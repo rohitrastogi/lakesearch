@@ -66,11 +66,25 @@ where
             None => PutOptions::default(),
         };
 
-        match store
-            .put_opts(&current_path, PutPayload::from(json), put_opts)
-            .await
-        {
-            Ok(_) => {
+        let result = store
+            .put_opts(&current_path, PutPayload::from(json.clone()), put_opts)
+            .await;
+
+        // LocalFileSystem doesn't support conditional PUT — fall back to
+        // unconditional overwrite. This is safe for single-writer local use.
+        let result = match &result {
+            Err(object_store::Error::NotImplemented) if etag.is_some() => {
+                warn!("conditional PUT not supported, falling back to unconditional write");
+                store
+                    .put(&current_path, PutPayload::from(json))
+                    .await
+                    .map(|_| ())
+            }
+            _ => result.map(|_| ()),
+        };
+
+        match result {
+            Ok(()) => {
                 info!(attempt, "metadata committed successfully");
                 return Ok(());
             }
