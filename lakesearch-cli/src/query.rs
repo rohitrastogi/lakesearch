@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tracing::info;
 
 use lakesearch_core::bm25;
@@ -66,9 +67,8 @@ pub async fn run_query(
     let current_result = read_current(store.as_ref(), base).await?;
     let metadata = read_metadata(store.as_ref(), &current_result.value).await?;
 
-    // 2. Collect all segments for the target column
-    let mut segment_bytes_list: Vec<Vec<u8>> = Vec::new();
-
+    // 2. Collect segment paths, then load bytes in parallel
+    let mut segment_paths: Vec<String> = Vec::new();
     for ml_path in &metadata.snapshot.manifest_lists {
         let ml = read_manifest_list(store.as_ref(), ml_path).await?;
         for me in &ml.manifests {
@@ -77,11 +77,16 @@ pub async fn run_query(
             }
             let manifest = read_manifest(store.as_ref(), &me.manifest_path).await?;
             for seg_info in &manifest.segments {
-                let bytes = load_bytes(store.as_ref(), &seg_info.segment_path).await?;
-                segment_bytes_list.push(bytes.to_vec());
+                segment_paths.push(seg_info.segment_path.clone());
             }
         }
     }
+
+    let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.iter())
+        .map(|path| async { load_bytes(store.as_ref(), path).await.map(|b| b.to_vec()) })
+        .buffered(8)
+        .try_collect()
+        .await?;
 
     if segment_bytes_list.is_empty() {
         return Ok(QueryResult {
@@ -166,18 +171,26 @@ pub async fn run_query(
 
         let file_table = reader.file_table();
 
-        // Pre-load Parquet metadata for unique files (avoids N+1 loads per group)
-        let mut pq_meta_cache: HashMap<u32, ParquetMetaData> = HashMap::new();
-        for &file_ord in groups
+        // Pre-load Parquet metadata for unique files in parallel
+        let unique_file_ords: Vec<u32> = groups
             .keys()
-            .map(|(fo, _)| fo)
+            .map(|(fo, _)| *fo)
             .collect::<HashSet<_>>()
-            .iter()
-        {
-            let fp = &file_table[*file_ord as usize].path;
-            let meta = load_parquet_metadata_async(store, fp).await?;
-            pq_meta_cache.insert(*file_ord, meta);
-        }
+            .into_iter()
+            .collect();
+
+        let pq_metas: Vec<(u32, ParquetMetaData)> = stream::iter(unique_file_ords.iter())
+            .map(|&fo| async move {
+                let fp = &file_table[fo as usize].path;
+                load_parquet_metadata_async(store, fp)
+                    .await
+                    .map(|meta| (fo, meta))
+            })
+            .buffered(8)
+            .try_collect()
+            .await?;
+
+        let pq_meta_cache: HashMap<u32, ParquetMetaData> = pq_metas.into_iter().collect();
 
         // Read and verify rows per group
         for ((file_ordinal, rg_idx), doc_ids) in &groups {
