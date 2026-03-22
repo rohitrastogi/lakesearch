@@ -1,0 +1,3 @@
+[workspace]
+members = ["lakesearch-core"]
+resolver = "2"
