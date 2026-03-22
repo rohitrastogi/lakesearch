@@ -3,12 +3,17 @@ name = "lakesearch-core"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+test-utils = ["dep:parquet", "dep:arrow"]
+
 [dependencies]
 crc32fast = "1"
 fst = "0.4"
 lz4_flex = "0.11"
 thiserror = "2"
 unicode-normalization = "0.1"
+parquet = { version = "54", features = ["arrow"], optional = true }
+arrow = { version = "54", optional = true }
 
 [dev-dependencies]
 proptest = "1"
