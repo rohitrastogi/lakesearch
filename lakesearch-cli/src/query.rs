@@ -18,7 +18,8 @@ use object_store::ObjectStore;
 use serde::Serialize;
 
 use crate::parquet_util::{
-    build_row_selection, read_parquet_batches_async, string_value, validate_column,
+    arrow_value_to_json, build_row_selection, load_parquet_metadata_async,
+    read_parquet_batches_async, string_value, validate_column,
 };
 use crate::storage::{load_bytes, read_current, read_manifest, read_manifest_list, read_metadata};
 use crate::Operator;
@@ -36,6 +37,8 @@ pub struct MatchedRow {
     pub text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub columns: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -55,6 +58,7 @@ pub async fn run_query(
     operator: Operator,
     with_score: bool,
     limit: Option<usize>,
+    select_columns: &[String],
     runtime: &LakeRuntime,
 ) -> Result<QueryResult> {
     // 1. Load metadata chain
@@ -173,22 +177,51 @@ pub async fn run_query(
             entries.dedup_by_key(|e| e.first_row_index);
             stats.candidate_pages += entries.len();
 
-            // Get total rows for the row group from parquet metadata
-            let pq_meta =
-                crate::parquet_util::load_parquet_metadata_async(store, file_path).await?;
+            // Get parquet metadata for column resolution
+            let pq_meta = load_parquet_metadata_async(store, file_path).await?;
             let rg_total_rows = pq_meta.row_group(*rg_idx as usize).num_rows();
 
             let selection = build_row_selection(&entries, rg_total_rows);
 
-            // Get column index from parquet metadata
-            let col_idx = validate_column(&pq_meta, column)
+            // Resolve leaf indices: indexed column + select columns
+            let indexed_leaf = validate_column(&pq_meta, column)
                 .with_context(|| format!("validating column in '{file_path}'"))?;
+
+            let mut select_leaves: Vec<(usize, String)> = Vec::new();
+            for sel_name in select_columns {
+                if sel_name == column {
+                    continue; // Already included as the indexed column
+                }
+                let leaf = validate_column(&pq_meta, sel_name)
+                    .with_context(|| format!("select column '{sel_name}' in '{file_path}'"))?;
+                select_leaves.push((leaf, sel_name.clone()));
+            }
+
+            // Build sorted leaf indices and track positions in the projected batch
+            let mut all_leaves: Vec<(usize, Option<String>)> = vec![(indexed_leaf, None)];
+            for (leaf, name) in &select_leaves {
+                all_leaves.push((*leaf, Some(name.clone())));
+            }
+            all_leaves.sort_by_key(|(leaf, _)| *leaf);
+
+            let leaf_indices: Vec<usize> = all_leaves.iter().map(|(l, _)| *l).collect();
+            let indexed_batch_col = all_leaves
+                .iter()
+                .position(|(l, _)| *l == indexed_leaf)
+                .unwrap();
+
+            // Map: batch column index → select column name
+            let select_col_map: Vec<(usize, String)> = all_leaves
+                .iter()
+                .enumerate()
+                .filter_map(|(batch_idx, (_, name))| name.as_ref().map(|n| (batch_idx, n.clone())))
+                .collect();
 
             let batches = read_parquet_batches_async(
                 store,
                 file_path,
                 *rg_idx as usize,
-                col_idx,
+                &leaf_indices,
                 Some(selection),
             )
             .await?;
@@ -196,15 +229,20 @@ pub async fn run_query(
             // Determine if LargeUtf8
             let is_large = batches
                 .first()
-                .map(|b| b.schema().field(0).data_type() == &arrow::datatypes::DataType::LargeUtf8)
+                .map(|b| {
+                    b.schema().field(indexed_batch_col).data_type()
+                        == &arrow::datatypes::DataType::LargeUtf8
+                })
                 .unwrap_or(false);
 
-            // CPU: verify and score rows
+            // CPU: verify, score, and extract select columns
             let qt = query_terms.clone();
             let ti = term_infos.clone();
             let op = operator;
             let fp = file_path.clone();
             let rg = *rg_idx;
+            let scm = select_col_map.clone();
+            let ibc = indexed_batch_col;
 
             let (mut matches, scan_stats) = runtime
                 .cpu(move || {
@@ -219,6 +257,8 @@ pub async fn run_query(
                         is_large,
                         &fp,
                         rg,
+                        ibc,
+                        &scm,
                     )
                 })
                 .await;
@@ -247,7 +287,7 @@ pub async fn run_query(
         candidate_pages = stats.candidate_pages,
         rows_scanned = stats.rows_scanned,
         rows_matched = stats.rows_matched,
-        "remote query complete"
+        "query complete"
     );
 
     Ok(QueryResult {
@@ -256,7 +296,7 @@ pub async fn run_query(
     })
 }
 
-/// CPU-bound: verify rows against query and optionally score with BM25.
+/// CPU-bound: verify rows against query, optionally score, and extract select columns.
 /// Returns (matches, (rows_scanned, rows_matched)).
 #[allow(clippy::too_many_arguments)]
 fn verify_and_score_batches(
@@ -270,13 +310,15 @@ fn verify_and_score_batches(
     is_large: bool,
     file_path: &str,
     rg_idx: u16,
+    indexed_batch_col: usize,
+    select_col_map: &[(usize, String)],
 ) -> (Vec<MatchedRow>, (usize, usize)) {
     let mut matches = Vec::new();
     let mut rows_scanned = 0usize;
     let mut rows_matched = 0usize;
 
     for batch in batches {
-        let col = batch.column(0);
+        let col = batch.column(indexed_batch_col);
 
         for row in 0..batch.num_rows() {
             rows_scanned += 1;
@@ -317,11 +359,23 @@ fn verify_and_score_batches(
                 None
             };
 
+            let columns = if select_col_map.is_empty() {
+                None
+            } else {
+                let mut map = serde_json::Map::new();
+                for (batch_idx, name) in select_col_map {
+                    let val = arrow_value_to_json(batch.column(*batch_idx).as_ref(), row);
+                    map.insert(name.clone(), val);
+                }
+                Some(map)
+            };
+
             matches.push(MatchedRow {
                 file: file_path.to_owned(),
                 row_group: rg_idx,
                 text: text.to_owned(),
                 score,
+                columns,
             });
         }
     }

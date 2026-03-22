@@ -97,7 +97,7 @@ pub async fn run_index(
         for rg_idx in 0..metadata.num_row_groups() {
             // Async: read all batches from this row group
             let batches =
-                read_parquet_batches_async(store, file_url, rg_idx, col_idx, None).await?;
+                read_parquet_batches_async(store, file_url, rg_idx, &[col_idx], None).await?;
 
             // Check LargeUtf8 on first batch
             if file_ordinal == 0 && rg_idx == 0 {

@@ -159,6 +159,7 @@ async fn create_index_query_round_trip() {
         Operator::And,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -176,6 +177,7 @@ async fn create_index_query_round_trip() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -233,6 +235,7 @@ async fn multiple_appends_both_queried() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -248,6 +251,7 @@ async fn multiple_appends_both_queried() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -263,6 +267,7 @@ async fn multiple_appends_both_queried() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -323,6 +328,7 @@ async fn batch_dedup_prevents_double_index() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -365,6 +371,7 @@ async fn bm25_scoring_across_segments() {
         Operator::Or,
         true,
         Some(5),
+        &[],
         &runtime,
     )
     .await
@@ -398,6 +405,7 @@ async fn empty_table_query() {
         Operator::Or,
         false,
         None,
+        &[],
         &runtime,
     )
     .await
@@ -405,4 +413,100 @@ async fn empty_table_query() {
 
     assert!(result.matches.is_empty());
     assert_eq!(result.stats.rows_matched, 0);
+}
+
+#[tokio::test]
+async fn select_projects_additional_columns() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/select.parquet",
+        10,
+        5,
+        &["error timeout"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Query with --select id
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        Some(3),
+        &["id".to_owned()],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.matches.len(), 3);
+    for m in &result.matches {
+        let cols = m.columns.as_ref().expect("should have columns");
+        assert!(cols.contains_key("id"), "should have 'id' column");
+        assert!(cols["id"].is_number(), "id should be a number");
+    }
+}
+
+#[tokio::test]
+async fn select_without_columns_omits_field() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/noselect.parquet",
+        10,
+        5,
+        &["hello world"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        Some(1),
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.matches.len(), 1);
+    // columns field should be None (omitted in JSON)
+    assert!(result.matches[0].columns.is_none());
 }

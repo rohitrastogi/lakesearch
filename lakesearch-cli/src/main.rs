@@ -60,6 +60,9 @@ enum Command {
         /// Maximum number of results
         #[arg(long)]
         limit: Option<usize>,
+        /// Additional columns to include in output
+        #[arg(long)]
+        select: Vec<String>,
     },
 }
 
@@ -152,6 +155,7 @@ async fn main() -> Result<()> {
             operator,
             score,
             limit,
+            select,
         } => {
             let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
             let runtime = LakeRuntime::default();
@@ -163,6 +167,7 @@ async fn main() -> Result<()> {
                 operator.into(),
                 score,
                 limit,
+                &select,
                 &runtime,
             )
             .await?;
