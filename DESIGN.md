@@ -2062,6 +2062,15 @@ A command-line tool that indexes local Parquet files and queries them.
 - **Standalone value**: a grep replacement for Parquet files that builds
   a persistent index. Useful immediately for anyone with local Parquet data.
 
+#### Limitations (Phase 1a)
+
+- **Top-level columns only.** The indexed column must be a top-level
+  `Utf8` or `LargeUtf8` field. Nested struct fields (e.g.,
+  `metadata.title`) are rejected by the Arrow type check. Files with
+  structs in *other* columns work fine — column projection uses parquet
+  leaf indices, not Arrow field indices, so nested siblings don't
+  interfere.
+
 ### Phase 1b: Object Storage + Metadata Protocol
 
 The CLI works against S3/GCS/R2 instead of just local files.
