@@ -160,22 +160,21 @@ pub async fn run_index(
         .await?;
 
     // 7. Upload artifacts
-    let segment_path = write_segment(store.as_ref(), base, segment_bytes.clone()).await?;
+    let segment_bytes_for_upload = segment_bytes.clone();
+    let segment_path = write_segment(store.as_ref(), base, segment_bytes_for_upload).await?;
 
-    // Build ParquetFileRef entries
     let parquet_file_refs: Vec<ParquetFileRef> = file_metadata
         .iter()
         .enumerate()
         .map(|(i, (path, meta))| ParquetFileRef {
             file_ordinal: i as u32,
             path: path.clone(),
-            file_size_bytes: 0, // Not critical for Phase 1b
+            file_size_bytes: 0,
             row_group_count: meta.num_row_groups() as u16,
         })
         .collect();
 
     let (min_term, max_term, term_count) = {
-        // Re-derive from segment (we moved the maps)
         let reader = lakesearch_core::segment::SegmentReader::open(segment_bytes)
             .context("reading built segment for stats")?;
         let all_terms = reader.prefix_terms("");

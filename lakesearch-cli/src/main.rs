@@ -3,6 +3,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use lakesearch_core::metadata::{ColumnStatus, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_core::tokenizer::DEFAULT_TOKENIZER;
 
 #[derive(Parser)]
 #[command(
@@ -105,7 +106,7 @@ async fn main() -> Result<()> {
                 .iter()
                 .map(|name| IndexedColumn {
                     name: name.clone(),
-                    tokenizer: "whitespace_lowercase".to_owned(),
+                    tokenizer: DEFAULT_TOKENIZER.to_owned(),
                     status: ColumnStatus::Active,
                 })
                 .collect();

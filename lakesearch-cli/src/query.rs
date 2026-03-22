@@ -14,6 +14,7 @@ use lakesearch_core::tokenizer::tokenize;
 use lakesearch_core::types::DocId;
 use object_store::path::Path;
 use object_store::ObjectStore;
+use parquet::file::metadata::ParquetMetaData;
 
 use serde::Serialize;
 
@@ -165,6 +166,19 @@ pub async fn run_query(
 
         let file_table = reader.file_table();
 
+        // Pre-load Parquet metadata for unique files (avoids N+1 loads per group)
+        let mut pq_meta_cache: HashMap<u32, ParquetMetaData> = HashMap::new();
+        for &file_ord in groups
+            .keys()
+            .map(|(fo, _)| fo)
+            .collect::<HashSet<_>>()
+            .iter()
+        {
+            let fp = &file_table[*file_ord as usize].path;
+            let meta = load_parquet_metadata_async(store, fp).await?;
+            pq_meta_cache.insert(*file_ord, meta);
+        }
+
         // Read and verify rows per group
         for ((file_ordinal, rg_idx), doc_ids) in &groups {
             let file_path = &file_table[*file_ordinal as usize].path;
@@ -177,14 +191,13 @@ pub async fn run_query(
             entries.dedup_by_key(|e| e.first_row_index);
             stats.candidate_pages += entries.len();
 
-            // Get parquet metadata for column resolution
-            let pq_meta = load_parquet_metadata_async(store, file_path).await?;
+            let pq_meta = &pq_meta_cache[file_ordinal];
             let rg_total_rows = pq_meta.row_group(*rg_idx as usize).num_rows();
 
             let selection = build_row_selection(&entries, rg_total_rows);
 
             // Resolve leaf indices: indexed column + select columns
-            let indexed_leaf = validate_column(&pq_meta, column)
+            let indexed_leaf = validate_column(pq_meta, column)
                 .with_context(|| format!("validating column in '{file_path}'"))?;
 
             let mut select_leaves: Vec<(usize, String)> = Vec::new();
@@ -192,7 +205,7 @@ pub async fn run_query(
                 if sel_name == column {
                     continue; // Already included as the indexed column
                 }
-                let leaf = validate_column(&pq_meta, sel_name)
+                let leaf = validate_column(pq_meta, sel_name)
                     .with_context(|| format!("select column '{sel_name}' in '{file_path}'"))?;
                 select_leaves.push((leaf, sel_name.clone()));
             }

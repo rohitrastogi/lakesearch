@@ -74,7 +74,7 @@ async fn create_test_table(store: &dyn ObjectStore, base: &Path, columns: &[&str
         .iter()
         .map(|name| IndexedColumn {
             name: (*name).to_owned(),
-            tokenizer: "whitespace_lowercase".to_owned(),
+            tokenizer: lakesearch_core::tokenizer::DEFAULT_TOKENIZER.to_owned(),
             status: ColumnStatus::Active,
         })
         .collect();

@@ -178,7 +178,7 @@ mod tests {
             location: "s3://bucket/lakesearch/tables/events/".to_owned(),
             indexed_columns: vec![IndexedColumn {
                 name: "description".to_owned(),
-                tokenizer: "whitespace_lowercase".to_owned(),
+                tokenizer: crate::tokenizer::DEFAULT_TOKENIZER.to_owned(),
                 status: ColumnStatus::Active,
             }],
             snapshot: Snapshot {

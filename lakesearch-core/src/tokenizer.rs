@@ -6,6 +6,9 @@
 
 use unicode_normalization::UnicodeNormalization;
 
+/// The name of the default tokenizer, used in metadata.
+pub const DEFAULT_TOKENIZER: &str = "whitespace_lowercase";
+
 /// Maximum byte length of a single token.
 const MAX_TOKEN_BYTES: usize = 256;
 

@@ -143,7 +143,7 @@ mod tests {
             location: "mem://table/".to_owned(),
             indexed_columns: vec![IndexedColumn {
                 name: "description".to_owned(),
-                tokenizer: "whitespace_lowercase".to_owned(),
+                tokenizer: lakesearch_core::tokenizer::DEFAULT_TOKENIZER.to_owned(),
                 status: ColumnStatus::Active,
             }],
             snapshot: Snapshot {
@@ -218,5 +218,107 @@ mod tests {
         assert!(!is_batch_duplicate(&store, &meta, "sha256:different")
             .await
             .unwrap());
+    }
+
+    /// Simulates the concurrent duplicate race: worker reads stale metadata,
+    /// a concurrent worker commits the same batch_id, then the first worker
+    /// tries to commit. The CAS rebase should detect the duplicate and skip.
+    #[tokio::test]
+    async fn rebase_detects_concurrent_duplicate() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        // Set up initial empty table
+        let initial = test_metadata(vec![]);
+        let meta_path = write_metadata(&store, &base, &initial)
+            .await
+            .expect("write initial metadata");
+        let pointer = CurrentPointer {
+            metadata_path: meta_path,
+            updated_at: "t0".to_owned(),
+        };
+        crate::storage::write_json(
+            &store,
+            &base.child("metadata").child("current.json"),
+            &pointer,
+        )
+        .await
+        .expect("write initial current.json");
+
+        // Worker A reads the current snapshot (empty)
+        let worker_a_read = read_current(&store, &base)
+            .await
+            .expect("worker A read current");
+        let worker_a_meta = read_metadata(&store, &worker_a_read.value)
+            .await
+            .expect("worker A read metadata");
+
+        // Simulate concurrent worker B committing the same batch_id first.
+        // Write a manifest list with batch_id "sha256:same"
+        let ml = lakesearch_core::metadata::ManifestList {
+            job_kind: lakesearch_core::metadata::JobKind::Append,
+            batch_id: "sha256:same".to_owned(),
+            data_files: vec![],
+            manifests: vec![],
+            replaces: None,
+            compacted_column: None,
+        };
+        let ml_path = crate::storage::write_manifest_list(&store, &base, &ml)
+            .await
+            .expect("write manifest list for worker B");
+
+        // Worker B commits (succeeds — no contention)
+        commit_metadata(
+            &store,
+            &base,
+            worker_a_read.e_tag.clone(),
+            &worker_a_meta,
+            Some("sha256:same"),
+            |meta| {
+                let mut new = meta.clone();
+                new.snapshot.manifest_lists.push(ml_path.clone());
+                new
+            },
+        )
+        .await
+        .expect("worker B commit");
+
+        // Worker A now tries to commit with the SAME batch_id but stale etag.
+        // It will hit CAS conflict, rebase, detect the duplicate, and skip.
+        let result = commit_metadata(
+            &store,
+            &base,
+            worker_a_read.e_tag,
+            &worker_a_meta,
+            Some("sha256:same"),
+            |meta| {
+                let mut new = meta.clone();
+                new.snapshot
+                    .manifest_lists
+                    .push("should-not-appear".to_owned());
+                new
+            },
+        )
+        .await;
+
+        // Should succeed (skip, not error)
+        result.expect("worker A should succeed via dedup skip");
+
+        // Verify: only ONE manifest list in the final state (worker B's)
+        let final_read = read_current(&store, &base)
+            .await
+            .expect("read final current");
+        let final_meta = read_metadata(&store, &final_read.value)
+            .await
+            .expect("read final metadata");
+        assert_eq!(
+            final_meta.snapshot.manifest_lists.len(),
+            1,
+            "should have exactly 1 manifest list, not 2"
+        );
+        assert!(
+            final_meta.snapshot.manifest_lists[0].contains("manifest-list-"),
+            "should be worker B's manifest list"
+        );
     }
 }
