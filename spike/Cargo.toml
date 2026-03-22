@@ -1,0 +1,9 @@
+[package]
+name = "parquet-page-spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+parquet = { version = "54", features = ["arrow"] }
+arrow = { version = "54", features = ["prettyprint"] }
+bytes = "1"
