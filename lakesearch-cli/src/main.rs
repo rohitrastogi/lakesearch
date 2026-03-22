@@ -1,5 +1,9 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+
+use lakesearch_core::metadata::{ColumnStatus, IndexedColumn, Metadata, Snapshot};
+use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_core::tokenizer::DEFAULT_TOKENIZER;
 
 #[derive(Parser)]
 #[command(
@@ -13,41 +17,53 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build a search index from Parquet files
+    /// Initialize a table (local or remote)
+    CreateTable {
+        /// Table location URL (e.g., file:///tmp/events/ or s3://bucket/tables/events/)
+        #[arg(long)]
+        location: String,
+        /// Table name
+        #[arg(long)]
+        table_name: String,
+        /// Column(s) to index
+        #[arg(long, required = true, num_args = 1..)]
+        column: Vec<String>,
+    },
+    /// Index Parquet files into a table
     Index {
-        /// Parquet file(s) to index
+        /// Table location URL
+        #[arg(long)]
+        location: String,
+        /// Parquet file path(s) or URL(s) to index
         #[arg(long, required = true, num_args = 1..)]
         file: Vec<String>,
-        /// Column to index (must be Utf8 or LargeUtf8)
+        /// Column to index
         #[arg(long)]
         column: String,
-        /// Output path for the segment file
-        #[arg(long)]
-        output: String,
     },
-    /// Query a search index
+    /// Query a table
     Query {
-        /// Path to the segment file
+        /// Table location URL
         #[arg(long)]
-        segment: String,
-        /// Parquet file(s) to read (same files used during indexing, in order)
-        #[arg(long, required = true, num_args = 1..)]
-        file: Vec<String>,
-        /// Column that was indexed
+        location: String,
+        /// Column to search
         #[arg(long)]
         column: String,
         /// Search query text
         #[arg(long = "match")]
         match_text: String,
-        /// Boolean operator for combining terms (and / or)
+        /// Boolean operator (and / or)
         #[arg(long, value_enum, default_value_t = OperatorArg::Or)]
         operator: OperatorArg,
         /// Compute BM25 relevance scores
         #[arg(long)]
         score: bool,
-        /// Maximum number of results to return
+        /// Maximum number of results
         #[arg(long)]
         limit: Option<usize>,
+        /// Additional columns to include in output
+        #[arg(long)]
+        select: Vec<String>,
     },
 }
 
@@ -66,38 +82,96 @@ impl From<OperatorArg> for lakesearch_cli::Operator {
     }
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let cli = Cli::parse();
     match cli.command {
+        Command::CreateTable {
+            location,
+            table_name,
+            column,
+        } => {
+            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+
+            if lakesearch_cli::storage::current_exists(store.as_ref(), &base).await? {
+                bail!("table already exists at {location}");
+            }
+
+            let table_id = uuid::Uuid::new_v4().to_string();
+            let indexed_columns: Vec<IndexedColumn> = column
+                .iter()
+                .map(|name| IndexedColumn {
+                    name: name.clone(),
+                    tokenizer: DEFAULT_TOKENIZER.to_owned(),
+                    status: ColumnStatus::Active,
+                })
+                .collect();
+
+            let metadata = Metadata {
+                format_version: 1,
+                table_id,
+                table_name: table_name.clone(),
+                location: location.clone(),
+                indexed_columns,
+                snapshot: Snapshot {
+                    timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
+                    manifest_lists: vec![],
+                },
+            };
+
+            let meta_path =
+                lakesearch_cli::storage::write_metadata(store.as_ref(), &base, &metadata).await?;
+
+            let pointer = lakesearch_core::metadata::CurrentPointer {
+                metadata_path: meta_path,
+                updated_at: chrono::Utc::now().to_rfc3339(),
+            };
+            lakesearch_cli::storage::write_json(
+                store.as_ref(),
+                &base.child("metadata").child("current.json"),
+                &pointer,
+            )
+            .await?;
+
+            println!("Created table '{table_name}' at {location}");
+        }
         Command::Index {
+            location,
             file,
             column,
-            output,
         } => {
-            lakesearch_cli::index::run_index(&file, &column, &output)?;
+            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+            let runtime = LakeRuntime::default();
+            lakesearch_cli::index::run_index(&store, &base, &file, &column, &runtime).await?;
+            println!("Indexing complete.");
         }
         Command::Query {
-            segment,
-            file,
+            location,
             column,
             match_text,
             operator,
             score,
             limit,
+            select,
         } => {
+            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+            let runtime = LakeRuntime::default();
             let result = lakesearch_cli::query::run_query(
-                &segment,
-                &file,
+                &store,
+                &base,
                 &column,
                 &match_text,
                 operator.into(),
                 score,
                 limit,
-            )?;
+                &select,
+                &runtime,
+            )
+            .await?;
             let json = serde_json::to_string_pretty(&result)?;
             println!("{json}");
         }

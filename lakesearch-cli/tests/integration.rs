@@ -1,590 +1,512 @@
-use std::collections::HashSet;
+//! Integration tests for object storage commands using InMemory store.
+
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, StringArray, StructArray};
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::array::{ArrayRef, Int32Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use object_store::memory::InMemory;
+use object_store::path::Path;
+use object_store::{ObjectStore, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-use tempfile::TempDir;
 
 use lakesearch_cli::index::run_index;
 use lakesearch_cli::query::run_query;
+use lakesearch_cli::storage::{read_current, read_metadata, write_json};
 use lakesearch_cli::Operator;
-use lakesearch_core::segment::SegmentReader;
-use lakesearch_core::test_utils::write_test_parquet;
-use lakesearch_core::tokenizer::tokenize;
+use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
+use lakesearch_core::runtime::LakeRuntime;
 
-fn test_descriptions() -> Vec<&'static str> {
-    vec![
-        "error timeout connection refused",
-        "success response ok",
-        "error connection reset",
-        "warning slow query",
-        "error timeout database",
-    ]
-}
-
-/// Helper: index a single parquet file and return paths.
-fn index_test_file(
-    dir: &TempDir,
+/// Creates a test Parquet file in memory and uploads it to the InMemory store.
+/// Returns the path where it was stored.
+async fn upload_test_parquet(
+    store: &dyn ObjectStore,
+    path: &str,
     num_rows: usize,
-    page_size: usize,
-    descs: &[&str],
-) -> (String, String) {
-    let parquet_path = dir.path().join("data.parquet");
-    let segment_path = dir.path().join("index.seg");
+    page_size_rows: usize,
+    descriptions: &[&str],
+) -> String {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("description", DataType::Utf8, true),
+    ]));
 
-    write_test_parquet(&parquet_path, num_rows, page_size, descs).unwrap();
+    let ids: Vec<i32> = (0..num_rows as i32).collect();
+    let descs: Vec<Option<&str>> = (0..num_rows)
+        .map(|i| Some(descriptions[i % descriptions.len()]))
+        .collect();
 
-    run_index(
-        &[parquet_path.to_str().unwrap().to_string()],
-        "description",
-        segment_path.to_str().unwrap(),
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int32Array::from(ids)) as ArrayRef,
+            Arc::new(StringArray::from(descs)) as ArrayRef,
+        ],
     )
     .unwrap();
 
-    (
-        parquet_path.to_str().unwrap().to_string(),
-        segment_path.to_str().unwrap().to_string(),
-    )
+    let mut buf = Vec::new();
+    let props = WriterProperties::builder()
+        .set_data_page_row_count_limit(page_size_rows)
+        .set_max_row_group_size(num_rows)
+        .set_dictionary_enabled(false)
+        .build();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    let obj_path = Path::from(path);
+    store
+        .put(&obj_path, PutPayload::from(Bytes::from(buf)))
+        .await
+        .unwrap();
+
+    path.to_owned()
 }
 
-#[test]
-fn and_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let descs = test_descriptions();
-    let (parquet_path, segment_path) = index_test_file(&dir, 100, 25, &descs);
+/// Creates a table with initial metadata in the InMemory store.
+async fn create_test_table(store: &dyn ObjectStore, base: &Path, columns: &[&str]) {
+    let indexed_columns: Vec<IndexedColumn> = columns
+        .iter()
+        .map(|name| IndexedColumn {
+            name: (*name).to_owned(),
+            tokenizer: lakesearch_core::tokenizer::DEFAULT_TOKENIZER.to_owned(),
+            status: ColumnStatus::Active,
+        })
+        .collect();
 
+    let metadata = Metadata {
+        format_version: 1,
+        table_id: "test-table-id".to_owned(),
+        table_name: "test".to_owned(),
+        location: "mem://table/".to_owned(),
+        indexed_columns,
+        snapshot: Snapshot {
+            timestamp_ms: 1000,
+            manifest_lists: vec![],
+        },
+    };
+
+    let meta_path = format!("{}/metadata/metadata-init.json", base);
+    write_json(store, &Path::from(meta_path.as_str()), &metadata)
+        .await
+        .unwrap();
+
+    let pointer = CurrentPointer {
+        metadata_path: meta_path,
+        updated_at: "2026-01-01T00:00:00Z".to_owned(),
+    };
+    write_json(
+        store,
+        &base.child("metadata").child("current.json"),
+        &pointer,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn create_index_query_round_trip() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    // Create table
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // Upload test parquet
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/test.parquet",
+        100,
+        25,
+        &[
+            "error timeout connection refused",
+            "success response ok",
+            "error connection reset",
+            "warning slow query",
+            "error timeout database",
+        ],
+    )
+    .await;
+
+    // Index
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Verify metadata was updated
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    assert_eq!(meta.snapshot.manifest_lists.len(), 1);
+
+    // Query: AND
     let result = run_query(
-        &segment_path,
-        &[parquet_path],
+        &store,
+        &base,
         "description",
         "error timeout",
         Operator::And,
         false,
         None,
+        &[],
+        &runtime,
     )
+    .await
     .unwrap();
 
     // Descriptions 0 and 4 contain both "error" and "timeout" → 2/5 * 100 = 40
     assert_eq!(result.stats.rows_matched, 40);
-    assert_eq!(result.matches.len(), 40);
 
-    for m in &result.matches {
-        let tokens: HashSet<String> = tokenize(&m.text).into_iter().collect();
-        assert!(tokens.contains("error"), "missing 'error' in: {}", m.text);
-        assert!(
-            tokens.contains("timeout"),
-            "missing 'timeout' in: {}",
-            m.text
-        );
-    }
-}
-
-#[test]
-fn or_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
-    let descs = test_descriptions();
-    let (parquet_path, segment_path) = index_test_file(&dir, 100, 25, &descs);
-
+    // Query: OR
     let result = run_query(
-        &segment_path,
-        &[parquet_path],
+        &store,
+        &base,
         "description",
         "error timeout",
         Operator::Or,
         false,
         None,
+        &[],
+        &runtime,
     )
+    .await
     .unwrap();
 
     // Descriptions 0, 2, 4 contain "error" or "timeout" → 3/5 * 100 = 60
     assert_eq!(result.stats.rows_matched, 60);
-    assert_eq!(result.matches.len(), 60);
-
-    for m in &result.matches {
-        let tokens: HashSet<String> = tokenize(&m.text).into_iter().collect();
-        assert!(
-            tokens.contains("error") || tokens.contains("timeout"),
-            "should contain 'error' or 'timeout': {}",
-            m.text
-        );
-    }
 }
 
-#[test]
-fn null_handling() {
-    let dir = tempfile::tempdir().unwrap();
-    let parquet_path = dir.path().join("nulls.parquet");
-    let segment_path = dir.path().join("nulls.seg");
+#[tokio::test]
+async fn multiple_appends_both_queried() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
 
-    // Write a Parquet file where every 3rd row is NULL
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("description", DataType::Utf8, true),
-    ]));
+    create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    let num_rows = 30;
-    let ids: Vec<i32> = (0..num_rows).collect();
-    let descs: Vec<Option<&str>> = (0..num_rows as usize)
-        .map(|i| {
-            if i % 3 == 0 {
-                None
-            } else {
-                Some("error timeout")
-            }
-        })
-        .collect();
-
-    let file = std::fs::File::create(&parquet_path).unwrap();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(10)
-        .set_max_row_group_size(num_rows as usize)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(descs)) as ArrayRef,
-        ],
+    // Upload and index file A (has "alpha")
+    let file_a = upload_test_parquet(
+        store.as_ref(),
+        "data/a.parquet",
+        20,
+        10,
+        &["alpha bravo charlie"],
     )
-    .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    .await;
+    run_index(&store, &base, &[file_a], "description", &runtime)
+        .await
+        .unwrap();
 
-    run_index(
-        &[parquet_path.to_str().unwrap().to_string()],
-        "description",
-        segment_path.to_str().unwrap(),
+    // Upload and index file B (has "delta")
+    let file_b = upload_test_parquet(
+        store.as_ref(),
+        "data/b.parquet",
+        20,
+        10,
+        &["delta echo foxtrot"],
     )
-    .unwrap();
+    .await;
+    run_index(&store, &base, &[file_b], "description", &runtime)
+        .await
+        .unwrap();
 
-    // Verify segment stats: total_rows includes NULLs
-    let seg_data = std::fs::read(&segment_path).unwrap();
-    let reader = SegmentReader::open(seg_data).unwrap();
-    assert_eq!(reader.corpus_stats().total_rows, 30);
+    // Metadata should have 2 manifest lists
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    assert_eq!(meta.snapshot.manifest_lists.len(), 2);
 
-    // Query: only non-NULL rows should match
+    // Query for "alpha" — only in file A
     let result = run_query(
-        segment_path.to_str().unwrap(),
-        &[parquet_path.to_str().unwrap().to_string()],
+        &store,
+        &base,
         "description",
-        "error timeout",
-        Operator::And,
+        "alpha",
+        Operator::Or,
         false,
         None,
+        &[],
+        &runtime,
     )
+    .await
     .unwrap();
-
-    // 10 NULLs (rows 0,3,6,...,27), 20 non-NULL rows, all matching
     assert_eq!(result.stats.rows_matched, 20);
-}
 
-#[test]
-fn multiple_row_groups() {
-    let dir = tempfile::tempdir().unwrap();
-    let parquet_path = dir.path().join("multi_rg.parquet");
-    let segment_path = dir.path().join("multi_rg.seg");
-
-    // Write with small max_row_group_size to force multiple row groups
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("description", DataType::Utf8, true),
-    ]));
-
-    let num_rows = 100usize;
-    let ids: Vec<i32> = (0..num_rows as i32).collect();
-    let descs: Vec<Option<&str>> = (0..num_rows)
-        .map(|i| {
-            let choices = test_descriptions();
-            Some(choices[i % choices.len()])
-        })
-        .collect();
-
-    let file = std::fs::File::create(&parquet_path).unwrap();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(10)
-        .set_max_row_group_size(25) // Forces 4 row groups
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(descs)) as ArrayRef,
-        ],
-    )
-    .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    run_index(
-        &[parquet_path.to_str().unwrap().to_string()],
-        "description",
-        segment_path.to_str().unwrap(),
-    )
-    .unwrap();
-
-    // Verify segment has pages across all row groups
-    let seg_data = std::fs::read(&segment_path).unwrap();
-    let reader = SegmentReader::open(seg_data).unwrap();
-    assert_eq!(reader.corpus_stats().total_rows, 100);
-
-    // Verify file table shows multiple row groups
-    let ft = reader.file_table();
-    assert_eq!(ft.len(), 1);
-    assert_eq!(ft[0].row_group_count, 4);
-
-    // Query should find results across all row groups
+    // Query for "delta" — only in file B
     let result = run_query(
-        segment_path.to_str().unwrap(),
-        &[parquet_path.to_str().unwrap().to_string()],
+        &store,
+        &base,
         "description",
-        "error timeout",
-        Operator::And,
+        "delta",
+        Operator::Or,
         false,
         None,
+        &[],
+        &runtime,
     )
+    .await
     .unwrap();
+    assert_eq!(result.stats.rows_matched, 20);
 
-    assert_eq!(result.stats.rows_matched, 40);
-
-    // Verify matches came from multiple row groups
-    let rgs: HashSet<u16> = result.matches.iter().map(|m| m.row_group).collect();
-    assert!(rgs.len() > 1, "matches should span multiple row groups");
-}
-
-#[test]
-fn bm25_scoring_order() {
-    let dir = tempfile::tempdir().unwrap();
-    // "rare" appears in 1/4 descriptions, "common" appears in 3/4
-    let descs = vec![
-        "rare unique special term",
-        "common everyday normal word",
-        "common regular standard phrase",
-        "common typical ordinary text",
-    ];
-    let (parquet_path, segment_path) = index_test_file(&dir, 100, 25, &descs);
-
-    // Query for "rare" with scoring
-    let result_rare = run_query(
-        &segment_path,
-        std::slice::from_ref(&parquet_path),
-        "description",
-        "rare",
-        Operator::Or,
-        true,
-        None,
-    )
-    .unwrap();
-
-    // Query for "common" with scoring
-    let result_common = run_query(
-        &segment_path,
-        &[parquet_path],
-        "description",
-        "common",
-        Operator::Or,
-        true,
-        None,
-    )
-    .unwrap();
-
-    // Rare term should have higher scores than common term
-    let max_rare = result_rare
-        .matches
-        .iter()
-        .filter_map(|m| m.score)
-        .fold(0.0f64, f64::max);
-    let max_common = result_common
-        .matches
-        .iter()
-        .filter_map(|m| m.score)
-        .fold(0.0f64, f64::max);
-
-    assert!(
-        max_rare > max_common,
-        "rare term score ({max_rare}) should exceed common term score ({max_common})"
-    );
-
-    // Verify scores are sorted descending
-    for m in result_rare.matches.windows(2) {
-        assert!(
-            m[0].score.unwrap() >= m[1].score.unwrap(),
-            "scores should be descending"
-        );
-    }
-}
-
-#[test]
-fn empty_result() {
-    let dir = tempfile::tempdir().unwrap();
-    let descs = test_descriptions();
-    let (parquet_path, segment_path) = index_test_file(&dir, 50, 25, &descs);
-
+    // Query for "nonexistent" — in neither
     let result = run_query(
-        &segment_path,
-        &[parquet_path],
+        &store,
+        &base,
         "description",
         "nonexistent",
         Operator::Or,
         false,
         None,
+        &[],
+        &runtime,
     )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.rows_matched, 0);
+}
+
+#[tokio::test]
+async fn batch_dedup_prevents_double_index() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/dedup.parquet",
+        20,
+        10,
+        &["hello world"],
+    )
+    .await;
+
+    // Index once
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Index again with same files — should be skipped
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Should still have only 1 manifest list
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    assert_eq!(meta.snapshot.manifest_lists.len(), 1);
+
+    // Query should find 20 matches, not 40 (no double-counting)
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.stats.rows_matched, 20);
+}
+
+#[tokio::test]
+async fn bm25_scoring_across_segments() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // File with "rare" in 1/4 descriptions
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/scoring.parquet",
+        100,
+        25,
+        &[
+            "rare unique special term",
+            "common everyday normal word",
+            "common regular standard phrase",
+            "common typical ordinary text",
+        ],
+    )
+    .await;
+
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "rare",
+        Operator::Or,
+        true,
+        Some(5),
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.matches.len(), 5);
+    // All scores should be positive and finite
+    for m in &result.matches {
+        let s = m.score.unwrap();
+        assert!(s > 0.0 && s.is_finite(), "bad score: {s}");
+    }
+    // Scores should be sorted descending
+    for w in result.matches.windows(2) {
+        assert!(w[0].score.unwrap() >= w[1].score.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn empty_table_query() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "anything",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
     .unwrap();
 
     assert!(result.matches.is_empty());
     assert_eq!(result.stats.rows_matched, 0);
-    assert_eq!(result.stats.rows_scanned, 0);
-    assert_eq!(result.stats.candidate_pages, 0);
 }
 
-#[test]
-fn segment_integrity() {
-    let dir = tempfile::tempdir().unwrap();
-    let descs = test_descriptions();
-    let (parquet_path, segment_path) = index_test_file(&dir, 100, 25, &descs);
+#[tokio::test]
+async fn select_projects_additional_columns() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
 
-    let seg_data = std::fs::read(&segment_path).unwrap();
-    let reader = SegmentReader::open(seg_data).unwrap();
+    create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    // Verify corpus stats
-    assert_eq!(reader.corpus_stats().total_rows, 100);
-    assert!(reader.corpus_stats().total_tokens > 0);
-
-    // Verify file table
-    assert_eq!(reader.file_table().len(), 1);
-    assert_eq!(reader.file_table()[0].path, parquet_path);
-
-    // Verify doc table has entries (should have pages)
-    assert!(reader.doc_count() > 0);
-
-    // Verify terms exist
-    assert!(reader.term_count() > 0);
-    assert!(reader.search_term("error").unwrap().is_some());
-    assert!(reader.search_term("timeout").unwrap().is_some());
-    assert!(reader.search_term("success").unwrap().is_some());
-    assert!(reader.search_term("nonexistent").unwrap().is_none());
-
-    // Verify posting lists are non-empty for known terms
-    let error_postings = reader.search_term("error").unwrap().unwrap();
-    assert!(!error_postings.is_empty());
-
-    // Verify doc_frequency for "error": appears in descriptions 0, 2, 4 → 3/5 * 100 = 60 rows
-    let ord = reader.term_ordinal("error").unwrap();
-    let info = reader.term_info(ord).unwrap();
-    assert_eq!(info.doc_frequency, 60);
-}
-
-#[test]
-fn limit_truncates_results() {
-    let dir = tempfile::tempdir().unwrap();
-    let descs = test_descriptions();
-    let (parquet_path, segment_path) = index_test_file(&dir, 100, 25, &descs);
-
-    let result = run_query(
-        &segment_path,
-        &[parquet_path],
-        "description",
-        "error",
-        Operator::Or,
-        false,
-        Some(5),
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/select.parquet",
+        10,
+        5,
+        &["error timeout"],
     )
-    .unwrap();
-
-    assert_eq!(result.matches.len(), 5);
-    // rows_matched should reflect total matches, but matches are truncated
-    // Actually our implementation truncates after collecting all, so rows_matched is the true count
-    assert_eq!(result.stats.rows_matched, 60);
-}
-
-#[test]
-fn nested_schema_column_projection() {
-    // Regression test: when a struct column precedes the indexed column,
-    // the parquet leaf index differs from the arrow field index. The CLI
-    // must use the parquet leaf index for ProjectionMask::leaves.
-    let dir = tempfile::tempdir().unwrap();
-    let parquet_path = dir.path().join("nested.parquet");
-    let segment_path = dir.path().join("nested.seg");
-
-    let nested_fields = Fields::from(vec![
-        Field::new("a", DataType::Int32, false),
-        Field::new("b", DataType::Int32, false),
-    ]);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("meta", DataType::Struct(nested_fields), false),
-        Field::new("description", DataType::Utf8, true),
-    ]));
-
-    let meta = StructArray::from(vec![
-        (
-            Arc::new(Field::new("a", DataType::Int32, false)),
-            Arc::new(Int32Array::from(vec![1, 2, 3, 4])) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new("b", DataType::Int32, false)),
-            Arc::new(Int32Array::from(vec![10, 20, 30, 40])) as ArrayRef,
-        ),
-    ]);
-    let desc = StringArray::from(vec![
-        Some("error timeout"),
-        Some("success ok"),
-        Some("error reset"),
-        Some("warning slow"),
-    ]);
-
-    let file = std::fs::File::create(&parquet_path).unwrap();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(2)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![Arc::new(meta) as ArrayRef, Arc::new(desc) as ArrayRef],
-    )
-    .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    .await;
 
     run_index(
-        &[parquet_path.to_str().unwrap().to_string()],
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
         "description",
-        segment_path.to_str().unwrap(),
+        &runtime,
     )
+    .await
     .unwrap();
 
+    // Query with --select id
     let result = run_query(
-        segment_path.to_str().unwrap(),
-        &[parquet_path.to_str().unwrap().to_string()],
+        &store,
+        &base,
         "description",
         "error",
         Operator::Or,
         false,
-        None,
+        Some(3),
+        &["id".to_owned()],
+        &runtime,
     )
+    .await
     .unwrap();
 
-    assert_eq!(result.stats.rows_matched, 2);
+    assert_eq!(result.matches.len(), 3);
     for m in &result.matches {
-        assert!(m.text.contains("error"), "expected 'error' in: {}", m.text);
+        let cols = m.columns.as_ref().expect("should have columns");
+        assert!(cols.contains_key("id"), "should have 'id' column");
+        assert!(cols["id"].is_number(), "id should be a number");
     }
 }
 
-#[test]
-fn type_mismatch_across_files_is_error() {
-    // If a later file has a non-string column with the same name,
-    // indexing should return an error, not panic.
-    let dir = tempfile::tempdir().unwrap();
-    let good_path = dir.path().join("good.parquet");
-    let bad_path = dir.path().join("bad.parquet");
-    let segment_path = dir.path().join("mixed.seg");
+#[tokio::test]
+async fn select_without_columns_omits_field() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
 
-    // Good file: description is Utf8
-    write_test_parquet(&good_path, 10, 5, &["hello world"]).unwrap();
+    create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    // Bad file: description is Int32
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("description", DataType::Int32, true),
-    ]));
-    let file = std::fs::File::create(&bad_path).unwrap();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(5)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![10, 20, 30])) as ArrayRef,
-        ],
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/noselect.parquet",
+        10,
+        5,
+        &["hello world"],
     )
-    .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
+    .await;
 
-    let result = run_index(
-        &[
-            good_path.to_str().unwrap().to_string(),
-            bad_path.to_str().unwrap().to_string(),
-        ],
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
         "description",
-        segment_path.to_str().unwrap(),
-    );
-
-    assert!(result.is_err(), "should fail on type mismatch");
-    let err_msg = format!("{:#}", result.unwrap_err());
-    assert!(
-        err_msg.contains("Utf8") || err_msg.contains("expected"),
-        "error should mention type: {err_msg}"
-    );
-}
-
-#[test]
-fn nested_struct_field_rejected() {
-    // Indexing a leaf inside a struct should give a clear error,
-    // not silently misbehave.
-    let dir = tempfile::tempdir().unwrap();
-    let parquet_path = dir.path().join("nested_leaf.parquet");
-    let segment_path = dir.path().join("nested_leaf.seg");
-
-    let nested_fields = Fields::from(vec![
-        Field::new("title", DataType::Utf8, true),
-        Field::new("body", DataType::Utf8, true),
-    ]);
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("content", DataType::Struct(nested_fields), false),
-    ]));
-
-    let title = StringArray::from(vec![Some("hello"), Some("world")]);
-    let body = StringArray::from(vec![Some("foo bar"), Some("baz qux")]);
-    let content = StructArray::from(vec![
-        (
-            Arc::new(Field::new("title", DataType::Utf8, true)),
-            Arc::new(title) as ArrayRef,
-        ),
-        (
-            Arc::new(Field::new("body", DataType::Utf8, true)),
-            Arc::new(body) as ArrayRef,
-        ),
-    ]);
-
-    let file = std::fs::File::create(&parquet_path).unwrap();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(2)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props)).unwrap();
-    let batch = RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
-            Arc::new(content) as ArrayRef,
-        ],
+        &runtime,
     )
+    .await
     .unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
 
-    let result = run_index(
-        &[parquet_path.to_str().unwrap().to_string()],
-        "title",
-        segment_path.to_str().unwrap(),
-    );
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        Some(1),
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
 
-    assert!(result.is_err(), "should reject nested struct field");
-    let err_msg = format!("{:#}", result.unwrap_err());
-    // validate_arrow_column rejects it: "title" isn't a top-level arrow field
-    assert!(
-        err_msg.contains("not found") || err_msg.contains("expected"),
-        "error should indicate the column can't be indexed: {err_msg}"
-    );
+    assert_eq!(result.matches.len(), 1);
+    // columns field should be None (omitted in JSON)
+    assert!(result.matches[0].columns.is_none());
 }

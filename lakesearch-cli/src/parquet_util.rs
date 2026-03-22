@@ -1,8 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
-use arrow::array::{Array, LargeStringArray, StringArray};
+use arrow::array::{Array, LargeStringArray, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
+use futures::TryStreamExt;
 use lakesearch_core::types::{DocId, DocTableEntry, FileTableEntry};
+use object_store::path::Path;
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 
 /// Information about a single page for row-to-doc_id mapping.
@@ -176,4 +183,152 @@ pub fn string_value(col: &dyn Array, row: usize, is_large: bool) -> &str {
             .expect("expected Utf8 column")
             .value(row)
     }
+}
+
+// --- Async helpers for object storage Parquet access ---
+
+/// Loads Parquet metadata (with page indexes) from object storage.
+pub async fn load_parquet_metadata_async(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+) -> Result<ParquetMetaData> {
+    let location = Path::from(path);
+    let meta = store
+        .head(&location)
+        .await
+        .with_context(|| format!("HEAD for '{path}'"))?;
+    let reader = ParquetObjectReader::new(Arc::clone(store), meta);
+    let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(true);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .with_context(|| format!("reading Parquet metadata from '{path}'"))?;
+    Ok(builder.metadata().as_ref().clone())
+}
+
+/// Reads record batches from a specific row group of a Parquet file in object
+/// storage, with column projection and optional row selection.
+///
+/// `leaf_indices` are parquet leaf column indices to project.
+pub async fn read_parquet_batches_async(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+    rg_idx: usize,
+    leaf_indices: &[usize],
+    selection: Option<RowSelection>,
+) -> Result<Vec<RecordBatch>> {
+    let location = Path::from(path);
+    let meta = store
+        .head(&location)
+        .await
+        .with_context(|| format!("HEAD for '{path}'"))?;
+    let reader = ParquetObjectReader::new(Arc::clone(store), meta);
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .with_context(|| format!("opening Parquet reader for '{path}'"))?;
+
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), leaf_indices.iter().copied());
+    builder = builder.with_row_groups(vec![rg_idx]).with_projection(mask);
+
+    if let Some(sel) = selection {
+        builder = builder.with_row_selection(sel);
+    }
+
+    let stream = builder
+        .build()
+        .with_context(|| format!("building Parquet stream for '{path}' rg {rg_idx}"))?;
+
+    stream
+        .try_collect()
+        .await
+        .with_context(|| format!("reading batches from '{path}' rg {rg_idx}"))
+}
+
+/// Extracts a value from an arrow array at the given row as a JSON value.
+pub fn arrow_value_to_json(col: &dyn Array, row: usize) -> serde_json::Value {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if col.is_null(row) {
+        return serde_json::Value::Null;
+    }
+
+    match col.data_type() {
+        DataType::Boolean => {
+            let arr = col.as_any().downcast_ref::<BooleanArray>().unwrap();
+            serde_json::Value::Bool(arr.value(row))
+        }
+        DataType::Int8 => json_num(col.as_any().downcast_ref::<Int8Array>().unwrap().value(row)),
+        DataType::Int16 => json_num(
+            col.as_any()
+                .downcast_ref::<Int16Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int32 => json_num(
+            col.as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Int64 => json_num(
+            col.as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt8 => json_num(
+            col.as_any()
+                .downcast_ref::<UInt8Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt16 => json_num(
+            col.as_any()
+                .downcast_ref::<UInt16Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt32 => json_num(
+            col.as_any()
+                .downcast_ref::<UInt32Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::UInt64 => json_num(
+            col.as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(row),
+        ),
+        DataType::Float32 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .unwrap()
+                .value(row);
+            serde_json::Value::from(v)
+        }
+        DataType::Float64 => {
+            let v = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .unwrap()
+                .value(row);
+            serde_json::Value::from(v)
+        }
+        DataType::Utf8 => {
+            let arr = col.as_any().downcast_ref::<StringArray>().unwrap();
+            serde_json::Value::String(arr.value(row).to_owned())
+        }
+        DataType::LargeUtf8 => {
+            let arr = col.as_any().downcast_ref::<LargeStringArray>().unwrap();
+            serde_json::Value::String(arr.value(row).to_owned())
+        }
+        // Fallback: use debug format
+        _ => serde_json::Value::String(format!("{col:?}")),
+    }
+}
+
+fn json_num<T: Into<serde_json::Number>>(v: T) -> serde_json::Value {
+    serde_json::Value::Number(v.into())
 }
