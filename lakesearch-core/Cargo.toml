@@ -1,0 +1,14 @@
+[package]
+name = "lakesearch-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+crc32fast = "1"
+fst = "0.4"
+lz4_flex = "0.11"
+thiserror = "2"
+unicode-normalization = "0.1"
+
+[dev-dependencies]
+proptest = "1"
