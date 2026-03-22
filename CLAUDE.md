@@ -188,7 +188,11 @@ automatically — trust its "regressed" / "improved" / "no change" classificatio
   committing.
 - Run `cargo fmt --all` and `cargo clippy --all-targets --all-features -- -D warnings`
   before each commit. Fix all errors before committing.
-- Write clear commit messages: what changed and why.
+- Use [Conventional Commits](https://www.conventionalcommits.org/):
+  `type(scope): description`. Types: `feat`, `fix`, `refactor`, `test`,
+  `docs`, `chore`, `perf`, `ci`. Scope is the crate or module (e.g.,
+  `feat(cli): add query command`, `fix(core): posting decode off-by-one`).
+  Body explains *why*, not *what*.
 
 ### Pre-Commit Checklist
 
