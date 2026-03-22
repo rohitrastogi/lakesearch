@@ -15,14 +15,16 @@ Run OpenAI's Codex CLI review command via `npx @openai/codex`.
 If `$ARGUMENTS` is a commit SHA, use:
 
 ```
-npx @openai/codex review --commit <SHA> "<prompt>"
+echo "<prompt>" | npx @openai/codex review --commit <SHA>
 ```
 
 If `$ARGUMENTS` is empty, use:
 
 ```
-npx @openai/codex review --uncommitted "<prompt>"
+echo "<prompt>" | npx @openai/codex review --uncommitted
 ```
+
+The Codex CLI does not accept a positional prompt together with `--uncommitted` or `--commit` — the prompt must be piped via stdin.
 
 Use this exact prompt for the Codex review:
 
