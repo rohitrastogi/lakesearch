@@ -21,11 +21,17 @@ const BASE_BACKOFF_MS: u64 = 50;
 /// `build_new_metadata` is a closure that takes the current metadata and
 /// returns the new metadata to commit. It is called on each retry to rebase
 /// against the latest state.
+///
+/// If `batch_id` is provided, the protocol re-checks for duplicate batches
+/// after each rebase. This closes the race where two workers process the
+/// same batch concurrently: the loser's rebase reveals the winner's commit
+/// and the loser exits cleanly instead of double-committing.
 pub async fn commit_metadata<F>(
     store: &dyn ObjectStore,
     base: &Path,
     current_etag: Option<String>,
     current_metadata: &Metadata,
+    batch_id: Option<&str>,
     build_new_metadata: F,
 ) -> Result<()>
 where
@@ -79,6 +85,18 @@ where
                 let result = read_current(store, base).await?;
                 etag = result.e_tag;
                 latest = read_metadata(store, &result.value).await?;
+
+                // Re-check dedup after rebase: if a concurrent worker already
+                // committed this batch, we're done.
+                if let Some(bid) = batch_id {
+                    if is_batch_duplicate(store, &latest, bid).await? {
+                        info!(
+                            batch_id = bid,
+                            "batch committed by concurrent worker, skipping"
+                        );
+                        return Ok(());
+                    }
+                }
             }
             Err(e) => return Err(e).context("writing current.json"),
         }
@@ -160,7 +178,7 @@ mod tests {
         let current_meta = read_metadata(&store, &result.value).await.unwrap();
 
         // Commit with a new manifest list
-        commit_metadata(&store, &base, result.e_tag, &current_meta, |meta| {
+        commit_metadata(&store, &base, result.e_tag, &current_meta, None, |meta| {
             let mut new = meta.clone();
             new.snapshot.manifest_lists.push("ml-new.json".to_owned());
             new

@@ -251,6 +251,7 @@ pub async fn run_index(
         base,
         current_result.e_tag,
         &current_meta,
+        Some(&batch_id),
         |meta| {
             let mut new = meta.clone();
             new.snapshot.manifest_lists.push(ml_path.clone());
