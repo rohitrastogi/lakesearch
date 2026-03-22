@@ -1,8 +1,15 @@
+use std::sync::Arc;
+
 use anyhow::{bail, Context, Result};
-use arrow::array::{Array, LargeStringArray, StringArray};
+use arrow::array::{Array, LargeStringArray, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
+use futures::TryStreamExt;
 use lakesearch_core::types::{DocId, DocTableEntry, FileTableEntry};
+use object_store::path::Path;
+use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};
+use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::arrow::{ParquetRecordBatchStreamBuilder, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 
 /// Information about a single page for row-to-doc_id mapping.
@@ -176,4 +183,60 @@ pub fn string_value(col: &dyn Array, row: usize, is_large: bool) -> &str {
             .expect("expected Utf8 column")
             .value(row)
     }
+}
+
+// --- Async helpers for object storage Parquet access ---
+
+/// Loads Parquet metadata (with page indexes) from object storage.
+pub async fn load_parquet_metadata_async(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+) -> Result<ParquetMetaData> {
+    let location = Path::from(path);
+    let meta = store
+        .head(&location)
+        .await
+        .with_context(|| format!("HEAD for '{path}'"))?;
+    let reader = ParquetObjectReader::new(Arc::clone(store), meta);
+    let options = parquet::arrow::arrow_reader::ArrowReaderOptions::new().with_page_index(true);
+    let builder = ParquetRecordBatchStreamBuilder::new_with_options(reader, options)
+        .await
+        .with_context(|| format!("reading Parquet metadata from '{path}'"))?;
+    Ok(builder.metadata().as_ref().clone())
+}
+
+/// Reads record batches from a specific row group of a Parquet file in object
+/// storage, with column projection and optional row selection.
+pub async fn read_parquet_batches_async(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+    rg_idx: usize,
+    col_idx: usize,
+    selection: Option<RowSelection>,
+) -> Result<Vec<RecordBatch>> {
+    let location = Path::from(path);
+    let meta = store
+        .head(&location)
+        .await
+        .with_context(|| format!("HEAD for '{path}'"))?;
+    let reader = ParquetObjectReader::new(Arc::clone(store), meta);
+    let mut builder = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .with_context(|| format!("opening Parquet reader for '{path}'"))?;
+
+    let mask = ProjectionMask::leaves(builder.parquet_schema(), [col_idx]);
+    builder = builder.with_row_groups(vec![rg_idx]).with_projection(mask);
+
+    if let Some(sel) = selection {
+        builder = builder.with_row_selection(sel);
+    }
+
+    let stream = builder
+        .build()
+        .with_context(|| format!("building Parquet stream for '{path}' rg {rg_idx}"))?;
+
+    stream
+        .try_collect()
+        .await
+        .with_context(|| format!("reading batches from '{path}' rg {rg_idx}"))
 }

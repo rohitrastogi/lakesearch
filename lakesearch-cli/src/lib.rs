@@ -2,6 +2,8 @@ pub mod cas;
 pub mod index;
 pub mod parquet_util;
 pub mod query;
+pub mod remote_index;
+pub mod remote_query;
 pub mod storage;
 
 /// Boolean operator for combining query terms.
