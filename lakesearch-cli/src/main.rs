@@ -16,35 +16,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Build a search index from local Parquet files
-    Index {
-        #[arg(long, required = true, num_args = 1..)]
-        file: Vec<String>,
-        #[arg(long)]
-        column: String,
-        #[arg(long)]
-        output: String,
-    },
-    /// Query a local search index
-    Query {
-        #[arg(long)]
-        segment: String,
-        #[arg(long, required = true, num_args = 1..)]
-        file: Vec<String>,
-        #[arg(long)]
-        column: String,
-        #[arg(long = "match")]
-        match_text: String,
-        #[arg(long, value_enum, default_value_t = OperatorArg::Or)]
-        operator: OperatorArg,
-        #[arg(long)]
-        score: bool,
-        #[arg(long)]
-        limit: Option<usize>,
-    },
-    /// Initialize a table in object storage
+    /// Initialize a table (local or remote)
     CreateTable {
-        /// Table location URL (e.g., s3://bucket/lakesearch/tables/events/)
+        /// Table location URL (e.g., file:///tmp/events/ or s3://bucket/tables/events/)
         #[arg(long)]
         location: String,
         /// Table name
@@ -54,20 +28,20 @@ enum Command {
         #[arg(long, required = true, num_args = 1..)]
         column: Vec<String>,
     },
-    /// Index Parquet files into an object storage table
-    RemoteIndex {
+    /// Index Parquet files into a table
+    Index {
         /// Table location URL
         #[arg(long)]
         location: String,
-        /// Parquet file URL(s) to index
+        /// Parquet file path(s) or URL(s) to index
         #[arg(long, required = true, num_args = 1..)]
         file: Vec<String>,
         /// Column to index
         #[arg(long)]
         column: String,
     },
-    /// Query a table in object storage
-    RemoteQuery {
+    /// Query a table
+    Query {
         /// Table location URL
         #[arg(long)]
         location: String,
@@ -112,34 +86,6 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Index {
-            file,
-            column,
-            output,
-        } => {
-            lakesearch_cli::index::run_index(&file, &column, &output)?;
-        }
-        Command::Query {
-            segment,
-            file,
-            column,
-            match_text,
-            operator,
-            score,
-            limit,
-        } => {
-            let result = lakesearch_cli::query::run_query(
-                &segment,
-                &file,
-                &column,
-                &match_text,
-                operator.into(),
-                score,
-                limit,
-            )?;
-            let json = serde_json::to_string_pretty(&result)?;
-            println!("{json}");
-        }
         Command::CreateTable {
             location,
             table_name,
@@ -189,7 +135,7 @@ async fn main() -> Result<()> {
 
             println!("Created table '{table_name}' at {location}");
         }
-        Command::RemoteIndex {
+        Command::Index {
             location,
             file,
             column,
@@ -200,7 +146,7 @@ async fn main() -> Result<()> {
                 .await?;
             println!("Indexing complete.");
         }
-        Command::RemoteQuery {
+        Command::Query {
             location,
             column,
             match_text,

@@ -15,12 +15,35 @@ use lakesearch_core::types::DocId;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
+use serde::Serialize;
+
 use crate::parquet_util::{
     build_row_selection, read_parquet_batches_async, string_value, validate_column,
 };
-use crate::query::{MatchedRow, QueryResult, QueryStats};
 use crate::storage::{load_bytes, read_current, read_manifest, read_manifest_list, read_metadata};
 use crate::Operator;
+
+#[derive(Debug, Serialize)]
+pub struct QueryResult {
+    pub matches: Vec<MatchedRow>,
+    pub stats: QueryStats,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MatchedRow {
+    pub file: String,
+    pub row_group: u16,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score: Option<f64>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct QueryStats {
+    pub candidate_pages: usize,
+    pub rows_scanned: usize,
+    pub rows_matched: usize,
+}
 
 /// Queries a LakeSearch table in object storage across all segments.
 #[allow(clippy::too_many_arguments)]
