@@ -1,6 +1,9 @@
 pub mod bm25;
 pub mod boolean;
+pub mod metadata;
 pub mod posting;
+#[cfg(feature = "runtime")]
+pub mod runtime;
 pub mod segment;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
