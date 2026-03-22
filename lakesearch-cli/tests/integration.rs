@@ -12,8 +12,8 @@ use object_store::{ObjectStore, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-use lakesearch_cli::remote_index::run_remote_index;
-use lakesearch_cli::remote_query::run_remote_query;
+use lakesearch_cli::index::run_index;
+use lakesearch_cli::query::run_query;
 use lakesearch_cli::storage::{read_current, read_metadata, write_json};
 use lakesearch_cli::Operator;
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
@@ -135,7 +135,7 @@ async fn create_index_query_round_trip() {
     .await;
 
     // Index
-    run_remote_index(
+    run_index(
         &store,
         &base,
         std::slice::from_ref(&file_path),
@@ -151,7 +151,7 @@ async fn create_index_query_round_trip() {
     assert_eq!(meta.snapshot.manifest_lists.len(), 1);
 
     // Query: AND
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -168,7 +168,7 @@ async fn create_index_query_round_trip() {
     assert_eq!(result.stats.rows_matched, 40);
 
     // Query: OR
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -202,7 +202,7 @@ async fn multiple_appends_both_queried() {
         &["alpha bravo charlie"],
     )
     .await;
-    run_remote_index(&store, &base, &[file_a], "description", &runtime)
+    run_index(&store, &base, &[file_a], "description", &runtime)
         .await
         .unwrap();
 
@@ -215,7 +215,7 @@ async fn multiple_appends_both_queried() {
         &["delta echo foxtrot"],
     )
     .await;
-    run_remote_index(&store, &base, &[file_b], "description", &runtime)
+    run_index(&store, &base, &[file_b], "description", &runtime)
         .await
         .unwrap();
 
@@ -225,7 +225,7 @@ async fn multiple_appends_both_queried() {
     assert_eq!(meta.snapshot.manifest_lists.len(), 2);
 
     // Query for "alpha" — only in file A
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -240,7 +240,7 @@ async fn multiple_appends_both_queried() {
     assert_eq!(result.stats.rows_matched, 20);
 
     // Query for "delta" — only in file B
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -255,7 +255,7 @@ async fn multiple_appends_both_queried() {
     assert_eq!(result.stats.rows_matched, 20);
 
     // Query for "nonexistent" — in neither
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -288,7 +288,7 @@ async fn batch_dedup_prevents_double_index() {
     .await;
 
     // Index once
-    run_remote_index(
+    run_index(
         &store,
         &base,
         std::slice::from_ref(&file_path),
@@ -299,7 +299,7 @@ async fn batch_dedup_prevents_double_index() {
     .unwrap();
 
     // Index again with same files — should be skipped
-    run_remote_index(
+    run_index(
         &store,
         &base,
         std::slice::from_ref(&file_path),
@@ -315,7 +315,7 @@ async fn batch_dedup_prevents_double_index() {
     assert_eq!(meta.snapshot.manifest_lists.len(), 1);
 
     // Query should find 20 matches, not 40 (no double-counting)
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -353,11 +353,11 @@ async fn bm25_scoring_across_segments() {
     )
     .await;
 
-    run_remote_index(&store, &base, &[file_path], "description", &runtime)
+    run_index(&store, &base, &[file_path], "description", &runtime)
         .await
         .unwrap();
 
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",
@@ -390,7 +390,7 @@ async fn empty_table_query() {
 
     create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    let result = run_remote_query(
+    let result = run_query(
         &store,
         &base,
         "description",

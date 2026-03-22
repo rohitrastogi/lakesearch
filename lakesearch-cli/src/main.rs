@@ -142,8 +142,7 @@ async fn main() -> Result<()> {
         } => {
             let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
             let runtime = LakeRuntime::default();
-            lakesearch_cli::remote_index::run_remote_index(&store, &base, &file, &column, &runtime)
-                .await?;
+            lakesearch_cli::index::run_index(&store, &base, &file, &column, &runtime).await?;
             println!("Indexing complete.");
         }
         Command::Query {
@@ -156,7 +155,7 @@ async fn main() -> Result<()> {
         } => {
             let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
             let runtime = LakeRuntime::default();
-            let result = lakesearch_cli::remote_query::run_remote_query(
+            let result = lakesearch_cli::query::run_query(
                 &store,
                 &base,
                 &column,

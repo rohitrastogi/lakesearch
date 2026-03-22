@@ -47,7 +47,7 @@ pub struct QueryStats {
 
 /// Queries a LakeSearch table in object storage across all segments.
 #[allow(clippy::too_many_arguments)]
-pub async fn run_remote_query(
+pub async fn run_query(
     store: &Arc<dyn ObjectStore>,
     base: &Path,
     column: &str,

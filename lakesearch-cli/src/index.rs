@@ -28,7 +28,7 @@ use crate::storage::{
 };
 
 /// Indexes Parquet files from object storage into a LakeSearch table.
-pub async fn run_remote_index(
+pub async fn run_index(
     store: &Arc<dyn ObjectStore>,
     base: &Path,
     file_urls: &[String],
