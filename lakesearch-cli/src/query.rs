@@ -26,6 +26,9 @@ use crate::parquet_util::{
 use crate::storage::{load_bytes, read_current, read_manifest, read_manifest_list, read_metadata};
 use crate::Operator;
 
+/// Max concurrent I/O operations for parallel loading.
+const IO_CONCURRENCY: usize = 8;
+
 #[derive(Debug, Serialize)]
 pub struct QueryResult {
     pub matches: Vec<MatchedRow>,
@@ -67,10 +70,15 @@ pub async fn run_query(
     let current_result = read_current(store.as_ref(), base).await?;
     let metadata = read_metadata(store.as_ref(), &current_result.value).await?;
 
-    // 2. Collect segment paths, then load bytes in parallel
+    // 2. Load manifest lists in parallel, collect segment paths
+    let manifest_lists: Vec<_> = stream::iter(metadata.snapshot.manifest_lists.iter())
+        .map(|ml_path| async { read_manifest_list(store.as_ref(), ml_path).await })
+        .buffered(IO_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
     let mut segment_paths: Vec<String> = Vec::new();
-    for ml_path in &metadata.snapshot.manifest_lists {
-        let ml = read_manifest_list(store.as_ref(), ml_path).await?;
+    for ml in &manifest_lists {
         for me in &ml.manifests {
             if me.indexed_column != column {
                 continue;
@@ -82,9 +90,10 @@ pub async fn run_query(
         }
     }
 
+    // Load segment bytes in parallel
     let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.iter())
         .map(|path| async { load_bytes(store.as_ref(), path).await.map(|b| b.to_vec()) })
-        .buffered(8)
+        .buffered(IO_CONCURRENCY)
         .try_collect()
         .await?;
 
@@ -186,7 +195,7 @@ pub async fn run_query(
                     .await
                     .map(|meta| (fo, meta))
             })
-            .buffered(8)
+            .buffered(IO_CONCURRENCY)
             .try_collect()
             .await?;
 
