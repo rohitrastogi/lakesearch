@@ -1,0 +1,7 @@
+# LakeSearch demo server config.
+# Replace WORKDIR below with the absolute path to the repo root,
+# or run the setup command in README.md to generate this file.
+bind_addr: "0.0.0.0:8080"
+flight_addr: "0.0.0.0:8081"
+tables:
+  events: "file://WORKDIR/demo/data/lakesearch/"
