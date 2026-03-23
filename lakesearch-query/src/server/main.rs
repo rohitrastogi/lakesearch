@@ -8,7 +8,7 @@ use tracing::info;
 use lakesearch_core::catalog_client::{StaticCatalog, TableInfo};
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_core::storage;
-use lakesearch_query::server::cache::MetadataCache;
+use lakesearch_query::server::cache::TableCache;
 use lakesearch_query::server::config::ServerConfig;
 use lakesearch_query::server::flight::LakeSearchFlightService;
 use lakesearch_query::server::routes::router;
@@ -32,12 +32,8 @@ async fn main() -> Result<()> {
     let config = ServerConfig::from_file(std::path::Path::new(&args.config))?;
 
     let runtime = Arc::new(LakeRuntime::new(config.cpu_threads));
-    let cache = Arc::new(MetadataCache::new(
-        config.metadata_poll_interval(),
-        config.io_concurrency,
-    ));
 
-    // Build catalog from config and register tables
+    // Build catalog from config
     let mut tables = Vec::new();
     for (name, location) in &config.tables {
         let (store, base) = storage::parse_location(location)?;
@@ -48,19 +44,17 @@ async fn main() -> Result<()> {
             base,
         });
     }
-    let catalog = StaticCatalog::new(tables);
-    cache.register_from_catalog(&catalog).await?;
-    info!(
-        tables = config.tables.len(),
-        "registered tables from catalog"
-    );
+    let catalog: Arc<dyn lakesearch_core::catalog_client::CatalogClient> =
+        Arc::new(StaticCatalog::new(tables));
+    info!(tables = config.tables.len(), "loaded catalog");
 
-    let poll_handle = cache.start_polling();
+    let table_cache = Arc::new(TableCache::new(config.io_concurrency));
 
     let state = AppState {
         config: Arc::new(config.clone()),
         runtime,
-        cache,
+        catalog,
+        table_cache,
     };
 
     let app = router(state.clone());
@@ -84,7 +78,6 @@ async fn main() -> Result<()> {
         }
     }
 
-    poll_handle.abort();
     info!("server stopped");
     Ok(())
 }

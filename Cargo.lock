@@ -1535,7 +1535,7 @@ name = "lakesearch-admin"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "axum",
+ "axum 0.8.8",
  "cascadq-client",
  "chrono",
  "clap",

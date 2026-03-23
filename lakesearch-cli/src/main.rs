@@ -177,12 +177,18 @@ async fn main() -> Result<()> {
             select,
         } => {
             let (store, base) = lakesearch_core::storage::parse_location(&location)?;
-            let cache =
-                std::sync::Arc::new(lakesearch_query::object_cache::ObjectCache::new(store));
+            let index_base = base.child("lakesearch");
+            let cache = std::sync::Arc::new(lakesearch_query::object_cache::ObjectCache::new(
+                store.clone(),
+            ));
+            let current =
+                lakesearch_core::storage::read_current(store.as_ref(), &index_base).await?;
+            let metadata =
+                lakesearch_core::storage::read_metadata(store.as_ref(), &current.value).await?;
             let runtime = std::sync::Arc::new(LakeRuntime::default());
             let result = lakesearch_query::query::run_query_collected(
                 cache,
-                base,
+                &metadata,
                 column,
                 &match_text,
                 operator.into(),

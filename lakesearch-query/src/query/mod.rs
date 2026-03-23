@@ -25,10 +25,10 @@ use arrow::record_batch::RecordBatch;
 use tracing::info;
 
 use lakesearch_core::bm25;
+use lakesearch_core::metadata::Metadata;
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_core::segment::SegmentReader;
 use lakesearch_core::tokenizer::tokenize;
-use object_store::path::Path;
 use parquet::file::metadata::ParquetMetaData;
 
 use crate::object_cache::ObjectCache;
@@ -138,7 +138,7 @@ fn collect_aggregate_stats(
 #[allow(clippy::type_complexity, clippy::too_many_arguments)]
 async fn setup_query(
     cache: &Arc<ObjectCache>,
-    base: &Path,
+    metadata: &Metadata,
     column: &str,
     query_terms: &[String],
     operator: Operator,
@@ -151,7 +151,15 @@ async fn setup_query(
     SchemaRef,
     AggregateStats,
 )> {
-    let plan = plan_query(cache, base, column, query_terms, operator, io_concurrency).await?;
+    let plan = plan_query(
+        cache,
+        metadata,
+        column,
+        query_terms,
+        operator,
+        io_concurrency,
+    )
+    .await?;
     let schema = resolve_schema(cache, &plan, column, select_columns, with_score).await?;
 
     let readers: Vec<SegmentReader> = plan
@@ -280,7 +288,7 @@ fn launch_pipeline(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
     cache: Arc<ObjectCache>,
-    base: Path,
+    metadata: &Metadata,
     column: String,
     query_text: &str,
     operator: Operator,
@@ -302,7 +310,7 @@ pub async fn run_query(
 
     let (work_items, unindexed_files, schema, agg) = setup_query(
         &cache,
-        &base,
+        metadata,
         &column,
         &query_terms,
         operator,
@@ -377,7 +385,7 @@ pub async fn run_query(
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query_collected(
     cache: Arc<ObjectCache>,
-    base: Path,
+    metadata: &Metadata,
     column: String,
     query_text: &str,
     operator: Operator,
@@ -399,7 +407,7 @@ pub async fn run_query_collected(
 
     let (work_items, unindexed_files, schema, agg) = setup_query(
         &cache,
-        &base,
+        metadata,
         &column,
         &query_terms,
         operator,

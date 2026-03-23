@@ -6,14 +6,11 @@ use std::sync::Arc;
 use anyhow::Result;
 use futures::stream::{self, StreamExt, TryStreamExt};
 
-use lakesearch_core::metadata::{Manifest, ManifestList, TermStats};
+use lakesearch_core::metadata::{Manifest, ManifestList, Metadata, TermStats};
 use lakesearch_core::segment::SegmentReader;
 
 use crate::object_cache::ObjectCache;
 use crate::Operator;
-use lakesearch_core::storage::{read_current, read_metadata};
-
-use object_store::path::Path;
 
 /// Result of query planning: segments to search and files needing brute-force.
 pub(crate) struct QueryPlan {
@@ -22,23 +19,19 @@ pub(crate) struct QueryPlan {
     pub unindexed_files: Vec<String>,
 }
 
-/// Loads metadata, resolves manifests, prunes by term stats, fetches segment
-/// bytes. Also identifies un-indexed files that need brute-force scanning.
+/// Resolves manifests, prunes by term stats, fetches segment bytes.
+/// Also identifies un-indexed files that need brute-force scanning.
 pub(crate) async fn plan_query(
     cache: &Arc<ObjectCache>,
-    base: &Path,
+    metadata: &Metadata,
     column: &str,
     query_terms: &[String],
     operator: Operator,
     io_concurrency: usize,
 ) -> Result<QueryPlan> {
-    // Read metadata chain
-    let current = read_current(cache.store().as_ref(), base).await?;
-    let metadata = read_metadata(cache.store().as_ref(), &current.value).await?;
-
     // Load manifest lists in parallel
     let manifest_lists: Vec<ManifestList> =
-        stream::iter(metadata.snapshot.manifest_lists.into_iter())
+        stream::iter(metadata.snapshot.manifest_lists.iter().cloned())
             .map(|ml_path| {
                 let cache = Arc::clone(cache);
                 async move { cache.get_json(&ml_path).await }
@@ -133,15 +126,12 @@ fn should_prune_segment(
 /// return schema without executing a query.
 pub async fn resolve_schema_from_table(
     cache: &Arc<ObjectCache>,
-    base: &Path,
+    metadata: &Metadata,
     column: &str,
     select_columns: &[String],
     with_score: bool,
 ) -> Result<arrow::datatypes::SchemaRef> {
     use super::{build_empty_schema, build_result_schema};
-
-    let current = lakesearch_core::storage::read_current(cache.store().as_ref(), base).await?;
-    let metadata = lakesearch_core::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
 
     // Try to find any data file from manifest lists to read its parquet schema.
     for ml_path in &metadata.snapshot.manifest_lists {

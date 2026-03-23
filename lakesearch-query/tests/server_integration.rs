@@ -13,12 +13,13 @@ use object_store::ObjectStore;
 use tonic::transport::Endpoint;
 
 use arrow_flight::FlightClient;
+use lakesearch_core::catalog_client::{CatalogClient, StaticCatalog, TableInfo};
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_indexer::run_index;
 use lakesearch_query::server::api_types::{
-    HealthResponse, ListTablesResponse, SearchResponse, TableInfo,
+    HealthResponse, ListTablesResponse, SearchResponse, TableInfo as ApiTableInfo,
 };
-use lakesearch_query::server::cache::MetadataCache;
+use lakesearch_query::server::cache::TableCache;
 use lakesearch_query::server::config::ServerConfig;
 use lakesearch_query::server::flight::LakeSearchFlightService;
 use lakesearch_query::server::routes::router;
@@ -26,16 +27,18 @@ use lakesearch_query::server::state::AppState;
 
 use helpers::{create_test_table, upload_test_parquet};
 
-/// Builds shared test state: creates table, registers with cache.
+/// Builds shared test state: creates table, registers with catalog + cache.
 async fn build_test_state(store: Arc<dyn ObjectStore>) -> AppState {
-    let base = Path::from("table");
-    create_test_table(store.as_ref(), &base, &["description"]).await;
+    let table_base = Path::from("table");
+    let index_base = table_base.child("lakesearch");
+    create_test_table(store.as_ref(), &index_base, &["description"]).await;
 
-    let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60), 8));
-    cache
-        .register_with_store("test", store.clone(), base)
-        .await
-        .unwrap();
+    let catalog: Arc<dyn CatalogClient> = Arc::new(StaticCatalog::new(vec![TableInfo {
+        name: "test".to_owned(),
+        location: "mem://table/".to_owned(),
+        store: Arc::clone(&store),
+        base: table_base,
+    }]));
 
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
@@ -48,10 +51,13 @@ async fn build_test_state(store: Arc<dyn ObjectStore>) -> AppState {
         tables: std::collections::HashMap::new(),
     };
 
+    let table_cache = Arc::new(TableCache::new(8));
+
     AppState {
         config: Arc::new(config),
         runtime: Arc::new(LakeRuntime::new(2)),
-        cache,
+        catalog,
+        table_cache,
     }
 }
 
@@ -98,7 +104,7 @@ async fn list_and_get_tables() {
     assert_eq!(resp.tables.len(), 1);
     assert_eq!(resp.tables[0].name, "test");
 
-    let resp: TableInfo = reqwest::get(format!("{base_url}/tables/test"))
+    let resp: ApiTableInfo = reqwest::get(format!("{base_url}/tables/test"))
         .await
         .unwrap()
         .json()
@@ -134,11 +140,12 @@ async fn search_round_trip() {
 
     let (base_url, handle) = start_test_server(Arc::clone(&store)).await;
 
-    // Index via CLI library
+    // Index via CLI library — write to the lakesearch sidecar path
+    let index_base = base.child("lakesearch");
     let runtime = LakeRuntime::new(2);
     run_index(
         &store,
-        &base,
+        &index_base,
         &["data/test.parquet".to_owned()],
         "description",
         &runtime,
@@ -257,11 +264,12 @@ async fn flight_do_get_round_trip() {
     // Start server first (creates initial table metadata)
     let (url, handle) = start_flight_server(Arc::clone(&store)).await;
 
-    // Index after server start so current.json exists
+    // Index after server start — write to sidecar path
+    let index_base = base.child("lakesearch");
     let runtime = LakeRuntime::new(2);
     run_index(
         &store,
-        &base,
+        &index_base,
         &["data/test.parquet".to_owned()],
         "description",
         &runtime,
@@ -277,17 +285,20 @@ async fn flight_do_get_round_trip() {
             "table": "test",
             "column": "description",
             "match": "error timeout",
-            "operator": "and"
+            "operator": "and",
+            "select": ["id"],
+            "score": "indexed",
+            "limit": 3
         }))
         .unwrap(),
     );
 
-    let record_batch_stream = client.do_get(ticket).await.unwrap();
-    let batches: Vec<_> = record_batch_stream.try_collect().await.unwrap();
+    let stream = client.do_get(ticket).await.unwrap();
+    let batches: Vec<_> = stream.try_collect().await.unwrap();
 
     let total_rows: usize = batches.iter().map(|b| b.num_rows()).sum();
-    // 2/5 descriptions have both "error" and "timeout" -> 40 matches
-    assert_eq!(total_rows, 40);
+    // 2/5 descriptions match "error timeout" → up to 40 hits, limited to 3
+    assert_eq!(total_rows, 3);
 
     handle.abort();
 }
@@ -299,14 +310,13 @@ async fn flight_get_flight_info_returns_schema() {
 
     upload_test_parquet(store.as_ref(), "data/test.parquet", 10, 5, &["hello world"]).await;
 
-    // Start server first (creates initial table metadata)
     let (url, handle) = start_flight_server(Arc::clone(&store)).await;
 
-    // Index after server start so current.json exists
+    let index_base = base.child("lakesearch");
     let runtime = LakeRuntime::new(2);
     run_index(
         &store,
-        &base,
+        &index_base,
         &["data/test.parquet".to_owned()],
         "description",
         &runtime,
