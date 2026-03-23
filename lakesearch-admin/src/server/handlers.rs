@@ -2,9 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use tracing::info;
 
-use lakesearch_core::metadata::{
-    ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot,
-};
+use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 
 use crate::cas;
 use crate::storage;
@@ -374,7 +372,11 @@ pub async fn start_backfill(
         &metadata,
         |meta| {
             let mut new = meta.clone();
-            if let Some(col) = new.indexed_columns.iter_mut().find(|c| c.name == column_name) {
+            if let Some(col) = new
+                .indexed_columns
+                .iter_mut()
+                .find(|c| c.name == column_name)
+            {
                 col.status = ColumnStatus::Backfilling;
                 col.backfill_manifest_lists = Some(snapshot_lists.clone());
             }
@@ -421,7 +423,7 @@ pub async fn backfill_status(
         .find(|c| c.name == column)
         .ok_or_else(|| ApiError::NotFound(format!("column '{column}' not found")))?;
 
-    let status_str = serde_json::to_value(&col.status)
+    let status_str = serde_json::to_value(col.status)
         .ok()
         .and_then(|v| v.as_str().map(String::from))
         .unwrap_or_else(|| format!("{:?}", col.status));
@@ -477,7 +479,7 @@ fn columns_to_info(columns: &[IndexedColumn]) -> Vec<ColumnInfo> {
         .map(|c| ColumnInfo {
             name: c.name.clone(),
             tokenizer: c.tokenizer.clone(),
-            status: serde_json::to_value(&c.status)
+            status: serde_json::to_value(c.status)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_else(|| format!("{:?}", c.status)),

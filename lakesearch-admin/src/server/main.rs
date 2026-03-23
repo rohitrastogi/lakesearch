@@ -5,6 +5,7 @@ use clap::Parser;
 use tracing::info;
 
 use cascadq_client::{CascadqClient, ClientConfig};
+use lakesearch_admin::reconcile;
 use lakesearch_admin::registry::TableRegistry;
 use lakesearch_admin::server::config::IngestConfig;
 use lakesearch_admin::server::routes::router;
@@ -57,20 +58,31 @@ async fn main() -> Result<()> {
         );
     }
 
+    let config = Arc::new(config);
+
+    // Start backfill reconciliation loop
+    let reconcile_handle = reconcile::start(
+        Arc::clone(&config),
+        Arc::clone(&registry),
+        Arc::clone(&cascadq),
+    );
+
     let state = AppState {
-        config: Arc::new(config.clone()),
+        config: Arc::clone(&config),
         cascadq,
         registry,
     };
 
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    info!(addr = %config.bind_addr, "starting admin server");
+    let bind_addr = config.bind_addr;
+    let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+    info!(addr = %bind_addr, "starting admin server");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
 
+    reconcile_handle.abort();
     info!("server stopped");
     Ok(())
 }
