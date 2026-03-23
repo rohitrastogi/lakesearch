@@ -1,12 +1,14 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use arrow_flight::flight_service_server::FlightServiceServer;
 use clap::Parser;
 use tracing::info;
 
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_query::server::cache::MetadataCache;
 use lakesearch_query::server::config::ServerConfig;
+use lakesearch_query::server::flight::LakeSearchFlightService;
 use lakesearch_query::server::routes::router;
 use lakesearch_query::server::state::AppState;
 
@@ -47,13 +49,22 @@ async fn main() -> Result<()> {
         cache,
     };
 
-    let app = router(state);
+    let app = router(state.clone());
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
-    info!(addr = %config.bind_addr, "starting query server");
+    info!(addr = %config.bind_addr, "starting REST query server");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    let flight_svc = LakeSearchFlightService::new(state);
+    let flight_addr = config.flight_addr;
+    info!(addr = %flight_addr, "starting Flight query server");
+
+    let (rest_result, flight_result) = tokio::join!(
+        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
+        tonic::transport::Server::builder()
+            .add_service(FlightServiceServer::new(flight_svc))
+            .serve_with_shutdown(flight_addr, shutdown_signal()),
+    );
+    rest_result?;
+    flight_result?;
 
     poll_handle.abort();
     info!("server stopped");

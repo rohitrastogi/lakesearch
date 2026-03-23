@@ -13,6 +13,7 @@ mod rank;
 pub mod types;
 mod verify;
 
+pub use plan::resolve_schema_from_table;
 pub use types::{CollectedQueryResult, QueryStats};
 
 use std::collections::HashMap;

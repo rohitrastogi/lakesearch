@@ -31,6 +31,9 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace"] }
+arrow-flight = "54"
+tonic = "0.12"
+prost = "0.13"
 
 [dev-dependencies]
 lakesearch-core = { path = "../lakesearch-core", features = ["test-utils"] }
