@@ -4,4 +4,4 @@
 bind_addr: "0.0.0.0:8080"
 flight_addr: "0.0.0.0:8081"
 tables:
-  events: "file://WORKDIR/demo/data/lakesearch/"
+  events: "file://WORKDIR/demo/data/"
