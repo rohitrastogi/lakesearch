@@ -81,17 +81,56 @@ pub async fn run_query(
             .try_collect::<Vec<_>>()
             .await?;
 
-    let mut segment_paths: Vec<String> = Vec::new();
+    // Tokenize query early so we can use terms for segment pruning
+    let query_terms = tokenize(query_text);
+    if query_terms.is_empty() {
+        return Ok(QueryResult {
+            matches: vec![],
+            stats: QueryStats::default(),
+        });
+    }
+
+    // Collect manifest paths, then load in parallel
+    let mut manifest_paths: Vec<(String, lakesearch_core::metadata::TermStats)> = Vec::new();
     for ml in &manifest_lists {
         for me in &ml.manifests {
             if me.indexed_column != column {
                 continue;
             }
-            let manifest: lakesearch_core::metadata::Manifest =
-                cache.get_json(&me.manifest_path).await?;
-            for seg_info in &manifest.segments {
-                segment_paths.push(seg_info.segment_path.clone());
-            }
+            manifest_paths.push((me.manifest_path.clone(), me.term_stats.clone()));
+        }
+    }
+
+    let manifest_path_strs: Vec<String> =
+        manifest_paths.iter().map(|(p, _)| p.clone()).collect();
+    let manifests: Vec<lakesearch_core::metadata::Manifest> =
+        stream::iter(manifest_path_strs.into_iter())
+            .map(|path| {
+                let cache = Arc::clone(&cache);
+                async move { cache.get_json(&path).await }
+            })
+            .buffered(IO_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+    // Collect segment paths, pruning by term_stats range
+    let mut segment_paths: Vec<String> = Vec::new();
+    for ((_path, term_stats), manifest) in manifest_paths.iter().zip(manifests.iter()) {
+        // Segment pruning: skip segments where query terms fall outside the
+        // term range. For AND, skip if any term is out of range. For OR,
+        // skip only if all terms are out of range.
+        let term_in_range =
+            |t: &str| t >= term_stats.min_term.as_str() && t <= term_stats.max_term.as_str();
+        let dominated = match operator {
+            Operator::And => query_terms.iter().any(|t| !term_in_range(t)),
+            Operator::Or => query_terms.iter().all(|t| !term_in_range(t)),
+        };
+        if dominated && !term_stats.min_term.is_empty() {
+            continue;
+        }
+
+        for seg_info in &manifest.segments {
+            segment_paths.push(seg_info.segment_path.clone());
         }
     }
 
@@ -113,15 +152,6 @@ pub async fn run_query(
     }
 
     info!(segments = segment_bytes_list.len(), "loaded segments");
-
-    // 3. Tokenize query
-    let query_terms = tokenize(query_text);
-    if query_terms.is_empty() {
-        return Ok(QueryResult {
-            matches: vec![],
-            stats: QueryStats::default(),
-        });
-    }
 
     let mut all_matches = Vec::new();
     let mut stats = QueryStats::default();
@@ -311,17 +341,31 @@ pub async fn run_query(
         }
     }
 
-    // Sort by score descending if scoring
-    if with_score {
+    // Top-K: when scoring + limit, use a min-heap to keep only the top K
+    // by score. This avoids sorting all matches when only K are needed.
+    if let (true, Some(k)) = (with_score, limit) {
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<ScoredMatch>> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for m in all_matches {
+            let s = m.score.unwrap_or(0.0);
+            heap.push(std::cmp::Reverse(ScoredMatch { score: s, row: m }));
+            if heap.len() > k {
+                heap.pop();
+            }
+        }
+        all_matches = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| r.0.row)
+            .collect();
+    } else if with_score {
         all_matches.sort_by(|a, b| {
             b.score
                 .unwrap_or(0.0)
                 .partial_cmp(&a.score.unwrap_or(0.0))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
-    }
-
-    if let Some(limit) = limit {
+    } else if let Some(limit) = limit {
         all_matches.truncate(limit);
     }
 
@@ -336,6 +380,34 @@ pub async fn run_query(
         matches: all_matches,
         stats,
     })
+}
+
+/// Wrapper for top-K heap ordering by score (ascending — min-heap).
+struct ScoredMatch {
+    score: f64,
+    row: MatchedRow,
+}
+
+impl PartialEq for ScoredMatch {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score
+    }
+}
+
+impl Eq for ScoredMatch {}
+
+impl PartialOrd for ScoredMatch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScoredMatch {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    }
 }
 
 /// CPU-bound: verify rows against query, optionally score, and extract select columns.
@@ -358,6 +430,8 @@ fn verify_and_score_batches(
     let mut matches = Vec::new();
     let mut rows_scanned = 0usize;
     let mut rows_matched = 0usize;
+    let single_term = query_terms.len() == 1;
+    let few_terms = query_terms.len() <= 4;
 
     for batch in batches {
         let col = batch.column(indexed_batch_col);
@@ -371,11 +445,22 @@ fn verify_and_score_batches(
 
             let text = string_value(col.as_ref(), row, is_large);
             let tokens = tokenize(text);
-            let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
 
-            let matches_query = match operator {
-                Operator::And => query_terms.iter().all(|t| token_set.contains(t.as_str())),
-                Operator::Or => query_terms.iter().any(|t| token_set.contains(t.as_str())),
+            // Fast path: single-term query — no HashSet needed
+            let matches_query = if single_term {
+                tokens.iter().any(|t| t == &query_terms[0])
+            } else if few_terms {
+                // Small query: linear scan beats HashSet construction
+                match operator {
+                    Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
+                    Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
+                }
+            } else {
+                let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
+                match operator {
+                    Operator::And => query_terms.iter().all(|t| token_set.contains(t.as_str())),
+                    Operator::Or => query_terms.iter().any(|t| token_set.contains(t.as_str())),
+                }
             };
 
             if !matches_query {
@@ -384,15 +469,13 @@ fn verify_and_score_batches(
 
             rows_matched += 1;
 
+            // Only build frequency map when scoring
             let score = if with_score {
                 let dl = tokens.len() as u32;
-                let mut freq: HashMap<&str, u32> = HashMap::new();
-                for t in &tokens {
-                    *freq.entry(t.as_str()).or_default() += 1;
-                }
                 let mut total_score = 0.0;
                 for (term, df) in term_infos {
-                    if let Some(&tf) = freq.get(term.as_str()) {
+                    let tf = tokens.iter().filter(|t| *t == term).count() as u32;
+                    if tf > 0 {
                         total_score += bm25::score(tf, dl, avg_dl, *df as u64, total_rows);
                     }
                 }
