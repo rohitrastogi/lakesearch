@@ -103,17 +103,7 @@ pub async fn search(
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(Json(SearchResponse {
-        rows: result
-            .matches
-            .into_iter()
-            .map(|m| SearchRow {
-                file: m.file,
-                row_group: m.row_group,
-                text: m.text,
-                score: m.score,
-                columns: m.columns,
-            })
-            .collect(),
+        rows: result.matches,
         stats: SearchStats {
             candidate_pages: result.stats.candidate_pages,
             rows_scanned: result.stats.rows_scanned,

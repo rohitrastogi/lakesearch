@@ -63,21 +63,11 @@ impl From<OperatorStr> for crate::Operator {
     }
 }
 
+/// Search response wraps QueryResult with elapsed_ms.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
-    pub rows: Vec<SearchRow>,
+    pub rows: Vec<crate::query::MatchedRow>,
     pub stats: SearchStats,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SearchRow {
-    pub file: String,
-    pub row_group: u16,
-    pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub score: Option<f64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub columns: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

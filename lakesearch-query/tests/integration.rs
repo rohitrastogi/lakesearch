@@ -1,5 +1,7 @@
 //! Integration tests for object storage commands using InMemory store.
 
+mod helpers;
+
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -14,12 +16,13 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use lakesearch_cli::index::run_index;
-use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_query::object_cache::ObjectCache;
 use lakesearch_query::query::{self, QueryResult};
-use lakesearch_query::storage::{read_current, read_metadata, write_json};
+use lakesearch_query::storage::{read_current, read_metadata};
 use lakesearch_query::Operator;
+
+use helpers::{create_test_table, upload_test_parquet};
 
 /// Test helper: wraps run_query with reference-based args for convenience.
 #[allow(clippy::too_many_arguments)]
@@ -52,96 +55,6 @@ async fn run_query(
         Arc::new(LakeRuntime::new(2)),
     )
     .await
-}
-
-/// Creates a test Parquet file in memory and uploads it to the InMemory store.
-/// Returns the path where it was stored.
-async fn upload_test_parquet(
-    store: &dyn ObjectStore,
-    path: &str,
-    num_rows: usize,
-    page_size_rows: usize,
-    descriptions: &[&str],
-) -> String {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("description", DataType::Utf8, true),
-    ]));
-
-    let ids: Vec<i32> = (0..num_rows as i32).collect();
-    let descs: Vec<Option<&str>> = (0..num_rows)
-        .map(|i| Some(descriptions[i % descriptions.len()]))
-        .collect();
-
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(descs)) as ArrayRef,
-        ],
-    )
-    .unwrap();
-
-    let mut buf = Vec::new();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(page_size_rows)
-        .set_max_row_group_size(num_rows)
-        .set_dictionary_enabled(false)
-        .build();
-    {
-        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-        writer.write(&batch).unwrap();
-        writer.close().unwrap();
-    }
-
-    let obj_path = Path::from(path);
-    store
-        .put(&obj_path, PutPayload::from(Bytes::from(buf)))
-        .await
-        .unwrap();
-
-    path.to_owned()
-}
-
-/// Creates a table with initial metadata in the InMemory store.
-async fn create_test_table(store: &dyn ObjectStore, base: &Path, columns: &[&str]) {
-    let indexed_columns: Vec<IndexedColumn> = columns
-        .iter()
-        .map(|name| IndexedColumn {
-            name: (*name).to_owned(),
-            tokenizer: lakesearch_core::tokenizer::DEFAULT_TOKENIZER.to_owned(),
-            status: ColumnStatus::Active,
-        })
-        .collect();
-
-    let metadata = Metadata {
-        format_version: 1,
-        table_id: "test-table-id".to_owned(),
-        table_name: "test".to_owned(),
-        location: "mem://table/".to_owned(),
-        indexed_columns,
-        snapshot: Snapshot {
-            timestamp_ms: 1000,
-            manifest_lists: vec![],
-        },
-    };
-
-    let meta_path = format!("{}/metadata/metadata-init.json", base);
-    write_json(store, &Path::from(meta_path.as_str()), &metadata)
-        .await
-        .unwrap();
-
-    let pointer = CurrentPointer {
-        metadata_path: meta_path,
-        updated_at: "2026-01-01T00:00:00Z".to_owned(),
-    };
-    write_json(
-        store,
-        &base.child("metadata").child("current.json"),
-        &pointer,
-    )
-    .await
-    .unwrap();
 }
 
 #[tokio::test]

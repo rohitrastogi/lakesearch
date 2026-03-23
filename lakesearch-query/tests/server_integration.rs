@@ -1,21 +1,15 @@
 //! HTTP server integration tests using InMemory object store.
 
+mod helpers;
+
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, StringArray};
-use arrow::datatypes::{DataType, Field, Schema};
-use arrow::record_batch::RecordBatch;
-use bytes::Bytes;
 use object_store::memory::InMemory;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutPayload};
-use parquet::arrow::ArrowWriter;
-use parquet::file::properties::WriterProperties;
+use object_store::ObjectStore;
 
 use lakesearch_cli::index::run_index;
-use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
-use lakesearch_core::tokenizer::DEFAULT_TOKENIZER;
 use lakesearch_query::server::api_types::{
     HealthResponse, ListTablesResponse, SearchResponse, TableInfo,
 };
@@ -23,89 +17,14 @@ use lakesearch_query::server::cache::MetadataCache;
 use lakesearch_query::server::config::ServerConfig;
 use lakesearch_query::server::routes::router;
 use lakesearch_query::server::state::AppState;
-use lakesearch_query::storage::write_json;
 
-/// Uploads a test Parquet file to the InMemory store.
-async fn upload_test_parquet(
-    store: &dyn ObjectStore,
-    path: &str,
-    num_rows: usize,
-    descriptions: &[&str],
-) {
-    let schema = Arc::new(Schema::new(vec![
-        Field::new("id", DataType::Int32, false),
-        Field::new("description", DataType::Utf8, true),
-    ]));
-    let ids: Vec<i32> = (0..num_rows as i32).collect();
-    let descs: Vec<Option<&str>> = (0..num_rows)
-        .map(|i| Some(descriptions[i % descriptions.len()]))
-        .collect();
-    let batch = RecordBatch::try_new(
-        schema.clone(),
-        vec![
-            Arc::new(Int32Array::from(ids)) as ArrayRef,
-            Arc::new(StringArray::from(descs)) as ArrayRef,
-        ],
-    )
-    .unwrap();
-
-    let mut buf = Vec::new();
-    let props = WriterProperties::builder()
-        .set_data_page_row_count_limit(25)
-        .set_max_row_group_size(num_rows)
-        .set_dictionary_enabled(false)
-        .build();
-    let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
-    writer.write(&batch).unwrap();
-    writer.close().unwrap();
-
-    store
-        .put(&Path::from(path), PutPayload::from(Bytes::from(buf)))
-        .await
-        .unwrap();
-}
-
-/// Creates table metadata in the InMemory store.
-async fn create_table_metadata(store: &dyn ObjectStore, base: &Path) {
-    let metadata = Metadata {
-        format_version: 1,
-        table_id: "test-id".to_owned(),
-        table_name: "test".to_owned(),
-        location: "mem://table/".to_owned(),
-        indexed_columns: vec![IndexedColumn {
-            name: "description".to_owned(),
-            tokenizer: DEFAULT_TOKENIZER.to_owned(),
-            status: ColumnStatus::Active,
-        }],
-        snapshot: Snapshot {
-            timestamp_ms: 1000,
-            manifest_lists: vec![],
-        },
-    };
-
-    let meta_path = format!("{}/metadata/metadata-init.json", base);
-    write_json(store, &Path::from(meta_path.as_str()), &metadata)
-        .await
-        .unwrap();
-
-    let pointer = CurrentPointer {
-        metadata_path: meta_path,
-        updated_at: "2026-01-01T00:00:00Z".to_owned(),
-    };
-    write_json(
-        store,
-        &base.child("metadata").child("current.json"),
-        &pointer,
-    )
-    .await
-    .unwrap();
-}
+use helpers::{create_test_table, upload_test_parquet};
 
 /// Starts a test server with the given InMemory store and table registered.
 /// Returns the base URL and a handle to the server task.
 async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task::JoinHandle<()>) {
     let base = Path::from("table");
-    create_table_metadata(store.as_ref(), &base).await;
+    create_test_table(store.as_ref(), &base, &["description"]).await;
 
     let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60)));
     cache
@@ -191,6 +110,7 @@ async fn search_round_trip() {
         store.as_ref(),
         "data/test.parquet",
         100,
+        25,
         &[
             "error timeout connection refused",
             "success response ok",
