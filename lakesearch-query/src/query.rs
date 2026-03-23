@@ -235,14 +235,13 @@ async fn plan_query(
             .try_collect()
             .await?;
 
-    // Derive full file set and indexed file set
+    // Single pass: collect all data files and all column manifest paths.
+    // Track which are pruned (for segment collection) vs not (for indexed file detection).
     let mut all_files: HashSet<String> = HashSet::new();
-    let mut indexed_files: HashSet<String> = HashSet::new();
+    let mut col_manifest_paths: Vec<String> = Vec::new();
+    let mut pruned_paths: HashSet<String> = HashSet::new();
 
-    // Collect manifest paths for the target column, pruning by term stats
-    let mut manifest_paths: Vec<String> = Vec::new();
     for ml in &manifest_lists {
-        // All data_files across all manifest lists = full file inventory
         for df in &ml.data_files {
             all_files.insert(df.path.clone());
         }
@@ -250,28 +249,15 @@ async fn plan_query(
             if me.indexed_column != column {
                 continue;
             }
-            // Files referenced by manifests for this column are indexed
-            // (we'll collect them after loading the manifests)
+            col_manifest_paths.push(me.manifest_path.clone());
             if should_prune_segment(&me.term_stats, query_terms, operator) {
-                continue;
-            }
-            manifest_paths.push(me.manifest_path.clone());
-        }
-    }
-
-    // Also collect ALL manifest paths for the column (not just non-pruned)
-    // to determine which files are indexed
-    let mut all_col_manifest_paths: Vec<String> = Vec::new();
-    for ml in &manifest_lists {
-        for me in &ml.manifests {
-            if me.indexed_column == column {
-                all_col_manifest_paths.push(me.manifest_path.clone());
+                pruned_paths.insert(me.manifest_path.clone());
             }
         }
     }
 
-    // Load all manifests for this column to determine indexed files
-    let all_col_manifests: Vec<Manifest> = stream::iter(all_col_manifest_paths.into_iter())
+    // Load all column manifests once (cache ensures no redundant fetches)
+    let col_manifests: Vec<Manifest> = stream::iter(col_manifest_paths.iter().cloned())
         .map(|path| {
             let cache = Arc::clone(cache);
             async move { cache.get_json(&path).await }
@@ -280,34 +266,23 @@ async fn plan_query(
         .try_collect()
         .await?;
 
-    for manifest in &all_col_manifests {
+    // Walk all manifests to determine indexed files + collect segment paths
+    // from non-pruned manifests.
+    let mut indexed_files: HashSet<String> = HashSet::new();
+    let mut segment_paths: Vec<String> = Vec::new();
+
+    for (path, manifest) in col_manifest_paths.iter().zip(col_manifests.iter()) {
         for seg in &manifest.segments {
             for pf in &seg.parquet_files {
                 indexed_files.insert(pf.path.clone());
             }
+            if !pruned_paths.contains(path) {
+                segment_paths.push(seg.segment_path.clone());
+            }
         }
     }
 
-    // Un-indexed files = all_files - indexed_files
     let unindexed_files: Vec<String> = all_files.difference(&indexed_files).cloned().collect();
-
-    // Load non-pruned manifests (subset we already fetched above — use cache)
-    let manifests: Vec<Manifest> = stream::iter(manifest_paths.into_iter())
-        .map(|path| {
-            let cache = Arc::clone(cache);
-            async move { cache.get_json(&path).await }
-        })
-        .buffered(IO_CONCURRENCY)
-        .try_collect()
-        .await?;
-
-    // Collect segment paths from surviving manifests
-    let mut segment_paths: Vec<String> = Vec::new();
-    for manifest in &manifests {
-        for seg in &manifest.segments {
-            segment_paths.push(seg.segment_path.clone());
-        }
-    }
 
     // Load segment bytes in parallel
     let segments = stream::iter(segment_paths.into_iter())
