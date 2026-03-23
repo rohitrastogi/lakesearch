@@ -244,6 +244,92 @@ pub async fn update_columns(
     Ok(Json(UpdateColumnsResponse { columns }))
 }
 
+pub async fn ingest(
+    State(state): State<AppState>,
+    Path(table_id): Path<String>,
+    Json(req): Json<IngestRequest>,
+) -> Result<Json<IngestResponse>, ApiError> {
+    if req.files.is_empty() {
+        return Err(ApiError::BadRequest("files list is empty".to_owned()));
+    }
+
+    let reg = state
+        .registry
+        .get(&table_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+
+    // Read metadata to get active columns
+    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // Determine which columns to push tasks for
+    let target_columns: Vec<String> = if req.columns.is_empty() {
+        metadata
+            .indexed_columns
+            .iter()
+            .filter(|c| c.status != ColumnStatus::Dropped)
+            .map(|c| c.name.clone())
+            .collect()
+    } else {
+        // Validate that requested columns exist and are not dropped
+        for col_name in &req.columns {
+            let col = metadata
+                .indexed_columns
+                .iter()
+                .find(|c| c.name == *col_name);
+            match col {
+                None => {
+                    return Err(ApiError::BadRequest(format!(
+                        "column '{col_name}' not found"
+                    )))
+                }
+                Some(c) if c.status == ColumnStatus::Dropped => {
+                    return Err(ApiError::BadRequest(format!(
+                        "column '{col_name}' is dropped"
+                    )))
+                }
+                _ => {}
+            }
+        }
+        req.columns
+    };
+
+    let mut tasks_pushed = 0;
+    for column in &target_columns {
+        let payload = IndexTaskPayload {
+            table_location: reg.location.clone(),
+            files: req.files.clone(),
+            column: column.clone(),
+        };
+        let json_payload = serde_json::to_value(&payload).map_err(|e| {
+            ApiError::Internal(anyhow::anyhow!("failed to serialize task payload: {e}"))
+        })?;
+
+        state
+            .cascadq
+            .push(&reg.queue, json_payload)
+            .await
+            .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to push to cascadq: {e}")))?;
+
+        tasks_pushed += 1;
+    }
+
+    info!(
+        table_id = %table_id,
+        files = req.files.len(),
+        columns = target_columns.len(),
+        tasks_pushed,
+        "pushed ingest tasks"
+    );
+
+    Ok(Json(IngestResponse { tasks_pushed }))
+}
+
 fn columns_to_info(columns: &[IndexedColumn]) -> Vec<ColumnInfo> {
     columns
         .iter()

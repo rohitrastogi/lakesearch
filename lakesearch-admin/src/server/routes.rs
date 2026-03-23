@@ -16,6 +16,10 @@ pub fn router(state: AppState) -> Router {
             "/tables/{table_id}/columns",
             put(handlers::update_columns),
         )
+        .route(
+            "/tables/{table_id}/ingest",
+            post(handlers::ingest),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

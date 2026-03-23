@@ -82,3 +82,27 @@ pub struct UpdateColumnsRequest {
 pub struct UpdateColumnsResponse {
     pub columns: Vec<ColumnInfo>,
 }
+
+// --- Ingest ---
+
+#[derive(Debug, Deserialize)]
+pub struct IngestRequest {
+    /// Parquet file paths to index.
+    pub files: Vec<String>,
+    /// If provided, only push tasks for these columns. Otherwise, all active columns.
+    #[serde(default)]
+    pub columns: Vec<String>,
+}
+
+/// Task payload pushed to cascadq for indexer workers.
+#[derive(Debug, Serialize)]
+pub struct IndexTaskPayload {
+    pub table_location: String,
+    pub files: Vec<String>,
+    pub column: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestResponse {
+    pub tasks_pushed: usize,
+}
