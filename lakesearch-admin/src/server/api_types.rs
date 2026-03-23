@@ -1,3 +1,4 @@
+use lakesearch_core::metadata::ColumnStatus;
 use serde::{Deserialize, Serialize};
 
 // --- Health ---
@@ -45,7 +46,7 @@ pub struct TableInfoResponse {
 pub struct ColumnInfo {
     pub name: String,
     pub tokenizer: String,
-    pub status: String,
+    pub status: ColumnStatus,
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +125,7 @@ pub struct StartBackfillResponse {
 #[derive(Debug, Serialize)]
 pub struct BackfillStatusResponse {
     pub column: String,
-    pub status: String,
+    pub status: ColumnStatus,
     pub total_files: usize,
     pub indexed_files: usize,
     pub uncovered_files: usize,

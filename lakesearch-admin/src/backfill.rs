@@ -88,7 +88,10 @@ pub async fn find_uncovered_files(
         }
     }
 
-    let uncovered: Vec<String> = target_files.difference(&indexed).cloned().collect();
+    // Sort for deterministic chunking: prevents overlapping batches when
+    // the reconciliation loop re-derives uncovered files across polls.
+    let mut uncovered: Vec<String> = target_files.difference(&indexed).cloned().collect();
+    uncovered.sort();
     let indexed_files = total_files - uncovered.len();
 
     Ok(UncoveredFiles {

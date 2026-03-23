@@ -28,6 +28,8 @@ pub struct IngestConfig {
     pub backfill_poll_secs: u64,
     #[serde(default = "default_backfill_chunk_size")]
     pub backfill_chunk_size: usize,
+    #[serde(default = "default_io_concurrency")]
+    pub io_concurrency: usize,
     #[serde(default)]
     pub tables: std::collections::HashMap<String, TableConfig>,
 }
@@ -59,6 +61,7 @@ impl Default for IngestConfig {
             cascadq_url: default_cascadq_url(),
             backfill_poll_secs: default_backfill_poll_secs(),
             backfill_chunk_size: default_backfill_chunk_size(),
+            io_concurrency: default_io_concurrency(),
             tables: std::collections::HashMap::new(),
         }
     }
@@ -78,4 +81,8 @@ fn default_backfill_poll_secs() -> u64 {
 
 fn default_backfill_chunk_size() -> usize {
     100
+}
+
+fn default_io_concurrency() -> usize {
+    8
 }

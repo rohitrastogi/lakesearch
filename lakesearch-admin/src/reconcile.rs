@@ -11,7 +11,9 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use cascadq_client::CascadqClient;
-use lakesearch_core::metadata::ColumnStatus;
+use lakesearch_core::metadata::{ColumnStatus, Metadata};
+use object_store::path::Path;
+use object_store::ObjectStore;
 
 use crate::backfill::find_uncovered_files;
 use crate::registry::TableRegistry;
@@ -74,16 +76,43 @@ async fn reconcile_once(
                 continue;
             }
             let backfill_lists = match &col.backfill_manifest_lists {
-                Some(lists) if !lists.is_empty() => lists,
-                _ => continue,
+                Some(lists) => lists,
+                None => continue,
             };
+
+            // Empty snapshot (e.g. brand-new table) → nothing to backfill
+            if backfill_lists.is_empty() {
+                let column_name = col.name.clone();
+                info!(
+                    table_id = %table.table_id,
+                    column = %column_name,
+                    "empty backfill snapshot, transitioning to active"
+                );
+                if let Err(e) = transition_to_active(
+                    table.store.as_ref(),
+                    &table.base,
+                    current.e_tag.clone(),
+                    &metadata,
+                    &column_name,
+                )
+                .await
+                {
+                    warn!(
+                        table_id = %table.table_id,
+                        column = %col.name,
+                        error = %e,
+                        "failed to transition column to active"
+                    );
+                }
+                continue;
+            }
 
             let uncovered = match find_uncovered_files(
                 table.store.as_ref(),
                 &metadata,
                 &col.name,
                 backfill_lists,
-                8,
+                config.io_concurrency,
             )
             .await
             {
@@ -100,32 +129,18 @@ async fn reconcile_once(
             };
 
             if uncovered.uncovered.is_empty() {
-                // All files covered — transition to active
                 let column_name = col.name.clone();
                 info!(
                     table_id = %table.table_id,
                     column = %column_name,
                     "backfill complete, transitioning to active"
                 );
-
-                if let Err(e) = cas::commit_metadata(
+                if let Err(e) = transition_to_active(
                     table.store.as_ref(),
                     &table.base,
                     current.e_tag.clone(),
                     &metadata,
-                    None,
-                    |meta| {
-                        let mut new = meta.clone();
-                        if let Some(c) = new
-                            .indexed_columns
-                            .iter_mut()
-                            .find(|c| c.name == column_name)
-                        {
-                            c.status = ColumnStatus::Active;
-                            c.backfill_manifest_lists = None;
-                        }
-                        new
-                    },
+                    &column_name,
                 )
                 .await
                 {
@@ -183,4 +198,31 @@ async fn reconcile_once(
     }
 
     Ok(())
+}
+
+/// Transitions a backfilling column to active via CAS.
+///
+/// Guards against concurrent drops: if the column was dropped between
+/// the read and the CAS rebase, the closure preserves the dropped status
+/// instead of overwriting it with active.
+async fn transition_to_active(
+    store: &dyn ObjectStore,
+    base: &Path,
+    etag: Option<String>,
+    metadata: &Metadata,
+    column_name: &str,
+) -> Result<()> {
+    let name = column_name.to_owned();
+    cas::commit_metadata(store, base, etag, metadata, None, |meta| {
+        let mut new = meta.clone();
+        if let Some(c) = new.indexed_columns.iter_mut().find(|c| c.name == name) {
+            // Only transition if still backfilling — don't overwrite a concurrent drop
+            if c.status == ColumnStatus::Backfilling {
+                c.status = ColumnStatus::Active;
+                c.backfill_manifest_lists = None;
+            }
+        }
+        new
+    })
+    .await
 }

@@ -192,51 +192,47 @@ pub async fn update_columns(
     let add_defs = req.add;
     let drop_names = req.drop;
 
+    let apply_changes = |meta: &Metadata| {
+        let mut new = meta.clone();
+
+        // Drop columns (soft-delete)
+        for col in &mut new.indexed_columns {
+            if drop_names.contains(&col.name) && col.status != ColumnStatus::Dropped {
+                col.status = ColumnStatus::Dropped;
+                col.backfill_manifest_lists = None;
+            }
+        }
+
+        // Add new columns (skip if name already exists)
+        for def in &add_defs {
+            if new.indexed_columns.iter().any(|c| c.name == def.name) {
+                continue;
+            }
+            new.indexed_columns.push(IndexedColumn {
+                name: def.name.clone(),
+                tokenizer: def.tokenizer.clone(),
+                status: ColumnStatus::Active,
+                backfill_manifest_lists: None,
+            });
+        }
+
+        new
+    };
+
     cas::commit_metadata(
         reg.store.as_ref(),
         &reg.base,
         current.e_tag,
         &metadata,
         None,
-        |meta| {
-            let mut new = meta.clone();
-
-            // Drop columns (soft-delete)
-            for col in &mut new.indexed_columns {
-                if drop_names.contains(&col.name) && col.status != ColumnStatus::Dropped {
-                    col.status = ColumnStatus::Dropped;
-                    col.backfill_manifest_lists = None;
-                }
-            }
-
-            // Add new columns (skip if name already exists)
-            for def in &add_defs {
-                if new.indexed_columns.iter().any(|c| c.name == def.name) {
-                    continue;
-                }
-                new.indexed_columns.push(IndexedColumn {
-                    name: def.name.clone(),
-                    tokenizer: def.tokenizer.clone(),
-                    status: ColumnStatus::Active,
-                    backfill_manifest_lists: None,
-                });
-            }
-
-            new
-        },
+        &apply_changes,
     )
     .await
     .map_err(ApiError::Internal)?;
 
-    // Re-read committed state for response
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
-        .await
-        .map_err(ApiError::Internal)?;
-    let final_meta = storage::read_metadata(reg.store.as_ref(), &current.value)
-        .await
-        .map_err(ApiError::Internal)?;
-
-    let columns = columns_to_info(&final_meta.indexed_columns);
+    // Build response from the mutation we just committed
+    let committed = apply_changes(&metadata);
+    let columns = columns_to_info(&committed.indexed_columns);
 
     info!(table_id = %table_id, "updated columns");
 
@@ -425,18 +421,13 @@ pub async fn backfill_status(
         .find(|c| c.name == column)
         .ok_or_else(|| ApiError::NotFound(format!("column '{column}' not found")))?;
 
-    let status_str = serde_json::to_value(col.status)
-        .ok()
-        .and_then(|v| v.as_str().map(String::from))
-        .unwrap_or_else(|| format!("{:?}", col.status));
-
     // If not backfilling (or no snapshot), return zeroed progress
     let backfill_lists = match &col.backfill_manifest_lists {
         Some(lists) if col.status == ColumnStatus::Backfilling => lists,
         _ => {
             return Ok(Json(BackfillStatusResponse {
                 column,
-                status: status_str,
+                status: col.status,
                 total_files: 0,
                 indexed_files: 0,
                 uncovered_files: 0,
@@ -454,7 +445,7 @@ pub async fn backfill_status(
         &metadata,
         &column,
         backfill_lists,
-        8, // default io_concurrency
+        state.config.io_concurrency,
     )
     .await
     .map_err(ApiError::Internal)?;
@@ -467,7 +458,7 @@ pub async fn backfill_status(
 
     Ok(Json(BackfillStatusResponse {
         column,
-        status: status_str,
+        status: col.status,
         total_files: result.total_files,
         indexed_files: result.indexed_files,
         uncovered_files: result.uncovered.len(),
@@ -481,10 +472,7 @@ fn columns_to_info(columns: &[IndexedColumn]) -> Vec<ColumnInfo> {
         .map(|c| ColumnInfo {
             name: c.name.clone(),
             tokenizer: c.tokenizer.clone(),
-            status: serde_json::to_value(c.status)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| format!("{:?}", c.status)),
+            status: c.status,
         })
         .collect()
 }
