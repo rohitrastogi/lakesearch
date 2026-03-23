@@ -1,3 +1,3 @@
 [workspace]
-members = ["lakesearch-core", "lakesearch-query", "lakesearch-cli"]
+members = ["lakesearch-core", "lakesearch-indexer", "lakesearch-query", "lakesearch-cli"]
 resolver = "2"

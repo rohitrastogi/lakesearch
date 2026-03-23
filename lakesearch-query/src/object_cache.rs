@@ -12,8 +12,8 @@ use moka::future::Cache;
 use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 
-use crate::parquet_util::load_parquet_metadata_async;
-use crate::storage::load_bytes;
+use lakesearch_core::parquet_util::load_parquet_metadata_async;
+use lakesearch_core::storage::load_bytes;
 
 /// Default max cache size in bytes (256 MB).
 const DEFAULT_MAX_BYTES: u64 = 256 * 1024 * 1024;

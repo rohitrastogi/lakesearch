@@ -73,12 +73,37 @@ impl SegmentBuilder {
         // --- Posting Blocks ---
         let posting_offset = buf.len() as u64;
 
-        // Encode each term's posting list and track offsets.
-        // We consume self.terms via into_iter to avoid cloning term strings.
+        // Phase 1: Encode all posting lists in parallel on rayon, producing
+        // (term, encoded_bytes, doc_frequency). The BTreeMap iteration order
+        // is lexicographic, which we preserve for the serial assembly step.
+        let terms_vec: Vec<(String, (Vec<DocId>, u32))> = self.terms.into_iter().collect();
+
+        #[cfg(feature = "runtime")]
+        let encoded_postings: Vec<(String, Vec<u8>, u32)> = {
+            use rayon::prelude::*;
+            terms_vec
+                .into_par_iter()
+                .map(|(term, (doc_ids, df))| {
+                    let encoded = posting::encode(&doc_ids);
+                    (term, encoded, df)
+                })
+                .collect()
+        };
+
+        #[cfg(not(feature = "runtime"))]
+        let encoded_postings: Vec<(String, Vec<u8>, u32)> = terms_vec
+            .into_iter()
+            .map(|(term, (doc_ids, df))| {
+                let encoded = posting::encode(&doc_ids);
+                (term, encoded, df)
+            })
+            .collect();
+
+        // Phase 2: Serial assembly — write encoded postings into buffer
+        // sequentially (required for offset tracking).
         let mut term_postings: Vec<(String, u64, u32, u32)> = Vec::new(); // (term, offset, length, df)
-        for (term, (doc_ids, doc_frequency)) in self.terms {
+        for (term, encoded, doc_frequency) in encoded_postings {
             let offset = (buf.len() as u64) - posting_offset;
-            let encoded = posting::encode(&doc_ids);
             let length = encoded.len() as u32;
             buf.extend_from_slice(&encoded);
             term_postings.push((term, offset, length, doc_frequency));

@@ -1,0 +1,13 @@
+[package]
+name = "lakesearch-indexer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+lakesearch-core = { path = "../lakesearch-core", features = ["runtime", "io"] }
+arrow = "54"
+futures = "0.3"
+object_store = { version = "0.11", features = ["aws"] }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"

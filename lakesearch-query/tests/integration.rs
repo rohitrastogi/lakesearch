@@ -14,11 +14,11 @@ use object_store::{ObjectStore, PutPayload};
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-use lakesearch_cli::index::run_index;
 use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_core::storage::{read_current, read_metadata};
+use lakesearch_indexer::run_index;
 use lakesearch_query::object_cache::ObjectCache;
 use lakesearch_query::query::{self, CollectedQueryResult};
-use lakesearch_query::storage::{read_current, read_metadata};
 use lakesearch_query::Operator;
 
 use helpers::{create_test_table, upload_test_parquet};
@@ -812,7 +812,7 @@ async fn brute_force_matches_indexed_results() {
 
     let ml = lakesearch_core::metadata::ManifestList {
         job_kind: lakesearch_core::metadata::JobKind::Append,
-        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_b]),
+        batch_id: lakesearch_core::storage::compute_batch_id(&[&file_b]),
         data_files: vec![lakesearch_core::metadata::DataFileEntry {
             path: file_b.clone(),
             file_size_bytes: 0,
@@ -822,18 +822,18 @@ async fn brute_force_matches_indexed_results() {
         replaces: None,
         compacted_column: None,
     };
-    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+    let ml_path = lakesearch_core::storage::write_manifest_list(store.as_ref(), &base, &ml)
         .await
         .unwrap();
     meta.snapshot.manifest_lists.push(ml_path);
-    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+    let meta_path = lakesearch_core::storage::write_metadata(store.as_ref(), &base, &meta)
         .await
         .unwrap();
     let pointer = lakesearch_core::metadata::CurrentPointer {
         metadata_path: meta_path,
         updated_at: "now".to_owned(),
     };
-    lakesearch_query::storage::write_json(
+    lakesearch_core::storage::write_json(
         store.as_ref(),
         &base.child("metadata").child("current.json"),
         &pointer,
@@ -890,7 +890,7 @@ async fn fully_indexed_and_fully_unindexed_same_results() {
     // First: query with no index at all (file is un-indexed).
     let ml = lakesearch_core::metadata::ManifestList {
         job_kind: lakesearch_core::metadata::JobKind::Append,
-        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        batch_id: lakesearch_core::storage::compute_batch_id(&[&file_path]),
         data_files: vec![lakesearch_core::metadata::DataFileEntry {
             path: file_path.clone(),
             file_size_bytes: 0,
@@ -900,20 +900,20 @@ async fn fully_indexed_and_fully_unindexed_same_results() {
         replaces: None,
         compacted_column: None,
     };
-    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+    let ml_path = lakesearch_core::storage::write_manifest_list(store.as_ref(), &base, &ml)
         .await
         .unwrap();
     let current = read_current(store.as_ref(), &base).await.unwrap();
     let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
     meta.snapshot.manifest_lists.push(ml_path);
-    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+    let meta_path = lakesearch_core::storage::write_metadata(store.as_ref(), &base, &meta)
         .await
         .unwrap();
     let pointer = lakesearch_core::metadata::CurrentPointer {
         metadata_path: meta_path,
         updated_at: "t1".to_owned(),
     };
-    lakesearch_query::storage::write_json(
+    lakesearch_core::storage::write_json(
         store.as_ref(),
         &base.child("metadata").child("current.json"),
         &pointer,
@@ -984,7 +984,7 @@ async fn brute_force_case_insensitive() {
     let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
     let ml = lakesearch_core::metadata::ManifestList {
         job_kind: lakesearch_core::metadata::JobKind::Append,
-        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        batch_id: lakesearch_core::storage::compute_batch_id(&[&file_path]),
         data_files: vec![lakesearch_core::metadata::DataFileEntry {
             path: file_path.clone(),
             file_size_bytes: 0,
@@ -994,18 +994,18 @@ async fn brute_force_case_insensitive() {
         replaces: None,
         compacted_column: None,
     };
-    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+    let ml_path = lakesearch_core::storage::write_manifest_list(store.as_ref(), &base, &ml)
         .await
         .unwrap();
     meta.snapshot.manifest_lists.push(ml_path);
-    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+    let meta_path = lakesearch_core::storage::write_metadata(store.as_ref(), &base, &meta)
         .await
         .unwrap();
     let pointer = lakesearch_core::metadata::CurrentPointer {
         metadata_path: meta_path,
         updated_at: "now".to_owned(),
     };
-    lakesearch_query::storage::write_json(
+    lakesearch_core::storage::write_json(
         store.as_ref(),
         &base.child("metadata").child("current.json"),
         &pointer,
@@ -1089,7 +1089,7 @@ async fn brute_force_early_termination_with_limit() {
     let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
     let ml = lakesearch_core::metadata::ManifestList {
         job_kind: lakesearch_core::metadata::JobKind::Append,
-        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        batch_id: lakesearch_core::storage::compute_batch_id(&[&file_path]),
         data_files: vec![lakesearch_core::metadata::DataFileEntry {
             path: file_path.clone(),
             file_size_bytes: 0,
@@ -1099,18 +1099,18 @@ async fn brute_force_early_termination_with_limit() {
         replaces: None,
         compacted_column: None,
     };
-    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+    let ml_path = lakesearch_core::storage::write_manifest_list(store.as_ref(), &base, &ml)
         .await
         .unwrap();
     meta.snapshot.manifest_lists.push(ml_path);
-    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+    let meta_path = lakesearch_core::storage::write_metadata(store.as_ref(), &base, &meta)
         .await
         .unwrap();
     let pointer = lakesearch_core::metadata::CurrentPointer {
         metadata_path: meta_path,
         updated_at: "now".to_owned(),
     };
-    lakesearch_query::storage::write_json(
+    lakesearch_core::storage::write_json(
         store.as_ref(),
         &base.child("metadata").child("current.json"),
         &pointer,

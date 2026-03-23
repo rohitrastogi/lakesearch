@@ -20,8 +20,8 @@ use parquet::file::metadata::ParquetMetaData;
 use lakesearch_core::bm25;
 use lakesearch_core::tokenizer::tokenize;
 
-use crate::parquet_util::{find_column, string_value, validate_arrow_column};
 use crate::Operator;
+use lakesearch_core::parquet_util::{find_column, string_value, validate_arrow_column};
 
 use super::types::{QueryStats, SCORE_COL, TEXT_COL};
 

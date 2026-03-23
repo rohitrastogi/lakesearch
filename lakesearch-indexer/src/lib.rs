@@ -1,9 +1,10 @@
 //! Async index command for object storage.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use tracing::info;
 
 use lakesearch_core::metadata::{
@@ -17,15 +18,18 @@ use lakesearch_core::types::{CorpusStats, DocId};
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use lakesearch_query::cas::{commit_metadata, is_batch_duplicate};
-use lakesearch_query::parquet_util::{
+use lakesearch_core::cas::{commit_metadata, is_batch_duplicate};
+use lakesearch_core::parquet_util::{
     build_page_inventory, load_parquet_metadata_async, read_parquet_batches_async, string_value,
     validate_arrow_column, validate_column,
 };
-use lakesearch_query::storage::{
+use lakesearch_core::storage::{
     compute_batch_id, read_current, read_metadata, write_manifest, write_manifest_list,
     write_segment,
 };
+
+/// Default number of concurrent I/O operations.
+const DEFAULT_IO_CONCURRENCY: usize = 8;
 
 /// Indexes Parquet files from object storage into a LakeSearch table.
 pub async fn run_index(
@@ -34,6 +38,26 @@ pub async fn run_index(
     file_urls: &[String],
     column: &str,
     runtime: &LakeRuntime,
+) -> Result<()> {
+    run_index_with_concurrency(
+        store,
+        base,
+        file_urls,
+        column,
+        runtime,
+        DEFAULT_IO_CONCURRENCY,
+    )
+    .await
+}
+
+/// Indexes Parquet files with configurable I/O concurrency.
+async fn run_index_with_concurrency(
+    store: &Arc<dyn ObjectStore>,
+    base: &Path,
+    file_urls: &[String],
+    column: &str,
+    runtime: &LakeRuntime,
+    io_concurrency: usize,
 ) -> Result<()> {
     // 1. Read current metadata
     let current_result = read_current(store.as_ref(), base).await?;
@@ -57,15 +81,24 @@ pub async fn run_index(
         return Ok(());
     }
 
-    // 3. Load Parquet metadata (concurrent)
-    let mut file_metadata = Vec::new();
+    // 3. Load Parquet metadata concurrently
+    let file_metadata: Vec<(String, _)> = stream::iter(file_urls.iter().cloned())
+        .map(|file_url| {
+            let store = Arc::clone(store);
+            async move {
+                let metadata = load_parquet_metadata_async(&store, &file_url).await?;
+                Ok::<_, anyhow::Error>((file_url, metadata))
+            }
+        })
+        .buffered(io_concurrency)
+        .try_collect()
+        .await?;
+
+    // Validate column index consistency across all files
     let mut parquet_col_idx: Option<usize> = None;
-
-    for file_url in file_urls {
-        let metadata = load_parquet_metadata_async(store, file_url).await?;
-        let idx = validate_column(&metadata, column)
+    for (file_url, metadata) in &file_metadata {
+        let idx = validate_column(metadata, column)
             .with_context(|| format!("validating '{file_url}'"))?;
-
         if let Some(prev) = parquet_col_idx {
             anyhow::ensure!(
                 prev == idx,
@@ -73,7 +106,6 @@ pub async fn run_index(
             );
         }
         parquet_col_idx = Some(idx);
-        file_metadata.push((file_url.clone(), metadata));
     }
 
     let col_idx = parquet_col_idx.context("no files provided")?;
@@ -86,56 +118,83 @@ pub async fn run_index(
         "built page inventory"
     );
 
-    // 5. Index all rows: async read batches, CPU tokenize on rayon
-    let mut term_doc_ids: HashMap<String, BTreeSet<DocId>> = HashMap::new();
-    let mut term_doc_freq: HashMap<String, u32> = HashMap::new();
-    let mut total_rows: u64 = 0;
-    let mut total_tokens: u64 = 0;
-    let mut is_large = false;
+    // 5. Index all rows: pipelined async reads with CPU tokenization on rayon
+    //
+    // Flatten all (file_ordinal, rg_idx) pairs into a stream, read ahead with
+    // buffered concurrency, then feed each completed read to rayon for
+    // tokenization. Collect all results and merge once at the end.
 
-    for (file_ordinal, (file_url, metadata)) in file_metadata.iter().enumerate() {
-        for rg_idx in 0..metadata.num_row_groups() {
-            // Async: read all batches from this row group
-            let batches =
-                read_parquet_batches_async(store, file_url, rg_idx, &[col_idx], None).await?;
+    // Detect is_large and validate arrow column type from first file's first RG
+    let is_large = {
+        let batches =
+            read_parquet_batches_async(store, &file_metadata[0].0, 0, &[col_idx], None).await?;
+        if let Some(first_batch) = batches.first() {
+            validate_arrow_column(first_batch.schema().as_ref(), column)
+                .with_context(|| format!("column type check for '{}'", file_metadata[0].0))?;
+            first_batch.schema().field(0).data_type() == &arrow::datatypes::DataType::LargeUtf8
+        } else {
+            false
+        }
+    };
 
-            // Check LargeUtf8 on first batch
-            if file_ordinal == 0 && rg_idx == 0 {
-                if let Some(first_batch) = batches.first() {
-                    is_large = first_batch.schema().field(0).data_type()
-                        == &arrow::datatypes::DataType::LargeUtf8;
-                    validate_arrow_column(first_batch.schema().as_ref(), column)
-                        .with_context(|| format!("column type check for '{file_url}'"))?;
-                }
-            }
+    // Build list of (file_ordinal, rg_idx) work items
+    let work_items: Vec<(usize, usize)> = file_metadata
+        .iter()
+        .enumerate()
+        .flat_map(|(file_ord, (_, meta))| {
+            (0..meta.num_row_groups()).map(move |rg_idx| (file_ord, rg_idx))
+        })
+        .collect();
 
-            let rg_pages = &inventory.pages[file_ordinal][rg_idx];
-
-            // CPU: tokenize rows on rayon
-            // We need to process batches and accumulate into our maps.
-            // Since the maps are not Send-friendly across the rayon boundary,
-            // collect per-rg results and merge.
-            let pages_clone: Vec<(DocId, i64)> = rg_pages
+    // Pipeline: buffered I/O reads feeding into rayon CPU work
+    let rg_results: Vec<RgIndexResult> = stream::iter(work_items)
+        .map(|(file_ordinal, rg_idx)| {
+            let store = Arc::clone(store);
+            let file_url = file_metadata[file_ordinal].0.clone();
+            let rg_pages: Vec<(DocId, i64)> = inventory.pages[file_ordinal][rg_idx]
                 .pages
                 .iter()
                 .map(|p| (p.doc_id, p.first_row_index))
                 .collect();
-            let is_large_copy = is_large;
 
-            let rg_result = runtime
-                .cpu(move || index_batches(&batches, &pages_clone, is_large_copy))
+            async move {
+                let batches =
+                    read_parquet_batches_async(&store, &file_url, rg_idx, &[col_idx], None).await?;
+                Ok::<_, anyhow::Error>((batches, rg_pages, is_large))
+            }
+        })
+        .buffered(io_concurrency)
+        .and_then(|(batches, rg_pages, is_large)| async move {
+            // CPU: tokenize on rayon
+            let result = runtime
+                .cpu(move || index_batches(&batches, &rg_pages, is_large))
                 .await;
+            Ok(result)
+        })
+        .try_collect()
+        .await?;
 
-            // Merge per-rg results
-            for (term, doc_ids) in rg_result.term_doc_ids {
-                term_doc_ids.entry(term).or_default().extend(doc_ids);
-            }
-            for (term, df) in rg_result.term_doc_freq {
-                *term_doc_freq.entry(term).or_default() += df;
-            }
-            total_rows += rg_result.total_rows;
-            total_tokens += rg_result.total_tokens;
+    // Merge all per-RG results in a single pass
+    let mut term_doc_ids: HashMap<String, Vec<DocId>> = HashMap::new();
+    let mut term_doc_freq: HashMap<String, u32> = HashMap::new();
+    let mut total_rows: u64 = 0;
+    let mut total_tokens: u64 = 0;
+
+    for rg_result in rg_results {
+        for (term, doc_ids) in rg_result.term_doc_ids {
+            term_doc_ids.entry(term).or_default().extend(doc_ids);
         }
+        for (term, df) in rg_result.term_doc_freq {
+            *term_doc_freq.entry(term).or_default() += df;
+        }
+        total_rows += rg_result.total_rows;
+        total_tokens += rg_result.total_tokens;
+    }
+
+    // Deduplicate doc_ids per term (sort + dedup)
+    for doc_ids in term_doc_ids.values_mut() {
+        doc_ids.sort_unstable();
+        doc_ids.dedup();
     }
 
     info!(
@@ -266,7 +325,7 @@ pub async fn run_index(
 
 /// Per-row-group indexing result, returned from rayon CPU work.
 struct RgIndexResult {
-    term_doc_ids: HashMap<String, BTreeSet<DocId>>,
+    term_doc_ids: HashMap<String, Vec<DocId>>,
     term_doc_freq: HashMap<String, u32>,
     total_rows: u64,
     total_tokens: u64,
@@ -278,7 +337,7 @@ fn index_batches(
     pages: &[(DocId, i64)], // (doc_id, first_row_index)
     is_large: bool,
 ) -> RgIndexResult {
-    let mut term_doc_ids: HashMap<String, BTreeSet<DocId>> = HashMap::new();
+    let mut term_doc_ids: HashMap<String, Vec<DocId>> = HashMap::new();
     let mut term_doc_freq: HashMap<String, u32> = HashMap::new();
     let mut total_rows: u64 = 0;
     let mut total_tokens: u64 = 0;
@@ -311,10 +370,7 @@ fn index_batches(
 
             let mut seen = HashSet::new();
             for token in &tokens {
-                term_doc_ids
-                    .entry(token.clone())
-                    .or_default()
-                    .insert(doc_id);
+                term_doc_ids.entry(token.clone()).or_default().push(doc_id);
                 if seen.insert(token.as_str()) {
                     *term_doc_freq.entry(token.clone()).or_default() += 1;
                 }
@@ -334,7 +390,7 @@ fn index_batches(
 
 /// CPU-bound: build a segment from accumulated index data.
 fn build_segment(
-    mut term_doc_ids: HashMap<String, BTreeSet<DocId>>,
+    mut term_doc_ids: HashMap<String, Vec<DocId>>,
     term_doc_freq: HashMap<String, u32>,
     doc_table: Vec<lakesearch_core::types::DocTableEntry>,
     file_table: Vec<lakesearch_core::types::FileTableEntry>,
@@ -347,7 +403,7 @@ fn build_segment(
     sorted_terms.sort();
 
     for term in sorted_terms {
-        let doc_ids: Vec<DocId> = term_doc_ids.remove(&term).unwrap().into_iter().collect();
+        let doc_ids = term_doc_ids.remove(&term).unwrap();
         let df = term_doc_freq[&term];
         builder.add_term(&term, doc_ids, df);
     }
