@@ -100,3 +100,148 @@ pub async fn find_uncovered_files(
         uncovered,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lakesearch_core::metadata::*;
+    use lakesearch_core::storage::write_json;
+    use object_store::memory::InMemory;
+    use object_store::path::Path;
+
+    fn test_metadata(manifest_lists: Vec<String>) -> Metadata {
+        Metadata {
+            format_version: 1,
+            table_id: "test".to_owned(),
+            table_name: "test".to_owned(),
+            location: "mem://test/".to_owned(),
+            indexed_columns: vec![IndexedColumn {
+                name: "desc".to_owned(),
+                tokenizer: "whitespace_lowercase".to_owned(),
+                status: ColumnStatus::Active,
+                backfill_manifest_lists: None,
+            }],
+            snapshot: Snapshot {
+                timestamp_ms: 1000,
+                manifest_lists,
+            },
+        }
+    }
+
+    fn test_manifest_list(files: &[&str], manifests: Vec<ManifestEntry>) -> ManifestList {
+        ManifestList {
+            job_kind: JobKind::Append,
+            batch_id: "sha256:test".to_owned(),
+            data_files: files
+                .iter()
+                .map(|f| DataFileEntry {
+                    path: f.to_string(),
+                    file_size_bytes: 1024,
+                    row_count: 100,
+                })
+                .collect(),
+            manifests,
+            replaces: None,
+            compacted_column: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn uncovered_files_are_sorted() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        // Create manifest list with files in non-alphabetical order
+        let ml = test_manifest_list(&["c.parquet", "a.parquet", "b.parquet"], vec![]);
+        let ml_path = base.child("manifest-lists").child("ml-1.json");
+        write_json(&store, &ml_path, &ml).await.unwrap();
+
+        let metadata = test_metadata(vec![]);
+
+        let result = find_uncovered_files(&store, &metadata, "desc", &[ml_path.to_string()], 4)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total_files, 3);
+        assert_eq!(result.uncovered.len(), 3);
+        // Verify sorted order
+        assert_eq!(
+            result.uncovered,
+            vec!["a.parquet", "b.parquet", "c.parquet"]
+        );
+    }
+
+    #[tokio::test]
+    async fn uncovered_excludes_indexed_files() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        // Frozen snapshot: 3 files
+        let ml = test_manifest_list(&["a.parquet", "b.parquet", "c.parquet"], vec![]);
+        let ml_path = base.child("manifest-lists").child("ml-frozen.json");
+        write_json(&store, &ml_path, &ml).await.unwrap();
+
+        // Current manifest list: has a manifest that covers a.parquet
+        let manifest = Manifest {
+            indexed_column: "desc".to_owned(),
+            segments: vec![SegmentInfo {
+                segment_path: "seg-1.seg".to_owned(),
+                size_bytes: 100,
+                term_count: 10,
+                doc_count: 5,
+                total_rows: 100,
+                total_tokens: 500,
+                parquet_files: vec![ParquetFileRef {
+                    file_ordinal: 0,
+                    path: "a.parquet".to_owned(),
+                    file_size_bytes: 1024,
+                    row_group_count: 1,
+                }],
+            }],
+        };
+        let manifest_path = base.child("manifests").child("m-1.json");
+        write_json(&store, &manifest_path, &manifest).await.unwrap();
+
+        let current_ml = test_manifest_list(
+            &["a.parquet", "b.parquet", "c.parquet"],
+            vec![ManifestEntry {
+                manifest_path: manifest_path.to_string(),
+                indexed_column: "desc".to_owned(),
+                segment_count: 1,
+                term_stats: TermStats {
+                    min_term: "a".to_owned(),
+                    max_term: "z".to_owned(),
+                    term_count: 10,
+                },
+            }],
+        );
+        let current_ml_path = base.child("manifest-lists").child("ml-current.json");
+        write_json(&store, &current_ml_path, &current_ml)
+            .await
+            .unwrap();
+
+        let metadata = test_metadata(vec![current_ml_path.to_string()]);
+
+        let result = find_uncovered_files(&store, &metadata, "desc", &[ml_path.to_string()], 4)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total_files, 3);
+        assert_eq!(result.indexed_files, 1);
+        assert_eq!(result.uncovered, vec!["b.parquet", "c.parquet"]);
+    }
+
+    #[tokio::test]
+    async fn empty_snapshot_yields_zero_uncovered() {
+        let store = InMemory::new();
+        let metadata = test_metadata(vec![]);
+
+        let result = find_uncovered_files(&store, &metadata, "desc", &[], 4)
+            .await
+            .unwrap();
+
+        assert_eq!(result.total_files, 0);
+        assert_eq!(result.indexed_files, 0);
+        assert!(result.uncovered.is_empty());
+    }
+}

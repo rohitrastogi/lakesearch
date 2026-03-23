@@ -205,7 +205,7 @@ async fn reconcile_once(
 /// Guards against concurrent drops: if the column was dropped between
 /// the read and the CAS rebase, the closure preserves the dropped status
 /// instead of overwriting it with active.
-async fn transition_to_active(
+pub(crate) async fn transition_to_active(
     store: &dyn ObjectStore,
     base: &Path,
     etag: Option<String>,
@@ -225,4 +225,125 @@ async fn transition_to_active(
         new
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lakesearch_core::metadata::*;
+    use lakesearch_core::storage::{read_current, read_metadata, write_json, write_metadata};
+    use object_store::memory::InMemory;
+
+    fn test_metadata(columns: Vec<IndexedColumn>) -> Metadata {
+        Metadata {
+            format_version: 1,
+            table_id: "test".to_owned(),
+            table_name: "test".to_owned(),
+            location: "mem://test/".to_owned(),
+            indexed_columns: columns,
+            snapshot: Snapshot {
+                timestamp_ms: 1000,
+                manifest_lists: vec![],
+            },
+        }
+    }
+
+    async fn setup_table(store: &InMemory, base: &Path, metadata: &Metadata) -> Option<String> {
+        let meta_path = write_metadata(store, base, metadata).await.unwrap();
+        let pointer = CurrentPointer {
+            metadata_path: meta_path,
+            updated_at: "t0".to_owned(),
+        };
+        write_json(
+            store,
+            &base.child("metadata").child("current.json"),
+            &pointer,
+        )
+        .await
+        .unwrap();
+        let result = read_current(store, base).await.unwrap();
+        result.e_tag
+    }
+
+    #[tokio::test]
+    async fn transition_backfilling_to_active() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        let meta = test_metadata(vec![IndexedColumn {
+            name: "desc".to_owned(),
+            tokenizer: "whitespace_lowercase".to_owned(),
+            status: ColumnStatus::Backfilling,
+            backfill_manifest_lists: Some(vec![]),
+        }]);
+
+        let etag = setup_table(&store, &base, &meta).await;
+
+        transition_to_active(&store, &base, etag, &meta, "desc")
+            .await
+            .unwrap();
+
+        let result = read_current(&store, &base).await.unwrap();
+        let final_meta = read_metadata(&store, &result.value).await.unwrap();
+
+        assert_eq!(final_meta.indexed_columns[0].status, ColumnStatus::Active);
+        assert!(final_meta.indexed_columns[0]
+            .backfill_manifest_lists
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn transition_preserves_dropped_status() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        // Column is already dropped (simulates concurrent drop)
+        let meta = test_metadata(vec![IndexedColumn {
+            name: "desc".to_owned(),
+            tokenizer: "whitespace_lowercase".to_owned(),
+            status: ColumnStatus::Dropped,
+            backfill_manifest_lists: None,
+        }]);
+
+        let etag = setup_table(&store, &base, &meta).await;
+
+        transition_to_active(&store, &base, etag, &meta, "desc")
+            .await
+            .unwrap();
+
+        let result = read_current(&store, &base).await.unwrap();
+        let final_meta = read_metadata(&store, &result.value).await.unwrap();
+
+        // Should still be dropped, not overwritten to active
+        assert_eq!(final_meta.indexed_columns[0].status, ColumnStatus::Dropped);
+    }
+
+    #[tokio::test]
+    async fn transition_ignores_unknown_column() {
+        let store = InMemory::new();
+        let base = Path::from("table");
+
+        let meta = test_metadata(vec![IndexedColumn {
+            name: "desc".to_owned(),
+            tokenizer: "whitespace_lowercase".to_owned(),
+            status: ColumnStatus::Backfilling,
+            backfill_manifest_lists: Some(vec![]),
+        }]);
+
+        let etag = setup_table(&store, &base, &meta).await;
+
+        // Transition a column that doesn't exist — should succeed without error
+        transition_to_active(&store, &base, etag, &meta, "nonexistent")
+            .await
+            .unwrap();
+
+        let result = read_current(&store, &base).await.unwrap();
+        let final_meta = read_metadata(&store, &result.value).await.unwrap();
+
+        // desc should still be backfilling
+        assert_eq!(
+            final_meta.indexed_columns[0].status,
+            ColumnStatus::Backfilling
+        );
+    }
 }
