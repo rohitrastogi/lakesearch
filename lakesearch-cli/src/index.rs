@@ -283,11 +283,20 @@ fn index_batches(
     let mut total_rows: u64 = 0;
     let mut total_tokens: u64 = 0;
     let mut row_idx: i64 = 0;
+    // Sequential page pointer — rows arrive in order, so we advance
+    // the pointer when row_idx crosses the next page boundary. O(N)
+    // instead of O(N log P) from binary search.
+    let mut cur_page: usize = 0;
 
     for batch in batches {
         let col = batch.column(0);
         for row in 0..batch.num_rows() {
             total_rows += 1;
+
+            // Advance page pointer if we've crossed into the next page
+            while cur_page + 1 < pages.len() && pages[cur_page + 1].1 <= row_idx {
+                cur_page += 1;
+            }
 
             if col.is_null(row) {
                 row_idx += 1;
@@ -298,11 +307,7 @@ fn index_batches(
             let tokens = tokenize(text);
             total_tokens += tokens.len() as u64;
 
-            // Binary search for the page containing this row
-            let page_idx = pages
-                .partition_point(|&(_, fri)| fri <= row_idx)
-                .saturating_sub(1);
-            let doc_id = pages[page_idx].0;
+            let doc_id = pages[cur_page].0;
 
             let mut seen = HashSet::new();
             for token in &tokens {
