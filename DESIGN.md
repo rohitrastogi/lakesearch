@@ -2128,6 +2128,14 @@ Evidence and scale.
 - Queue-based parallel ingestion
 - I/O optimizations (speculative tail read, batched posting reads, concurrent
   segment loading)
+- **Lazy posting list decoding**: instead of fully decoding each posting list
+  into `Vec<DocId>` before intersection, use a block-aware cursor that decodes
+  blocks on demand. The existing block structure (128 doc_ids per block, with
+  `min_doc_id` in each block header) enables skip-ahead: during AND
+  intersection, skip blocks whose `min_doc_id` exceeds the current candidate.
+  This avoids decoding blocks that can't contribute to the result, reducing
+  CPU, temp allocations, and intermediate result sizes — especially impactful
+  for multi-term AND queries where one term is common and another is rare.
 - **Standalone value**: quantitative proof that indexed search beats brute
   force. Production-ready ingest path for high-volume data.
 

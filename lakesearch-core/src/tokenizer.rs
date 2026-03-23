@@ -20,16 +20,59 @@ const MAX_TOKEN_BYTES: usize = 256;
 /// 4. Filter tokens that are empty or exceed 256 bytes
 #[must_use]
 pub fn tokenize(text: &str) -> Vec<String> {
-    // NFC normalize first so combining characters (e.g. e + \u{0301}) merge
-    // into composed forms (é) before we split on non-alphanumeric boundaries.
-    // ASCII text is already NFC, so skip the allocation in the common case.
-    let owned;
-    let normalized = if text.is_ascii() {
-        text
+    if text.is_ascii() {
+        tokenize_ascii(text)
     } else {
-        owned = text.nfc().collect::<String>();
-        &owned
-    };
+        tokenize_unicode(text)
+    }
+}
+
+/// Fast path for ASCII text: byte-level splitting and lowercasing with no
+/// Unicode table lookups, no char decoding, and no per-token allocation
+/// for already-lowercase tokens.
+fn tokenize_ascii(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut tokens = Vec::new();
+    let mut start = None;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        if b.is_ascii_alphanumeric() {
+            if start.is_none() {
+                start = Some(i);
+            }
+        } else if let Some(s) = start.take() {
+            let raw = &bytes[s..i];
+            push_ascii_token(raw, &mut tokens);
+        }
+    }
+    if let Some(s) = start {
+        push_ascii_token(&bytes[s..], &mut tokens);
+    }
+    tokens
+}
+
+fn push_ascii_token(raw: &[u8], tokens: &mut Vec<String>) {
+    if raw.is_empty() || raw.len() > MAX_TOKEN_BYTES {
+        return;
+    }
+    // Check if already lowercase to avoid allocation
+    if raw.iter().all(|b| !b.is_ascii_uppercase()) {
+        // Safety: input is ASCII, so valid UTF-8
+        tokens.push(unsafe { std::str::from_utf8_unchecked(raw) }.to_owned());
+    } else {
+        let mut lowered = Vec::with_capacity(raw.len());
+        for &b in raw {
+            lowered.push(b.to_ascii_lowercase());
+        }
+        // Safety: lowercasing ASCII bytes produces valid UTF-8
+        tokens.push(unsafe { String::from_utf8_unchecked(lowered) });
+    }
+}
+
+/// Unicode path: NFC normalize, split on non-alphanumeric char boundaries,
+/// Unicode-aware lowercase.
+fn tokenize_unicode(text: &str) -> Vec<String> {
+    let normalized: String = text.nfc().collect();
 
     let mut tokens = Vec::new();
     let mut start = None;
@@ -40,17 +83,16 @@ pub fn tokenize(text: &str) -> Vec<String> {
                 start = Some(i);
             }
         } else if let Some(s) = start.take() {
-            push_token(&normalized[s..i], &mut tokens);
+            push_unicode_token(&normalized[s..i], &mut tokens);
         }
     }
-    // Handle trailing token
     if let Some(s) = start {
-        push_token(&normalized[s..], &mut tokens);
+        push_unicode_token(&normalized[s..], &mut tokens);
     }
     tokens
 }
 
-fn push_token(raw: &str, tokens: &mut Vec<String>) {
+fn push_unicode_token(raw: &str, tokens: &mut Vec<String>) {
     let lowered: String = raw.chars().flat_map(char::to_lowercase).collect();
     if !lowered.is_empty() && lowered.len() <= MAX_TOKEN_BYTES {
         tokens.push(lowered);
