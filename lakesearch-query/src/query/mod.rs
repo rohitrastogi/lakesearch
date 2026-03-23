@@ -275,6 +275,7 @@ fn launch_pipeline(
 ///
 /// Launches a three-stage pipeline (I/O → CPU → Coalescer). For top-K
 /// queries, an intermediate task accumulates, ranks, and re-emits.
+/// Stats are logged via `tracing` when the pipeline completes.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
     cache: Arc<ObjectCache>,
@@ -288,17 +289,14 @@ pub async fn run_query(
     io_concurrency: usize,
     max_io_tasks: usize,
     runtime: Arc<LakeRuntime>,
-) -> Result<(SendableRecordBatchStream, QueryStats)> {
+) -> Result<SendableRecordBatchStream> {
     let with_score = score_mode != crate::ScoreMode::None;
     let query_terms = tokenize(query_text);
     if query_terms.is_empty() {
         let schema = build_empty_schema(&select_columns, &column, with_score);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         drop(tx);
-        return Ok((
-            Box::pin(QueryResultStream::new(schema, rx)),
-            QueryStats::default(),
-        ));
+        return Ok(Box::pin(QueryResultStream::new(schema, rx)));
     }
 
     let (work_items, unindexed_files, schema, agg) = setup_query(
@@ -345,7 +343,8 @@ pub async fn run_query(
                     }
                 }
             }
-            let _ = stats_handle.await;
+            let stats = stats_handle.await.unwrap_or_default();
+            log_query_stats(&stats);
             match rank_batches(all_batches, &schema_clone, true, limit) {
                 Ok(ranked) => {
                     for batch in ranked {
@@ -359,11 +358,14 @@ pub async fn run_query(
                 }
             }
         });
-        let result_stream = QueryResultStream::new(schema, ranked_rx);
-        Ok((Box::pin(result_stream), QueryStats::default()))
+        Ok(Box::pin(QueryResultStream::new(schema, ranked_rx)))
     } else {
-        let result_stream = QueryResultStream::new(schema, final_rx);
-        Ok((Box::pin(result_stream), QueryStats::default()))
+        // Log stats when the pipeline completes (after stream is consumed).
+        tokio::spawn(async move {
+            let stats = stats_handle.await.unwrap_or_default();
+            log_query_stats(&stats);
+        });
+        Ok(Box::pin(QueryResultStream::new(schema, final_rx)))
     }
 }
 
@@ -434,15 +436,19 @@ pub async fn run_query_collected(
     // Rank and limit
     all_batches = rank_batches(all_batches, &schema, with_score, limit)?;
 
+    log_query_stats(&stats);
+
+    Ok(CollectedQueryResult {
+        batches: all_batches,
+        stats,
+    })
+}
+
+fn log_query_stats(stats: &QueryStats) {
     info!(
         candidate_pages = stats.candidate_pages,
         rows_scanned = stats.rows_scanned,
         rows_matched = stats.rows_matched,
         "query complete"
     );
-
-    Ok(CollectedQueryResult {
-        batches: all_batches,
-        stats,
-    })
 }

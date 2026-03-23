@@ -1380,7 +1380,7 @@ async fn streaming_query_returns_all_results() {
     .unwrap();
 
     let cache = Arc::new(ObjectCache::new(Arc::clone(&store)));
-    let (stream, _stats) = query::run_query(
+    let stream = query::run_query(
         cache,
         base,
         "description".to_owned(),
