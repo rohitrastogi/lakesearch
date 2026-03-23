@@ -14,11 +14,11 @@ use cascadq_client::CascadqClient;
 use lakesearch_core::metadata::ColumnStatus;
 
 use crate::backfill::find_uncovered_files;
-use crate::cas;
 use crate::registry::TableRegistry;
 use crate::server::api_types::IndexTaskPayload;
 use crate::server::config::IngestConfig;
-use crate::storage;
+use lakesearch_core::cas;
+use lakesearch_core::storage;
 
 /// Starts the reconciliation loop. Returns a `JoinHandle` that can be
 /// aborted for graceful shutdown.
@@ -113,6 +113,7 @@ async fn reconcile_once(
                     &table.base,
                     current.e_tag.clone(),
                     &metadata,
+                    None,
                     |meta| {
                         let mut new = meta.clone();
                         if let Some(c) = new

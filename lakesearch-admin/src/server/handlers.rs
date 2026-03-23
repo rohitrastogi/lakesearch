@@ -4,8 +4,8 @@ use tracing::info;
 
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 
-use crate::cas;
-use crate::storage;
+use lakesearch_core::cas;
+use lakesearch_core::storage;
 
 use super::api_types::*;
 use super::error::ApiError;
@@ -197,6 +197,7 @@ pub async fn update_columns(
         &reg.base,
         current.e_tag,
         &metadata,
+        None,
         |meta| {
             let mut new = meta.clone();
 
@@ -370,6 +371,7 @@ pub async fn start_backfill(
         &reg.base,
         current.e_tag,
         &metadata,
+        None,
         |meta| {
             let mut new = meta.clone();
             if let Some(col) = new

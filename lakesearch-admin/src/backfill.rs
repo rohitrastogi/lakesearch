@@ -13,7 +13,7 @@ use object_store::ObjectStore;
 
 use lakesearch_core::metadata::{ManifestList, Metadata};
 
-use crate::storage::{read_manifest, read_manifest_list};
+use lakesearch_core::storage::{read_manifest, read_manifest_list};
 
 /// Files that exist in the frozen backfill snapshot but are not yet indexed
 /// for the given column.

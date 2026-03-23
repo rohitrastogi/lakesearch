@@ -10,7 +10,7 @@ use lakesearch_admin::registry::TableRegistry;
 use lakesearch_admin::server::config::IngestConfig;
 use lakesearch_admin::server::routes::router;
 use lakesearch_admin::server::state::AppState;
-use lakesearch_admin::storage;
+use lakesearch_core::storage;
 
 #[derive(Parser)]
 #[command(name = "lakesearch-admin", about = "LakeSearch admin / ingest service")]

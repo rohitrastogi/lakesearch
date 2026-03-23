@@ -11,7 +11,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::sync::RwLock;
 
-use crate::storage::parse_location;
+use lakesearch_core::storage::parse_location;
 
 /// A registered table with its object store handle.
 #[derive(Clone)]
