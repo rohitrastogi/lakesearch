@@ -7,16 +7,15 @@ use serde::Deserialize;
 
 /// Admin server configuration, loaded from a YAML file.
 ///
+/// Table discovery is handled by the `CatalogClient` trait, not config.
+///
 /// Example `config.yaml`:
 /// ```yaml
 /// bind_addr: "0.0.0.0:8081"
 /// cascadq_url: "http://localhost:8000"
 /// backfill_poll_secs: 30
 /// backfill_chunk_size: 100
-/// tables:
-///   events:
-///     location: "s3://bucket/lakesearch/tables/events/"
-///     queue: "events-index"
+/// io_concurrency: 8
 /// ```
 #[derive(Debug, Clone, Deserialize)]
 pub struct IngestConfig {
@@ -30,15 +29,11 @@ pub struct IngestConfig {
     pub backfill_chunk_size: usize,
     #[serde(default = "default_io_concurrency")]
     pub io_concurrency: usize,
+    /// Static table definitions for the built-in catalog: name → location URL.
+    /// For production use, replace with a CatalogClient implementation
+    /// (e.g. Iceberg REST catalog).
     #[serde(default)]
-    pub tables: std::collections::HashMap<String, TableConfig>,
-}
-
-/// Per-table configuration in the YAML file.
-#[derive(Debug, Clone, Deserialize)]
-pub struct TableConfig {
-    pub location: String,
-    pub queue: String,
+    pub tables: std::collections::HashMap<String, String>,
 }
 
 impl IngestConfig {

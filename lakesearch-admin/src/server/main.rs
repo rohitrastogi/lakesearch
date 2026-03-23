@@ -6,10 +6,10 @@ use tracing::info;
 
 use cascadq_client::{CascadqClient, ClientConfig};
 use lakesearch_admin::reconcile;
-use lakesearch_admin::registry::TableRegistry;
 use lakesearch_admin::server::config::IngestConfig;
 use lakesearch_admin::server::routes::router;
 use lakesearch_admin::server::state::AppState;
+use lakesearch_core::catalog_client::{StaticCatalog, TableInfo};
 use lakesearch_core::storage;
 
 #[derive(Parser)]
@@ -34,43 +34,34 @@ async fn main() -> Result<()> {
         ..ClientConfig::default()
     }));
 
-    let registry = Arc::new(TableRegistry::new());
-
-    // Register tables from config
-    for (name, table_cfg) in &config.tables {
-        let (store, base) = storage::parse_location(&table_cfg.location)?;
-        let current = storage::read_current(store.as_ref(), &base).await?;
-        let metadata = storage::read_metadata(store.as_ref(), &current.value).await?;
-
-        registry
-            .register(
-                &metadata.table_id,
-                name,
-                &table_cfg.location,
-                &table_cfg.queue,
-            )
-            .await?;
-        info!(
-            table = %name,
-            table_id = %metadata.table_id,
-            location = %table_cfg.location,
-            "registered table from config"
-        );
+    // Build catalog from config tables
+    let mut tables = Vec::new();
+    for (name, location) in &config.tables {
+        let (store, base) = storage::parse_location(location)?;
+        tables.push(TableInfo {
+            name: name.clone(),
+            location: location.clone(),
+            store,
+            base,
+        });
+        info!(table = %name, location = %location, "registered table");
     }
+    let catalog: Arc<dyn lakesearch_core::catalog_client::CatalogClient> =
+        Arc::new(StaticCatalog::new(tables));
 
     let config = Arc::new(config);
 
     // Start backfill reconciliation loop
     let reconcile_handle = reconcile::start(
         Arc::clone(&config),
-        Arc::clone(&registry),
+        Arc::clone(&catalog),
         Arc::clone(&cascadq),
     );
 
     let state = AppState {
         config: Arc::clone(&config),
         cascadq,
-        registry,
+        catalog,
     };
 
     let app = router(state);

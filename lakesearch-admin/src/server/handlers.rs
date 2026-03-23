@@ -2,6 +2,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 use tracing::info;
 
+use lakesearch_core::catalog_client::TableInfo;
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 
 use lakesearch_core::cas;
@@ -10,6 +11,16 @@ use lakesearch_core::storage;
 use super::api_types::*;
 use super::error::ApiError;
 use super::state::AppState;
+
+/// Helper: look up a table by name from the catalog.
+async fn lookup_table(state: &AppState, table_name: &str) -> Result<TableInfo, ApiError> {
+    state
+        .catalog
+        .get_table(table_name)
+        .await
+        .map_err(ApiError::Internal)?
+        .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))
+}
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -27,9 +38,15 @@ pub async fn create_table(
         ));
     }
 
-    let (store, base) = storage::parse_location(&req.location).map_err(ApiError::Internal)?;
+    // Register in catalog (which also parses the location)
+    let table = state
+        .catalog
+        .register_table(&req.table_name, &req.location)
+        .await
+        .map_err(ApiError::Internal)?;
 
-    if storage::current_exists(store.as_ref(), &base)
+    // Check if index metadata already exists
+    if storage::current_exists(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?
     {
@@ -64,7 +81,7 @@ pub async fn create_table(
         },
     };
 
-    let meta_path = storage::write_metadata(store.as_ref(), &base, &metadata)
+    let meta_path = storage::write_metadata(table.store.as_ref(), &table.base, &metadata)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -73,26 +90,12 @@ pub async fn create_table(
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
     storage::write_json(
-        store.as_ref(),
-        &base.child("metadata").child("current.json"),
+        table.store.as_ref(),
+        &table.base.child("metadata").child("current.json"),
         &pointer,
     )
     .await
     .map_err(ApiError::Internal)?;
-
-    // Determine queue name: use table_name as default queue
-    let queue = state
-        .config
-        .tables
-        .get(&req.table_name)
-        .map(|t| t.queue.clone())
-        .unwrap_or_else(|| format!("{}-index", req.table_name));
-
-    state
-        .registry
-        .register(&table_id, &req.table_name, &req.location, &queue)
-        .await
-        .map_err(ApiError::Internal)?;
 
     info!(
         table_id = %table_id,
@@ -107,40 +110,40 @@ pub async fn create_table(
     }))
 }
 
-pub async fn list_tables(State(state): State<AppState>) -> Json<ListTablesResponse> {
-    let tables = state.registry.list().await;
+pub async fn list_tables(
+    State(state): State<AppState>,
+) -> Result<Json<ListTablesResponse>, ApiError> {
+    let tables = state
+        .catalog
+        .list_tables()
+        .await
+        .map_err(ApiError::Internal)?;
     let summaries = tables
         .into_iter()
         .map(|t| TableSummary {
-            table_id: t.table_id,
-            table_name: t.table_name,
+            table_name: t.name,
             location: t.location,
         })
         .collect();
-    Json(ListTablesResponse { tables: summaries })
+    Ok(Json(ListTablesResponse { tables: summaries }))
 }
 
 pub async fn get_table(
     State(state): State<AppState>,
-    Path(table_id): Path<String>,
+    Path(table_name): Path<String>,
 ) -> Result<Json<TableInfoResponse>, ApiError> {
-    let reg = state
-        .registry
-        .get(&table_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+    let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+    let current = storage::read_current(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?;
-    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+    let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
         .await
         .map_err(ApiError::Internal)?;
 
     let columns = columns_to_info(&metadata.indexed_columns);
 
     Ok(Json(TableInfoResponse {
-        table_id: metadata.table_id,
         table_name: metadata.table_name,
         location: metadata.location,
         columns,
@@ -149,25 +152,31 @@ pub async fn get_table(
 
 pub async fn delete_table(
     State(state): State<AppState>,
-    Path(table_id): Path<String>,
+    Path(table_name): Path<String>,
 ) -> Result<Json<DeleteTableResponse>, ApiError> {
-    if !state.registry.unregister(&table_id).await {
+    let found = state
+        .catalog
+        .unregister_table(&table_name)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    if !found {
         return Err(ApiError::NotFound(format!(
-            "table '{table_id}' not found in registry"
+            "table '{table_name}' not found"
         )));
     }
 
-    info!(table_id = %table_id, "unregistered table (data not deleted)");
+    info!(table_name = %table_name, "unregistered table (data not deleted)");
 
     Ok(Json(DeleteTableResponse {
-        table_id,
+        table_name,
         message: "table unregistered (data not deleted)".to_owned(),
     }))
 }
 
 pub async fn update_columns(
     State(state): State<AppState>,
-    Path(table_id): Path<String>,
+    Path(table_name): Path<String>,
     Json(req): Json<UpdateColumnsRequest>,
 ) -> Result<Json<UpdateColumnsResponse>, ApiError> {
     if req.add.is_empty() && req.drop.is_empty() {
@@ -176,16 +185,12 @@ pub async fn update_columns(
         ));
     }
 
-    let reg = state
-        .registry
-        .get(&table_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+    let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+    let current = storage::read_current(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?;
-    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+    let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -195,7 +200,6 @@ pub async fn update_columns(
     let apply_changes = |meta: &Metadata| {
         let mut new = meta.clone();
 
-        // Drop columns (soft-delete)
         for col in &mut new.indexed_columns {
             if drop_names.contains(&col.name) && col.status != ColumnStatus::Dropped {
                 col.status = ColumnStatus::Dropped;
@@ -203,7 +207,6 @@ pub async fn update_columns(
             }
         }
 
-        // Add new columns (skip if name already exists)
         for def in &add_defs {
             if new.indexed_columns.iter().any(|c| c.name == def.name) {
                 continue;
@@ -220,8 +223,8 @@ pub async fn update_columns(
     };
 
     cas::commit_metadata(
-        reg.store.as_ref(),
-        &reg.base,
+        table.store.as_ref(),
+        &table.base,
         current.e_tag,
         &metadata,
         None,
@@ -230,39 +233,32 @@ pub async fn update_columns(
     .await
     .map_err(ApiError::Internal)?;
 
-    // Build response from the mutation we just committed
     let committed = apply_changes(&metadata);
     let columns = columns_to_info(&committed.indexed_columns);
 
-    info!(table_id = %table_id, "updated columns");
+    info!(table_name = %table_name, "updated columns");
 
     Ok(Json(UpdateColumnsResponse { columns }))
 }
 
 pub async fn ingest(
     State(state): State<AppState>,
-    Path(table_id): Path<String>,
+    Path(table_name): Path<String>,
     Json(req): Json<IngestRequest>,
 ) -> Result<Json<IngestResponse>, ApiError> {
     if req.files.is_empty() {
         return Err(ApiError::BadRequest("files list is empty".to_owned()));
     }
 
-    let reg = state
-        .registry
-        .get(&table_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+    let table = lookup_table(&state, &table_name).await?;
 
-    // Read metadata to get active columns
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+    let current = storage::read_current(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?;
-    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+    let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
         .await
         .map_err(ApiError::Internal)?;
 
-    // Determine which columns to push tasks for
     let target_columns: Vec<String> = if req.columns.is_empty() {
         metadata
             .indexed_columns
@@ -271,7 +267,6 @@ pub async fn ingest(
             .map(|c| c.name.clone())
             .collect()
     } else {
-        // Validate that requested columns exist and are not dropped
         for col_name in &req.columns {
             let col = metadata
                 .indexed_columns
@@ -294,10 +289,11 @@ pub async fn ingest(
         req.columns
     };
 
+    let queue = table.queue_name();
     let mut tasks_pushed = 0;
     for column in &target_columns {
         let payload = IndexTaskPayload {
-            table_location: reg.location.clone(),
+            table_location: table.location.clone(),
             files: req.files.clone(),
             column: column.clone(),
         };
@@ -307,7 +303,7 @@ pub async fn ingest(
 
         state
             .cascadq
-            .push(&reg.queue, json_payload)
+            .push(&queue, json_payload)
             .await
             .map_err(|e| ApiError::Internal(anyhow::anyhow!("failed to push to cascadq: {e}")))?;
 
@@ -315,7 +311,7 @@ pub async fn ingest(
     }
 
     info!(
-        table_id = %table_id,
+        table_name = %table_name,
         files = req.files.len(),
         columns = target_columns.len(),
         tasks_pushed,
@@ -327,23 +323,18 @@ pub async fn ingest(
 
 pub async fn start_backfill(
     State(state): State<AppState>,
-    Path(table_id): Path<String>,
+    Path(table_name): Path<String>,
     Json(req): Json<StartBackfillRequest>,
 ) -> Result<Json<StartBackfillResponse>, ApiError> {
-    let reg = state
-        .registry
-        .get(&table_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+    let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+    let current = storage::read_current(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?;
-    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+    let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
         .await
         .map_err(ApiError::Internal)?;
 
-    // Validate column exists and is not dropped
     let col = metadata
         .indexed_columns
         .iter()
@@ -356,15 +347,13 @@ pub async fn start_backfill(
         )));
     }
 
-    // Snapshot current manifest lists
     let snapshot_lists = metadata.snapshot.manifest_lists.clone();
     let snapshot_count = snapshot_lists.len();
     let column_name = req.column.clone();
 
-    // CAS commit: set column status to Backfilling with frozen snapshot
     cas::commit_metadata(
-        reg.store.as_ref(),
-        &reg.base,
+        table.store.as_ref(),
+        &table.base,
         current.e_tag,
         &metadata,
         None,
@@ -385,7 +374,7 @@ pub async fn start_backfill(
     .map_err(ApiError::Internal)?;
 
     info!(
-        table_id = %table_id,
+        table_name = %table_name,
         column = %req.column,
         manifest_lists = snapshot_count,
         "started backfill"
@@ -400,18 +389,14 @@ pub async fn start_backfill(
 
 pub async fn backfill_status(
     State(state): State<AppState>,
-    Path((table_id, column)): Path<(String, String)>,
+    Path((table_name, column)): Path<(String, String)>,
 ) -> Result<Json<BackfillStatusResponse>, ApiError> {
-    let reg = state
-        .registry
-        .get(&table_id)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+    let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+    let current = storage::read_current(table.store.as_ref(), &table.base)
         .await
         .map_err(ApiError::Internal)?;
-    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+    let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -421,7 +406,6 @@ pub async fn backfill_status(
         .find(|c| c.name == column)
         .ok_or_else(|| ApiError::NotFound(format!("column '{column}' not found")))?;
 
-    // If not backfilling (or no snapshot), return zeroed progress
     let backfill_lists = match &col.backfill_manifest_lists {
         Some(lists) if col.status == ColumnStatus::Backfilling => lists,
         _ => {
@@ -441,7 +425,7 @@ pub async fn backfill_status(
     };
 
     let result = crate::backfill::find_uncovered_files(
-        reg.store.as_ref(),
+        table.store.as_ref(),
         &metadata,
         &column,
         backfill_lists,

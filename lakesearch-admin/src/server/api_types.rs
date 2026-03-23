@@ -36,7 +36,6 @@ pub struct CreateTableResponse {
 
 #[derive(Debug, Serialize)]
 pub struct TableInfoResponse {
-    pub table_id: String,
     pub table_name: String,
     pub location: String,
     pub columns: Vec<ColumnInfo>,
@@ -56,14 +55,13 @@ pub struct ListTablesResponse {
 
 #[derive(Debug, Serialize)]
 pub struct TableSummary {
-    pub table_id: String,
     pub table_name: String,
     pub location: String,
 }
 
 #[derive(Debug, Serialize)]
 pub struct DeleteTableResponse {
-    pub table_id: String,
+    pub table_name: String,
     pub message: String,
 }
 

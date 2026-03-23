@@ -2,6 +2,8 @@ pub mod bm25;
 pub mod boolean;
 #[cfg(feature = "io")]
 pub mod cas;
+#[cfg(feature = "io")]
+pub mod catalog_client;
 pub mod metadata;
 #[cfg(feature = "io")]
 pub mod parquet_util;

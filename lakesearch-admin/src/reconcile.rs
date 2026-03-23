@@ -11,12 +11,12 @@ use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
 use cascadq_client::CascadqClient;
+use lakesearch_core::catalog_client::{CatalogClient, TableInfo};
 use lakesearch_core::metadata::{ColumnStatus, Metadata};
 use object_store::path::Path;
 use object_store::ObjectStore;
 
 use crate::backfill::find_uncovered_files;
-use crate::registry::TableRegistry;
 use crate::server::api_types::IndexTaskPayload;
 use crate::server::config::IngestConfig;
 use lakesearch_core::cas;
@@ -26,13 +26,13 @@ use lakesearch_core::storage;
 /// aborted for graceful shutdown.
 pub fn start(
     config: Arc<IngestConfig>,
-    registry: Arc<TableRegistry>,
+    catalog: Arc<dyn CatalogClient>,
     cascadq: Arc<CascadqClient>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let interval = config.backfill_poll_interval();
         loop {
-            if let Err(e) = reconcile_once(&config, &registry, &cascadq).await {
+            if let Err(e) = reconcile_once(&config, catalog.as_ref(), &cascadq).await {
                 error!(error = %e, "reconciliation loop error");
             }
             tokio::time::sleep(interval).await;
@@ -42,10 +42,10 @@ pub fn start(
 
 async fn reconcile_once(
     config: &IngestConfig,
-    registry: &TableRegistry,
+    catalog: &dyn CatalogClient,
     cascadq: &CascadqClient,
 ) -> Result<()> {
-    let tables = registry.list().await;
+    let tables = catalog.list_tables().await?;
 
     let mut tasks = futures::stream::FuturesUnordered::new();
     for table in tables {
@@ -65,13 +65,13 @@ async fn reconcile_once(
 async fn reconcile_table(
     config: &IngestConfig,
     cascadq: &CascadqClient,
-    table: crate::registry::RegisteredTable,
+    table: TableInfo,
 ) -> Result<()> {
     let current = match storage::read_current(table.store.as_ref(), &table.base).await {
         Ok(c) => c,
         Err(e) => {
             warn!(
-                table_id = %table.table_id,
+                table = %table.name,
                 error = %e,
                 "failed to read current.json, skipping"
             );
@@ -82,7 +82,7 @@ async fn reconcile_table(
         Ok(m) => m,
         Err(e) => {
             warn!(
-                table_id = %table.table_id,
+                table = %table.name,
                 error = %e,
                 "failed to read metadata, skipping"
             );
@@ -103,7 +103,7 @@ async fn reconcile_table(
         if backfill_lists.is_empty() {
             let column_name = col.name.clone();
             info!(
-                table_id = %table.table_id,
+                table = %table.name,
                 column = %column_name,
                 "empty backfill snapshot, transitioning to active"
             );
@@ -117,7 +117,7 @@ async fn reconcile_table(
             .await
             {
                 warn!(
-                    table_id = %table.table_id,
+                    table = %table.name,
                     column = %col.name,
                     error = %e,
                     "failed to transition column to active"
@@ -138,7 +138,7 @@ async fn reconcile_table(
             Ok(u) => u,
             Err(e) => {
                 warn!(
-                    table_id = %table.table_id,
+                    table = %table.name,
                     column = %col.name,
                     error = %e,
                     "failed to find uncovered files"
@@ -150,7 +150,7 @@ async fn reconcile_table(
         if uncovered.uncovered.is_empty() {
             let column_name = col.name.clone();
             info!(
-                table_id = %table.table_id,
+                table = %table.name,
                 column = %column_name,
                 "backfill complete, transitioning to active"
             );
@@ -164,7 +164,7 @@ async fn reconcile_table(
             .await
             {
                 warn!(
-                    table_id = %table.table_id,
+                    table = %table.name,
                     column = %col.name,
                     error = %e,
                     "failed to transition column to active"
@@ -180,6 +180,7 @@ async fn reconcile_table(
             .take(config.backfill_chunk_size)
             .collect();
 
+        let queue = table.queue_name();
         let payload = IndexTaskPayload {
             table_location: table.location.clone(),
             files: chunk.clone(),
@@ -194,10 +195,10 @@ async fn reconcile_table(
             }
         };
 
-        match cascadq.push(&table.queue, json_payload).await {
+        match cascadq.push(&queue, json_payload).await {
             Ok(()) => {
                 info!(
-                    table_id = %table.table_id,
+                    table = %table.name,
                     column = %col.name,
                     files = chunk.len(),
                     remaining = uncovered.total_files - uncovered.indexed_files - chunk.len(),
@@ -206,7 +207,7 @@ async fn reconcile_table(
             }
             Err(e) => {
                 warn!(
-                    table_id = %table.table_id,
+                    table = %table.name,
                     column = %col.name,
                     error = %e,
                     "failed to push backfill chunk to cascadq"
@@ -234,7 +235,6 @@ pub(crate) async fn transition_to_active(
     cas::commit_metadata(store, base, etag, metadata, None, |meta| {
         let mut new = meta.clone();
         if let Some(c) = new.indexed_columns.iter_mut().find(|c| c.name == name) {
-            // Only transition if still backfilling — don't overwrite a concurrent drop
             if c.status == ColumnStatus::Backfilling {
                 c.status = ColumnStatus::Active;
                 c.backfill_manifest_lists = None;
@@ -315,7 +315,6 @@ mod tests {
         let store = InMemory::new();
         let base = Path::from("table");
 
-        // Column is already dropped (simulates concurrent drop)
         let meta = test_metadata(vec![IndexedColumn {
             name: "desc".to_owned(),
             tokenizer: "whitespace_lowercase".to_owned(),
@@ -332,7 +331,6 @@ mod tests {
         let result = read_current(&store, &base).await.unwrap();
         let final_meta = read_metadata(&store, &result.value).await.unwrap();
 
-        // Should still be dropped, not overwritten to active
         assert_eq!(final_meta.indexed_columns[0].status, ColumnStatus::Dropped);
     }
 
@@ -350,7 +348,6 @@ mod tests {
 
         let etag = setup_table(&store, &base, &meta).await;
 
-        // Transition a column that doesn't exist — should succeed without error
         transition_to_active(&store, &base, etag, &meta, "nonexistent")
             .await
             .unwrap();
@@ -358,7 +355,6 @@ mod tests {
         let result = read_current(&store, &base).await.unwrap();
         let final_meta = read_metadata(&store, &result.value).await.unwrap();
 
-        // desc should still be backfilling
         assert_eq!(
             final_meta.indexed_columns[0].status,
             ColumnStatus::Backfilling
