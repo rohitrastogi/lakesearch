@@ -1,4 +1,10 @@
-//! Async multi-segment query command for object storage.
+//! Async multi-segment query execution.
+//!
+//! The query pipeline has four stages:
+//! 1. **Load segments** — read metadata chain, prune by term stats, fetch bytes
+//! 2. **Evaluate segments** — look up posting lists, combine with boolean ops
+//! 3. **Fetch and verify** — read Parquet pages, re-tokenize rows, score
+//! 4. **Rank results** — top-K heap or sort+truncate
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -9,14 +15,15 @@ use tracing::info;
 
 use lakesearch_core::bm25;
 use lakesearch_core::boolean;
+use lakesearch_core::metadata::{Manifest, ManifestList, TermStats};
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_core::segment::SegmentReader;
 use lakesearch_core::tokenizer::tokenize;
-use lakesearch_core::types::DocId;
+use lakesearch_core::types::{DocId, DocTableEntry};
 use object_store::path::Path;
 use parquet::file::metadata::ParquetMetaData;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::object_cache::ObjectCache;
 use crate::parquet_util::{
@@ -29,13 +36,17 @@ use crate::Operator;
 /// Max concurrent I/O operations for parallel loading.
 const IO_CONCURRENCY: usize = 8;
 
-#[derive(Debug, Serialize)]
+// ---------------------------------------------------------------------------
+// Public types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct QueryResult {
     pub matches: Vec<MatchedRow>,
     pub stats: QueryStats,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct MatchedRow {
     pub file: String,
     pub row_group: u16,
@@ -46,14 +57,18 @@ pub struct MatchedRow {
     pub columns: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct QueryStats {
     pub candidate_pages: usize,
     pub rows_scanned: usize,
     pub rows_matched: usize,
 }
 
-/// Queries a LakeSearch table in object storage across all segments.
+// ---------------------------------------------------------------------------
+// Orchestrator
+// ---------------------------------------------------------------------------
+
+/// Queries a LakeSearch table across all segments.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
     cache: Arc<ObjectCache>,
@@ -66,22 +81,6 @@ pub async fn run_query(
     select_columns: Vec<String>,
     runtime: Arc<LakeRuntime>,
 ) -> Result<QueryResult> {
-    // 1. Load metadata chain
-    let current_result = read_current(cache.store().as_ref(), &base).await?;
-    let metadata = read_metadata(cache.store().as_ref(), &current_result.value).await?;
-
-    // 2. Load manifest lists (cached), collect segment paths
-    let manifest_lists: Vec<lakesearch_core::metadata::ManifestList> =
-        stream::iter(metadata.snapshot.manifest_lists.into_iter())
-            .map(|ml_path| {
-                let cache = Arc::clone(&cache);
-                async move { cache.get_json(&ml_path).await }
-            })
-            .buffered(IO_CONCURRENCY)
-            .try_collect::<Vec<_>>()
-            .await?;
-
-    // Tokenize query early so we can use terms for segment pruning
     let query_terms = tokenize(query_text);
     if query_terms.is_empty() {
         return Ok(QueryResult {
@@ -90,283 +89,49 @@ pub async fn run_query(
         });
     }
 
-    // Collect manifest paths, then load in parallel
-    let mut manifest_paths: Vec<(String, lakesearch_core::metadata::TermStats)> = Vec::new();
-    for ml in &manifest_lists {
-        for me in &ml.manifests {
-            if me.indexed_column != column {
-                continue;
-            }
-            manifest_paths.push((me.manifest_path.clone(), me.term_stats.clone()));
-        }
-    }
-
-    let manifest_path_strs: Vec<String> = manifest_paths.iter().map(|(p, _)| p.clone()).collect();
-    let manifests: Vec<lakesearch_core::metadata::Manifest> =
-        stream::iter(manifest_path_strs.into_iter())
-            .map(|path| {
-                let cache = Arc::clone(&cache);
-                async move { cache.get_json(&path).await }
-            })
-            .buffered(IO_CONCURRENCY)
-            .try_collect()
-            .await?;
-
-    // Collect segment paths, pruning by term_stats range
-    let mut segment_paths: Vec<String> = Vec::new();
-    for ((_path, term_stats), manifest) in manifest_paths.iter().zip(manifests.iter()) {
-        // Segment pruning: skip segments where query terms fall outside the
-        // term range. For AND, skip if any term is out of range. For OR,
-        // skip only if all terms are out of range.
-        let term_in_range =
-            |t: &str| t >= term_stats.min_term.as_str() && t <= term_stats.max_term.as_str();
-        let dominated = match operator {
-            Operator::And => query_terms.iter().any(|t| !term_in_range(t)),
-            Operator::Or => query_terms.iter().all(|t| !term_in_range(t)),
-        };
-        if dominated && !term_stats.min_term.is_empty() {
-            continue;
-        }
-
-        for seg_info in &manifest.segments {
-            segment_paths.push(seg_info.segment_path.clone());
-        }
-    }
-
-    // Load segment bytes (cached)
-    let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.into_iter())
-        .map(|path| {
-            let cache = Arc::clone(&cache);
-            async move { cache.get_bytes(&path).await.map(|b| b.to_vec()) }
-        })
-        .buffered(IO_CONCURRENCY)
-        .try_collect()
-        .await?;
-
-    if segment_bytes_list.is_empty() {
+    // Stage 1: load segments
+    let segments = load_segments(&cache, &base, &column, &query_terms, operator).await?;
+    if segments.is_empty() {
         return Ok(QueryResult {
             matches: vec![],
             stats: QueryStats::default(),
         });
     }
+    info!(segments = segments.len(), "loaded segments");
 
-    info!(segments = segment_bytes_list.len(), "loaded segments");
-
+    // Stage 2+3: evaluate each segment and fetch/verify matching rows
     let mut all_matches = Vec::new();
     let mut stats = QueryStats::default();
 
-    // 4. Process each segment independently
-    for seg_bytes in segment_bytes_list {
+    for seg_bytes in segments {
         let reader = SegmentReader::open(seg_bytes).context("opening segment")?;
 
-        // Look up posting lists for this segment
-        let mut posting_lists: Vec<Vec<DocId>> = Vec::new();
-        let mut any_missing = false;
-        for term in &query_terms {
-            match reader.search_term(term)? {
-                Some(postings) => posting_lists.push(postings),
-                None => {
-                    if operator == Operator::And {
-                        any_missing = true;
-                        break;
-                    }
-                }
-            }
-        }
-
-        if any_missing || posting_lists.is_empty() {
+        let candidates = evaluate_segment(&reader, &query_terms, operator)?;
+        if candidates.is_empty() {
             continue;
         }
 
-        // Combine posting lists
-        let mut combined = posting_lists[0].clone();
-        for postings in &posting_lists[1..] {
-            combined = match operator {
-                Operator::And => boolean::intersect(&combined, postings),
-                Operator::Or => boolean::union(&combined, postings),
-            };
-        }
+        let (mut matches, scan_stats) = fetch_and_verify(
+            &cache,
+            &reader,
+            &candidates,
+            &column,
+            &query_terms,
+            operator,
+            with_score,
+            &select_columns,
+            &runtime,
+        )
+        .await?;
 
-        if combined.is_empty() {
-            continue;
-        }
-
-        // Group candidates by (file_ordinal, row_group)
-        let mut groups: BTreeMap<(u32, u16), Vec<DocId>> = BTreeMap::new();
-        for &doc_id in &combined {
-            if let Some(entry) = reader.doc_entry(doc_id) {
-                groups
-                    .entry((entry.file_ordinal, entry.row_group))
-                    .or_default()
-                    .push(doc_id);
-            }
-        }
-
-        // Prepare scoring data for this segment
-        let corpus_stats = reader.corpus_stats();
-        let avg_dl = bm25::avg_dl(corpus_stats.total_tokens, corpus_stats.total_rows);
-        let term_infos: Vec<(String, u32)> = query_terms
-            .iter()
-            .filter_map(|t| {
-                reader.term_ordinal(t).map(|ord| {
-                    let info = reader.term_info(ord).expect("valid ordinal from FST");
-                    (t.clone(), info.doc_frequency)
-                })
-            })
-            .collect();
-
-        let file_table = reader.file_table();
-
-        // Pre-load Parquet metadata for unique files in parallel
-        let unique_file_ords: Vec<u32> = groups
-            .keys()
-            .map(|(fo, _)| *fo)
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-
-        let pq_metas: Vec<(u32, Arc<ParquetMetaData>)> = stream::iter(unique_file_ords.into_iter())
-            .map(|fo| {
-                let cache = Arc::clone(&cache);
-                let fp = file_table[fo as usize].path.clone();
-                async move { cache.get_parquet_metadata(&fp).await.map(|meta| (fo, meta)) }
-            })
-            .buffered(IO_CONCURRENCY)
-            .try_collect()
-            .await?;
-
-        let pq_meta_map: HashMap<u32, Arc<ParquetMetaData>> = pq_metas.into_iter().collect();
-
-        // Read and verify rows per group
-        for ((file_ordinal, rg_idx), doc_ids) in &groups {
-            let file_path = &file_table[*file_ordinal as usize].path;
-
-            let mut entries: Vec<_> = doc_ids
-                .iter()
-                .map(|&id| reader.doc_entry(id).expect("validated"))
-                .collect();
-            entries.sort_by_key(|e| e.first_row_index);
-            entries.dedup_by_key(|e| e.first_row_index);
-            stats.candidate_pages += entries.len();
-
-            let pq_meta = &pq_meta_map[file_ordinal];
-            let rg_total_rows = pq_meta.row_group(*rg_idx as usize).num_rows();
-
-            let selection = build_row_selection(&entries, rg_total_rows);
-
-            // Resolve leaf indices: indexed column + select columns
-            let indexed_leaf = validate_column(pq_meta, &column)
-                .with_context(|| format!("validating column in '{file_path}'"))?;
-
-            let mut select_leaves: Vec<(usize, String)> = Vec::new();
-            for sel_name in &select_columns {
-                if *sel_name == column {
-                    continue; // Already included as the indexed column
-                }
-                let leaf = validate_column(pq_meta, sel_name)
-                    .with_context(|| format!("select column '{sel_name}' in '{file_path}'"))?;
-                select_leaves.push((leaf, sel_name.clone()));
-            }
-
-            // Build sorted leaf indices and track positions in the projected batch
-            let mut all_leaves: Vec<(usize, Option<String>)> = vec![(indexed_leaf, None)];
-            for (leaf, name) in &select_leaves {
-                all_leaves.push((*leaf, Some(name.clone())));
-            }
-            all_leaves.sort_by_key(|(leaf, _)| *leaf);
-
-            let leaf_indices: Vec<usize> = all_leaves.iter().map(|(l, _)| *l).collect();
-            let indexed_batch_col = all_leaves
-                .iter()
-                .position(|(l, _)| *l == indexed_leaf)
-                .unwrap();
-
-            // Map: batch column index → select column name
-            let select_col_map: Vec<(usize, String)> = all_leaves
-                .iter()
-                .enumerate()
-                .filter_map(|(batch_idx, (_, name))| name.as_ref().map(|n| (batch_idx, n.clone())))
-                .collect();
-
-            let batches = read_parquet_batches_async(
-                cache.store(),
-                file_path,
-                *rg_idx as usize,
-                &leaf_indices,
-                Some(selection),
-            )
-            .await?;
-
-            // Determine if LargeUtf8
-            let is_large = batches
-                .first()
-                .map(|b| {
-                    b.schema().field(indexed_batch_col).data_type()
-                        == &arrow::datatypes::DataType::LargeUtf8
-                })
-                .unwrap_or(false);
-
-            // CPU: verify, score, and extract select columns
-            let qt = query_terms.clone();
-            let ti = term_infos.clone();
-            let op = operator;
-            let fp = file_path.clone();
-            let rg = *rg_idx;
-            let scm = select_col_map.clone();
-            let ibc = indexed_batch_col;
-
-            let (mut matches, scan_stats) = runtime
-                .cpu(move || {
-                    verify_and_score_batches(
-                        &batches,
-                        &qt,
-                        &ti,
-                        op,
-                        with_score,
-                        avg_dl,
-                        corpus_stats.total_rows,
-                        is_large,
-                        &fp,
-                        rg,
-                        ibc,
-                        &scm,
-                    )
-                })
-                .await;
-
-            stats.rows_scanned += scan_stats.0;
-            stats.rows_matched += scan_stats.1;
-            all_matches.append(&mut matches);
-        }
+        stats.candidate_pages += scan_stats.candidate_pages;
+        stats.rows_scanned += scan_stats.rows_scanned;
+        stats.rows_matched += scan_stats.rows_matched;
+        all_matches.append(&mut matches);
     }
 
-    // Top-K: when scoring + limit, use a min-heap to keep only the top K
-    // by score. This avoids sorting all matches when only K are needed.
-    if let (true, Some(k)) = (with_score, limit) {
-        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<ScoredMatch>> =
-            std::collections::BinaryHeap::with_capacity(k + 1);
-        for m in all_matches {
-            let s = m.score.unwrap_or(0.0);
-            heap.push(std::cmp::Reverse(ScoredMatch { score: s, row: m }));
-            if heap.len() > k {
-                heap.pop();
-            }
-        }
-        all_matches = heap
-            .into_sorted_vec()
-            .into_iter()
-            .map(|r| r.0.row)
-            .collect();
-    } else if with_score {
-        all_matches.sort_by(|a, b| {
-            b.score
-                .unwrap_or(0.0)
-                .partial_cmp(&a.score.unwrap_or(0.0))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-    } else if let Some(limit) = limit {
-        all_matches.truncate(limit);
-    }
+    // Stage 4: rank and limit
+    rank_results(&mut all_matches, with_score, limit);
 
     info!(
         candidate_pages = stats.candidate_pages,
@@ -381,7 +146,350 @@ pub async fn run_query(
     })
 }
 
-/// Wrapper for top-K heap ordering by score (ascending — min-heap).
+// ---------------------------------------------------------------------------
+// Stage 1: Load segments
+// ---------------------------------------------------------------------------
+
+/// Loads metadata, resolves manifests, prunes by term stats, fetches segment
+/// bytes. Returns the raw bytes for each segment that could contain matches.
+async fn load_segments(
+    cache: &Arc<ObjectCache>,
+    base: &Path,
+    column: &str,
+    query_terms: &[String],
+    operator: Operator,
+) -> Result<Vec<Vec<u8>>> {
+    // Read metadata chain
+    let current = read_current(cache.store().as_ref(), base).await?;
+    let metadata = read_metadata(cache.store().as_ref(), &current.value).await?;
+
+    // Load manifest lists in parallel
+    let manifest_lists: Vec<ManifestList> =
+        stream::iter(metadata.snapshot.manifest_lists.into_iter())
+            .map(|ml_path| {
+                let cache = Arc::clone(cache);
+                async move { cache.get_json(&ml_path).await }
+            })
+            .buffered(IO_CONCURRENCY)
+            .try_collect()
+            .await?;
+
+    // Collect manifest paths for the target column
+    let mut manifest_entries: Vec<(String, TermStats)> = Vec::new();
+    for ml in &manifest_lists {
+        for me in &ml.manifests {
+            if me.indexed_column == column {
+                manifest_entries.push((me.manifest_path.clone(), me.term_stats.clone()));
+            }
+        }
+    }
+
+    // Load manifests in parallel
+    let manifest_paths: Vec<String> = manifest_entries.iter().map(|(p, _)| p.clone()).collect();
+    let manifests: Vec<Manifest> = stream::iter(manifest_paths.into_iter())
+        .map(|path| {
+            let cache = Arc::clone(cache);
+            async move { cache.get_json(&path).await }
+        })
+        .buffered(IO_CONCURRENCY)
+        .try_collect()
+        .await?;
+
+    // Collect segment paths, pruning by term stats
+    let mut segment_paths: Vec<String> = Vec::new();
+    for ((_, term_stats), manifest) in manifest_entries.iter().zip(manifests.iter()) {
+        if should_prune_segment(term_stats, query_terms, operator) {
+            continue;
+        }
+        for seg in &manifest.segments {
+            segment_paths.push(seg.segment_path.clone());
+        }
+    }
+
+    // Load segment bytes in parallel
+    stream::iter(segment_paths.into_iter())
+        .map(|path| {
+            let cache = Arc::clone(cache);
+            async move { cache.get_bytes(&path).await.map(|b| b.to_vec()) }
+        })
+        .buffered(IO_CONCURRENCY)
+        .try_collect()
+        .await
+}
+
+/// Returns true if the segment can be skipped based on term stats.
+fn should_prune_segment(
+    term_stats: &TermStats,
+    query_terms: &[String],
+    operator: Operator,
+) -> bool {
+    if term_stats.min_term.is_empty() {
+        return false; // No stats, can't prune
+    }
+    let in_range = |t: &str| t >= term_stats.min_term.as_str() && t <= term_stats.max_term.as_str();
+    match operator {
+        // AND: skip if any term is definitely missing
+        Operator::And => query_terms.iter().any(|t| !in_range(t)),
+        // OR: skip only if all terms are definitely missing
+        Operator::Or => query_terms.iter().all(|t| !in_range(t)),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: Evaluate segment
+// ---------------------------------------------------------------------------
+
+/// Looks up posting lists for each query term and combines them with boolean
+/// ops. Returns candidate doc_ids (page-level, may contain false positives).
+fn evaluate_segment(
+    reader: &SegmentReader,
+    query_terms: &[String],
+    operator: Operator,
+) -> Result<Vec<DocId>> {
+    let mut posting_lists: Vec<Vec<DocId>> = Vec::new();
+    for term in query_terms {
+        match reader.search_term(term)? {
+            Some(postings) => posting_lists.push(postings),
+            None => {
+                if operator == Operator::And {
+                    return Ok(vec![]);
+                }
+            }
+        }
+    }
+
+    if posting_lists.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let mut combined = posting_lists[0].clone();
+    for postings in &posting_lists[1..] {
+        combined = match operator {
+            Operator::And => boolean::intersect(&combined, postings),
+            Operator::Or => boolean::union(&combined, postings),
+        };
+    }
+    Ok(combined)
+}
+
+// ---------------------------------------------------------------------------
+// Stage 3: Fetch and verify
+// ---------------------------------------------------------------------------
+
+/// Groups candidates by (file, row_group), reads Parquet pages, verifies
+/// rows on the CPU pool, and optionally scores with BM25.
+#[allow(clippy::too_many_arguments)]
+async fn fetch_and_verify(
+    cache: &Arc<ObjectCache>,
+    reader: &SegmentReader,
+    candidates: &[DocId],
+    column: &str,
+    query_terms: &[String],
+    operator: Operator,
+    with_score: bool,
+    select_columns: &[String],
+    runtime: &Arc<LakeRuntime>,
+) -> Result<(Vec<MatchedRow>, QueryStats)> {
+    // Group by (file_ordinal, row_group)
+    let mut groups: BTreeMap<(u32, u16), Vec<&DocTableEntry>> = BTreeMap::new();
+    for &doc_id in candidates {
+        if let Some(entry) = reader.doc_entry(doc_id) {
+            groups
+                .entry((entry.file_ordinal, entry.row_group))
+                .or_default()
+                .push(entry);
+        }
+    }
+
+    // Scoring context
+    let corpus_stats = reader.corpus_stats();
+    let avg_dl = bm25::avg_dl(corpus_stats.total_tokens, corpus_stats.total_rows);
+    let term_infos: Vec<(String, u32)> = query_terms
+        .iter()
+        .filter_map(|t| {
+            reader.term_ordinal(t).map(|ord| {
+                let info = reader.term_info(ord).expect("valid ordinal from FST");
+                (t.clone(), info.doc_frequency)
+            })
+        })
+        .collect();
+
+    let file_table = reader.file_table();
+
+    // Pre-load Parquet metadata for unique files in parallel
+    let unique_file_ords: Vec<u32> = groups
+        .keys()
+        .map(|(fo, _)| *fo)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let pq_metas: Vec<(u32, Arc<ParquetMetaData>)> = stream::iter(unique_file_ords.into_iter())
+        .map(|fo| {
+            let cache = Arc::clone(cache);
+            let fp = file_table[fo as usize].path.clone();
+            async move { cache.get_parquet_metadata(&fp).await.map(|m| (fo, m)) }
+        })
+        .buffered(IO_CONCURRENCY)
+        .try_collect()
+        .await?;
+    let pq_meta_map: HashMap<u32, Arc<ParquetMetaData>> = pq_metas.into_iter().collect();
+
+    let mut all_matches = Vec::new();
+    let mut stats = QueryStats::default();
+
+    for ((file_ordinal, rg_idx), entries) in &groups {
+        let file_path = &file_table[*file_ordinal as usize].path;
+
+        let mut sorted_entries: Vec<&DocTableEntry> = entries.clone();
+        sorted_entries.sort_by_key(|e| e.first_row_index);
+        sorted_entries.dedup_by_key(|e| e.first_row_index);
+        stats.candidate_pages += sorted_entries.len();
+
+        let pq_meta = &pq_meta_map[file_ordinal];
+        let rg_total_rows = pq_meta.row_group(*rg_idx as usize).num_rows();
+        let selection = build_row_selection(&sorted_entries, rg_total_rows);
+
+        // Resolve column projection
+        let projection = resolve_projection(pq_meta, column, select_columns)?;
+
+        let batches = read_parquet_batches_async(
+            cache.store(),
+            file_path,
+            *rg_idx as usize,
+            &projection.leaf_indices,
+            Some(selection),
+        )
+        .await?;
+
+        let is_large = batches
+            .first()
+            .map(|b| {
+                b.schema().field(projection.indexed_batch_col).data_type()
+                    == &arrow::datatypes::DataType::LargeUtf8
+            })
+            .unwrap_or(false);
+
+        // CPU: verify and score
+        let qt = query_terms.to_vec();
+        let ti = term_infos.clone();
+        let fp = file_path.clone();
+        let rg = *rg_idx;
+        let scm = projection.select_col_map.clone();
+        let ibc = projection.indexed_batch_col;
+
+        let (mut matches, scan) = runtime
+            .cpu(move || {
+                verify_and_score(
+                    &batches,
+                    &qt,
+                    &ti,
+                    operator,
+                    with_score,
+                    avg_dl,
+                    corpus_stats.total_rows,
+                    is_large,
+                    &fp,
+                    rg,
+                    ibc,
+                    &scm,
+                )
+            })
+            .await;
+
+        stats.rows_scanned += scan.rows_scanned;
+        stats.rows_matched += scan.rows_matched;
+        all_matches.append(&mut matches);
+    }
+
+    Ok((all_matches, stats))
+}
+
+/// Resolved column projection: which parquet leaves to read and how they
+/// map to batch column indices.
+struct Projection {
+    leaf_indices: Vec<usize>,
+    indexed_batch_col: usize,
+    select_col_map: Vec<(usize, String)>,
+}
+
+/// Resolves parquet leaf indices for the indexed column + select columns.
+fn resolve_projection(
+    pq_meta: &ParquetMetaData,
+    column: &str,
+    select_columns: &[String],
+) -> Result<Projection> {
+    let indexed_leaf = validate_column(pq_meta, column)
+        .with_context(|| format!("resolving indexed column '{column}'"))?;
+
+    let mut select_leaves: Vec<(usize, String)> = Vec::new();
+    for sel in select_columns {
+        if sel == column {
+            continue;
+        }
+        let leaf = validate_column(pq_meta, sel)
+            .with_context(|| format!("resolving select column '{sel}'"))?;
+        select_leaves.push((leaf, sel.clone()));
+    }
+
+    let mut all_leaves: Vec<(usize, Option<String>)> = vec![(indexed_leaf, None)];
+    for (leaf, name) in &select_leaves {
+        all_leaves.push((*leaf, Some(name.clone())));
+    }
+    all_leaves.sort_by_key(|(leaf, _)| *leaf);
+
+    let leaf_indices: Vec<usize> = all_leaves.iter().map(|(l, _)| *l).collect();
+    let indexed_batch_col = all_leaves
+        .iter()
+        .position(|(l, _)| *l == indexed_leaf)
+        .unwrap();
+    let select_col_map: Vec<(usize, String)> = all_leaves
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, (_, name))| name.as_ref().map(|n| (idx, n.clone())))
+        .collect();
+
+    Ok(Projection {
+        leaf_indices,
+        indexed_batch_col,
+        select_col_map,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Stage 4: Rank results
+// ---------------------------------------------------------------------------
+
+/// Sorts and/or truncates the result set.
+fn rank_results(matches: &mut Vec<MatchedRow>, with_score: bool, limit: Option<usize>) {
+    if let (true, Some(k)) = (with_score, limit) {
+        // Top-K via min-heap
+        let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<ScoredMatch>> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        for m in matches.drain(..) {
+            let s = m.score.unwrap_or(0.0);
+            heap.push(std::cmp::Reverse(ScoredMatch { score: s, row: m }));
+            if heap.len() > k {
+                heap.pop();
+            }
+        }
+        *matches = heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|r| r.0.row)
+            .collect();
+    } else if with_score {
+        matches.sort_by(|a, b| {
+            b.score
+                .unwrap_or(0.0)
+                .partial_cmp(&a.score.unwrap_or(0.0))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+    } else if let Some(limit) = limit {
+        matches.truncate(limit);
+    }
+}
+
 struct ScoredMatch {
     score: f64,
     row: MatchedRow,
@@ -392,15 +500,12 @@ impl PartialEq for ScoredMatch {
         self.score == other.score
     }
 }
-
 impl Eq for ScoredMatch {}
-
 impl PartialOrd for ScoredMatch {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }
 }
-
 impl Ord for ScoredMatch {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.score
@@ -409,10 +514,13 @@ impl Ord for ScoredMatch {
     }
 }
 
-/// CPU-bound: verify rows against query, optionally score, and extract select columns.
-/// Returns (matches, (rows_scanned, rows_matched)).
+// ---------------------------------------------------------------------------
+// Row verification (CPU-bound)
+// ---------------------------------------------------------------------------
+
+/// Re-tokenizes each row, checks the boolean predicate, optionally scores.
 #[allow(clippy::too_many_arguments)]
-fn verify_and_score_batches(
+fn verify_and_score(
     batches: &[arrow::array::RecordBatch],
     query_terms: &[String],
     term_infos: &[(String, u32)],
@@ -425,10 +533,9 @@ fn verify_and_score_batches(
     rg_idx: u16,
     indexed_batch_col: usize,
     select_col_map: &[(usize, String)],
-) -> (Vec<MatchedRow>, (usize, usize)) {
+) -> (Vec<MatchedRow>, QueryStats) {
     let mut matches = Vec::new();
-    let mut rows_scanned = 0usize;
-    let mut rows_matched = 0usize;
+    let mut stats = QueryStats::default();
     let single_term = query_terms.len() == 1;
     let few_terms = query_terms.len() <= 4;
 
@@ -436,7 +543,7 @@ fn verify_and_score_batches(
         let col = batch.column(indexed_batch_col);
 
         for row in 0..batch.num_rows() {
-            rows_scanned += 1;
+            stats.rows_scanned += 1;
 
             if col.is_null(row) {
                 continue;
@@ -445,11 +552,9 @@ fn verify_and_score_batches(
             let text = string_value(col.as_ref(), row, is_large);
             let tokens = tokenize(text);
 
-            // Fast path: single-term query — no HashSet needed
             let matches_query = if single_term {
                 tokens.iter().any(|t| t == &query_terms[0])
             } else if few_terms {
-                // Small query: linear scan beats HashSet construction
                 match operator {
                     Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
                     Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
@@ -466,9 +571,8 @@ fn verify_and_score_batches(
                 continue;
             }
 
-            rows_matched += 1;
+            stats.rows_matched += 1;
 
-            // Only build frequency map when scoring
             let score = if with_score {
                 let dl = tokens.len() as u32;
                 let mut total_score = 0.0;
@@ -504,5 +608,5 @@ fn verify_and_score_batches(
         }
     }
 
-    (matches, (rows_scanned, rows_matched))
+    (matches, stats)
 }
