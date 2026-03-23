@@ -1609,12 +1609,20 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "axum",
+ "cascadq-client",
  "chrono",
+ "clap",
  "futures",
  "lakesearch-core",
  "object_store",
  "parquet",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

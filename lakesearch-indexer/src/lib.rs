@@ -4,6 +4,8 @@
 //! pipelined I/O reads feeding rayon CPU tokenization, and parallel posting
 //! list encoding in the segment builder.
 
+pub mod server;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
