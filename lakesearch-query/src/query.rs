@@ -174,18 +174,22 @@ async fn load_segments(
             .try_collect()
             .await?;
 
-    // Collect manifest paths for the target column
-    let mut manifest_entries: Vec<(String, TermStats)> = Vec::new();
+    // Collect manifest paths for the target column, pruning by term stats
+    // BEFORE fetching the manifests to avoid unnecessary I/O.
+    let mut manifest_paths: Vec<String> = Vec::new();
     for ml in &manifest_lists {
         for me in &ml.manifests {
-            if me.indexed_column == column {
-                manifest_entries.push((me.manifest_path.clone(), me.term_stats.clone()));
+            if me.indexed_column != column {
+                continue;
             }
+            if should_prune_segment(&me.term_stats, query_terms, operator) {
+                continue;
+            }
+            manifest_paths.push(me.manifest_path.clone());
         }
     }
 
-    // Load manifests in parallel
-    let manifest_paths: Vec<String> = manifest_entries.iter().map(|(p, _)| p.clone()).collect();
+    // Load non-pruned manifests in parallel
     let manifests: Vec<Manifest> = stream::iter(manifest_paths.into_iter())
         .map(|path| {
             let cache = Arc::clone(cache);
@@ -195,12 +199,9 @@ async fn load_segments(
         .try_collect()
         .await?;
 
-    // Collect segment paths, pruning by term stats
+    // Collect segment paths from surviving manifests
     let mut segment_paths: Vec<String> = Vec::new();
-    for ((_, term_stats), manifest) in manifest_entries.iter().zip(manifests.iter()) {
-        if should_prune_segment(term_stats, query_terms, operator) {
-            continue;
-        }
+    for manifest in &manifests {
         for seg in &manifest.segments {
             segment_paths.push(seg.segment_path.clone());
         }
