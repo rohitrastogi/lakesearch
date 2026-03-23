@@ -9,10 +9,11 @@ use object_store::ObjectStore;
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 
+use lakesearch_core::catalog_client::CatalogClient;
 use lakesearch_core::metadata::Metadata;
 
 use crate::object_cache::ObjectCache;
-use lakesearch_core::storage::{parse_location, read_current, read_metadata};
+use lakesearch_core::storage::{read_current, read_metadata};
 
 /// Cached state for a single table.
 struct TableState {
@@ -41,14 +42,17 @@ impl MetadataCache {
         }
     }
 
-    /// Registers a table by loading its metadata from object storage.
-    pub async fn register(&self, name: &str, location: &str) -> Result<()> {
-        let (store, base) = parse_location(location)?;
-        self.register_with_store(name, store, base).await
+    /// Registers all tables from a catalog client.
+    pub async fn register_from_catalog(&self, catalog: &dyn CatalogClient) -> Result<()> {
+        let tables = catalog.list_tables().await?;
+        for table in tables {
+            self.register_with_store(&table.name, table.store, table.base)
+                .await?;
+        }
+        Ok(())
     }
 
     /// Registers a table with an already-constructed object store and base path.
-    /// Used in tests where the store is created programmatically (e.g., InMemory).
     pub async fn register_with_store(
         &self,
         name: &str,
