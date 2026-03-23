@@ -90,6 +90,8 @@ async fn reconcile_table(
         }
     };
 
+    // TODO(rohitrastogi): load current manifest lists once per table and pass
+    // into find_uncovered_files, instead of re-fetching for each column.
     for col in &metadata.indexed_columns {
         if col.status != ColumnStatus::Backfilling {
             continue;

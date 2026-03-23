@@ -52,24 +52,25 @@ pub async fn list_tables(
         .await
         .map_err(ApiError::Internal)?;
 
-    let mut infos = Vec::with_capacity(tables.len());
-    for table in tables {
-        let index_base = table.index_base();
-        // Try to read metadata; skip tables without index metadata
-        let current = match read_current(table.store.as_ref(), &index_base).await {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        let meta = match read_metadata(table.store.as_ref(), &current.value).await {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        infos.push(TableInfo {
-            name: table.name,
-            location: table.location,
-            indexed_columns: active_column_names(&meta.indexed_columns),
-        });
-    }
+    // Load metadata for all tables in parallel
+    let futs: Vec<_> = tables
+        .into_iter()
+        .map(|table| async move {
+            let index_base = table.index_base();
+            let current = read_current(table.store.as_ref(), &index_base).await.ok()?;
+            let meta = read_metadata(table.store.as_ref(), &current.value)
+                .await
+                .ok()?;
+            Some(TableInfo {
+                name: table.name,
+                location: table.location,
+                indexed_columns: active_column_names(&meta.indexed_columns),
+            })
+        })
+        .collect();
+
+    let results = futures::future::join_all(futs).await;
+    let infos = results.into_iter().flatten().collect();
 
     Ok(Json(ListTablesResponse { tables: infos }))
 }

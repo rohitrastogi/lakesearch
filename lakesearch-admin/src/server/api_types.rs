@@ -116,7 +116,7 @@ pub struct StartBackfillRequest {
 #[derive(Debug, Serialize)]
 pub struct StartBackfillResponse {
     pub column: String,
-    pub status: String,
+    pub status: ColumnStatus,
     pub manifest_lists_snapshot: usize,
 }
 

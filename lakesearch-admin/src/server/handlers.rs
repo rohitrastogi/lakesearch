@@ -382,7 +382,7 @@ pub async fn start_backfill(
 
     Ok(Json(StartBackfillResponse {
         column: req.column,
-        status: "backfilling".to_owned(),
+        status: ColumnStatus::Backfilling,
         manifest_lists_snapshot: snapshot_count,
     }))
 }
