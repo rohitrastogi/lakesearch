@@ -101,7 +101,7 @@ impl SegmentBuilder {
 
         // Phase 2: Serial assembly — write encoded postings into buffer
         // sequentially (required for offset tracking).
-        let mut term_postings: Vec<(String, u64, u32, u32)> = Vec::new(); // (term, offset, length, df)
+        let mut term_postings: Vec<(String, u64, u32, u32)> = Vec::with_capacity(encoded_postings.len());
         for (term, encoded, doc_frequency) in encoded_postings {
             let offset = (buf.len() as u64) - posting_offset;
             let length = encoded.len() as u32;

@@ -1457,6 +1457,7 @@ dependencies = [
  "futures",
  "lakesearch-core",
  "object_store",
+ "parquet",
  "tracing",
 ]
 
