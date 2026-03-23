@@ -83,7 +83,7 @@ pub async fn search(
     // Execute query with timeout
     let operator: crate::Operator = req.search.operator.into();
     let result = tokio::time::timeout(
-        state.config.query_timeout,
+        state.config.query_timeout(),
         crate::query::run_query(
             object_cache,
             base,
@@ -93,6 +93,7 @@ pub async fn search(
             req.score.into(),
             req.limit,
             req.select.clone(),
+            state.config.io_concurrency,
             Arc::clone(&state.runtime),
         ),
     )

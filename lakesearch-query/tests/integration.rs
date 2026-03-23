@@ -52,6 +52,7 @@ async fn run_query(
         score_mode,
         limit,
         select_columns.to_vec(),
+        8,
         Arc::new(LakeRuntime::new(2)),
     )
     .await

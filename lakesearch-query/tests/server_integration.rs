@@ -34,10 +34,11 @@ async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task:
 
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
-        query_timeout: std::time::Duration::from_secs(30),
-        metadata_poll_interval: std::time::Duration::from_secs(60),
+        query_timeout_secs: 30,
+        metadata_poll_secs: 60,
         cpu_threads: 2,
-        tables: vec![],
+        io_concurrency: 8,
+        tables: std::collections::HashMap::new(),
     };
 
     let state = AppState {

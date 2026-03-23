@@ -144,6 +144,8 @@ impl MetadataCache {
         if let Some(state) = tables.get_mut(name) {
             state.current_metadata_path = current.value.metadata_path;
             state.metadata = Arc::new(metadata);
+        } else {
+            warn!(table = %name, "table removed during metadata refresh");
         }
 
         Ok(())

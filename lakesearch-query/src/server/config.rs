@@ -1,60 +1,88 @@
 use std::net::SocketAddr;
+use std::path::Path;
 use std::time::Duration;
 
-/// Server configuration, loaded from environment variables.
-#[derive(Debug, Clone)]
+use anyhow::{Context, Result};
+use serde::Deserialize;
+
+/// Server configuration, loaded from a YAML file.
+///
+/// Example `config.yaml`:
+/// ```yaml
+/// bind_addr: "0.0.0.0:8080"
+/// query_timeout_secs: 300
+/// metadata_poll_secs: 5
+/// cpu_threads: 8
+/// io_concurrency: 8
+/// tables:
+///   events: "s3://bucket/lakesearch/tables/events/"
+///   logs: "file:///tmp/lakesearch/logs/"
+/// ```
+#[derive(Debug, Clone, Deserialize)]
 pub struct ServerConfig {
+    #[serde(default = "default_bind_addr")]
     pub bind_addr: SocketAddr,
-    pub query_timeout: Duration,
-    pub metadata_poll_interval: Duration,
+    #[serde(default = "default_query_timeout_secs")]
+    pub query_timeout_secs: u64,
+    #[serde(default = "default_metadata_poll_secs")]
+    pub metadata_poll_secs: u64,
+    #[serde(default = "default_cpu_threads")]
     pub cpu_threads: usize,
+    #[serde(default = "default_io_concurrency")]
+    pub io_concurrency: usize,
     /// Table definitions: name → location URL.
-    pub tables: Vec<(String, String)>,
+    #[serde(default)]
+    pub tables: std::collections::HashMap<String, String>,
 }
 
 impl ServerConfig {
-    pub fn from_env() -> Self {
-        let bind_addr = std::env::var("LAKESEARCH_BIND_ADDR")
-            .unwrap_or_else(|_| "0.0.0.0:8080".to_owned())
-            .parse()
-            .expect("invalid LAKESEARCH_BIND_ADDR");
+    /// Loads config from a YAML file.
+    pub fn from_file(path: &Path) -> Result<Self> {
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        serde_yaml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))
+    }
 
-        let query_timeout_secs: u64 = std::env::var("LAKESEARCH_QUERY_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "300".to_owned())
-            .parse()
-            .expect("invalid LAKESEARCH_QUERY_TIMEOUT_SECS");
+    pub fn query_timeout(&self) -> Duration {
+        Duration::from_secs(self.query_timeout_secs)
+    }
 
-        let metadata_poll_secs: u64 = std::env::var("LAKESEARCH_METADATA_POLL_SECS")
-            .unwrap_or_else(|_| "5".to_owned())
-            .parse()
-            .expect("invalid LAKESEARCH_METADATA_POLL_SECS");
+    pub fn metadata_poll_interval(&self) -> Duration {
+        Duration::from_secs(self.metadata_poll_secs)
+    }
+}
 
-        let cpu_threads: usize = std::env::var("LAKESEARCH_CPU_THREADS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or_else(|| {
-                std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(4)
-            });
-
-        // Tables from LAKESEARCH_TABLES env var: "name1=location1,name2=location2"
-        let tables = std::env::var("LAKESEARCH_TABLES")
-            .unwrap_or_default()
-            .split(',')
-            .filter(|s| !s.is_empty())
-            .filter_map(|entry| {
-                let (name, loc) = entry.split_once('=')?;
-                Some((name.trim().to_owned(), loc.trim().to_owned()))
-            })
-            .collect();
-
+impl Default for ServerConfig {
+    fn default() -> Self {
         Self {
-            bind_addr,
-            query_timeout: Duration::from_secs(query_timeout_secs),
-            metadata_poll_interval: Duration::from_secs(metadata_poll_secs),
-            cpu_threads,
-            tables,
+            bind_addr: default_bind_addr(),
+            query_timeout_secs: default_query_timeout_secs(),
+            metadata_poll_secs: default_metadata_poll_secs(),
+            cpu_threads: default_cpu_threads(),
+            io_concurrency: default_io_concurrency(),
+            tables: std::collections::HashMap::new(),
         }
     }
+}
+
+fn default_bind_addr() -> SocketAddr {
+    "0.0.0.0:8080".parse().unwrap()
+}
+
+fn default_query_timeout_secs() -> u64 {
+    300
+}
+
+fn default_metadata_poll_secs() -> u64 {
+    5
+}
+
+fn default_cpu_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+}
+
+fn default_io_concurrency() -> usize {
+    8
 }

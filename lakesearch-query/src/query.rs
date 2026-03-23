@@ -35,9 +35,6 @@ use crate::parquet_util::{
 use crate::storage::{read_current, read_metadata};
 use crate::Operator;
 
-/// Max concurrent I/O operations for parallel loading.
-const IO_CONCURRENCY: usize = 8;
-
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -81,6 +78,7 @@ pub async fn run_query(
     score_mode: crate::ScoreMode,
     limit: Option<usize>,
     select_columns: Vec<String>,
+    io_concurrency: usize,
     runtime: Arc<LakeRuntime>,
 ) -> Result<QueryResult> {
     let with_score = score_mode != crate::ScoreMode::None;
@@ -93,7 +91,15 @@ pub async fn run_query(
     }
 
     // Stage 1: plan query — load segments + identify un-indexed files
-    let plan = plan_query(&cache, &base, &column, &query_terms, operator).await?;
+    let plan = plan_query(
+        &cache,
+        &base,
+        &column,
+        &query_terms,
+        operator,
+        io_concurrency,
+    )
+    .await?;
 
     let mut all_matches = Vec::new();
     let mut stats = QueryStats::default();
@@ -135,6 +141,7 @@ pub async fn run_query(
                 operator,
                 with_score,
                 &select_columns,
+                io_concurrency,
                 &runtime,
             )
             .await?;
@@ -228,6 +235,7 @@ async fn plan_query(
     column: &str,
     query_terms: &[String],
     operator: Operator,
+    io_concurrency: usize,
 ) -> Result<QueryPlan> {
     // Read metadata chain
     let current = read_current(cache.store().as_ref(), base).await?;
@@ -240,7 +248,7 @@ async fn plan_query(
                 let cache = Arc::clone(cache);
                 async move { cache.get_json(&ml_path).await }
             })
-            .buffered(IO_CONCURRENCY)
+            .buffered(io_concurrency)
             .try_collect()
             .await?;
 
@@ -271,7 +279,7 @@ async fn plan_query(
             let cache = Arc::clone(cache);
             async move { cache.get_json(&path).await }
         })
-        .buffered(IO_CONCURRENCY)
+        .buffered(io_concurrency)
         .try_collect()
         .await?;
 
@@ -299,7 +307,7 @@ async fn plan_query(
             let cache = Arc::clone(cache);
             async move { cache.get_bytes(&path).await.map(|b| b.to_vec()) }
         })
-        .buffered(IO_CONCURRENCY)
+        .buffered(io_concurrency)
         .try_collect()
         .await?;
 
@@ -393,6 +401,7 @@ async fn fetch_and_verify(
     operator: Operator,
     with_score: bool,
     select_columns: &[String],
+    io_concurrency: usize,
     runtime: &Arc<LakeRuntime>,
 ) -> Result<(Vec<MatchedRow>, QueryStats)> {
     // Group by (file_ordinal, row_group)
@@ -438,7 +447,7 @@ async fn fetch_and_verify(
             let fp = file_table[fo as usize].path.clone();
             async move { cache.get_parquet_metadata(&fp).await.map(|m| (fo, m)) }
         })
-        .buffered(IO_CONCURRENCY)
+        .buffered(io_concurrency)
         .try_collect()
         .await?;
     let pq_meta_map: HashMap<u32, Arc<ParquetMetaData>> = pq_metas.into_iter().collect();
