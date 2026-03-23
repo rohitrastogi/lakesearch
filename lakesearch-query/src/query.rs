@@ -56,23 +56,26 @@ pub struct QueryStats {
 /// Queries a LakeSearch table in object storage across all segments.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
-    store: &Arc<dyn ObjectStore>,
-    base: &Path,
-    column: &str,
+    store: Arc<dyn ObjectStore>,
+    base: Path,
+    column: String,
     query_text: &str,
     operator: Operator,
     with_score: bool,
     limit: Option<usize>,
-    select_columns: &[String],
-    runtime: &LakeRuntime,
+    select_columns: Vec<String>,
+    runtime: Arc<LakeRuntime>,
 ) -> Result<QueryResult> {
     // 1. Load metadata chain
-    let current_result = read_current(store.as_ref(), base).await?;
+    let current_result = read_current(store.as_ref(), &base).await?;
     let metadata = read_metadata(store.as_ref(), &current_result.value).await?;
 
     // 2. Load manifest lists in parallel, collect segment paths
-    let manifest_lists: Vec<_> = stream::iter(metadata.snapshot.manifest_lists.iter())
-        .map(|ml_path| async { read_manifest_list(store.as_ref(), ml_path).await })
+    let manifest_lists: Vec<_> = stream::iter(metadata.snapshot.manifest_lists.into_iter())
+        .map(|ml_path| {
+            let store = Arc::clone(&store);
+            async move { read_manifest_list(store.as_ref(), &ml_path).await }
+        })
         .buffered(IO_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
@@ -91,8 +94,11 @@ pub async fn run_query(
     }
 
     // Load segment bytes in parallel
-    let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.iter())
-        .map(|path| async { load_bytes(store.as_ref(), path).await.map(|b| b.to_vec()) })
+    let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.into_iter())
+        .map(|path| {
+            let store = Arc::clone(&store);
+            async move { load_bytes(store.as_ref(), &path).await.map(|b| b.to_vec()) }
+        })
         .buffered(IO_CONCURRENCY)
         .try_collect()
         .await?;
@@ -188,12 +194,15 @@ pub async fn run_query(
             .into_iter()
             .collect();
 
-        let pq_metas: Vec<(u32, ParquetMetaData)> = stream::iter(unique_file_ords.iter())
-            .map(|&fo| async move {
-                let fp = &file_table[fo as usize].path;
-                load_parquet_metadata_async(store, fp)
-                    .await
-                    .map(|meta| (fo, meta))
+        let pq_metas: Vec<(u32, ParquetMetaData)> = stream::iter(unique_file_ords.into_iter())
+            .map(|fo| {
+                let store = Arc::clone(&store);
+                let fp = file_table[fo as usize].path.clone();
+                async move {
+                    load_parquet_metadata_async(&store, &fp)
+                        .await
+                        .map(|meta| (fo, meta))
+                }
             })
             .buffered(IO_CONCURRENCY)
             .try_collect()
@@ -219,12 +228,12 @@ pub async fn run_query(
             let selection = build_row_selection(&entries, rg_total_rows);
 
             // Resolve leaf indices: indexed column + select columns
-            let indexed_leaf = validate_column(pq_meta, column)
+            let indexed_leaf = validate_column(pq_meta, &column)
                 .with_context(|| format!("validating column in '{file_path}'"))?;
 
             let mut select_leaves: Vec<(usize, String)> = Vec::new();
-            for sel_name in select_columns {
-                if sel_name == column {
+            for sel_name in &select_columns {
+                if *sel_name == column {
                     continue; // Already included as the indexed column
                 }
                 let leaf = validate_column(pq_meta, sel_name)
@@ -253,7 +262,7 @@ pub async fn run_query(
                 .collect();
 
             let batches = read_parquet_batches_async(
-                store,
+                &store,
                 file_path,
                 *rg_idx as usize,
                 &leaf_indices,

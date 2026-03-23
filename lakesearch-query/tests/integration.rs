@@ -15,9 +15,36 @@ use parquet::file::properties::WriterProperties;
 use lakesearch_cli::index::run_index;
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
-use lakesearch_query::query::run_query;
+use lakesearch_query::query::{self, QueryResult};
 use lakesearch_query::storage::{read_current, read_metadata, write_json};
 use lakesearch_query::Operator;
+
+/// Test helper: wraps run_query with reference-based args for convenience.
+#[allow(clippy::too_many_arguments)]
+async fn run_query(
+    store: &Arc<dyn ObjectStore>,
+    base: &Path,
+    column: &str,
+    query_text: &str,
+    operator: Operator,
+    with_score: bool,
+    limit: Option<usize>,
+    select_columns: &[String],
+    _runtime: &LakeRuntime,
+) -> anyhow::Result<QueryResult> {
+    query::run_query(
+        Arc::clone(store),
+        base.clone(),
+        column.to_owned(),
+        query_text,
+        operator,
+        with_score,
+        limit,
+        select_columns.to_vec(),
+        Arc::new(LakeRuntime::new(2)),
+    )
+    .await
+}
 
 /// Creates a test Parquet file in memory and uploads it to the InMemory store.
 /// Returns the path where it was stored.

@@ -159,17 +159,17 @@ async fn main() -> Result<()> {
             select,
         } => {
             let (store, base) = lakesearch_query::storage::parse_location(&location)?;
-            let runtime = LakeRuntime::default();
+            let runtime = std::sync::Arc::new(LakeRuntime::default());
             let result = lakesearch_query::query::run_query(
-                &store,
-                &base,
-                &column,
+                store,
+                base,
+                column,
                 &match_text,
                 operator.into(),
                 score,
                 limit,
-                &select,
-                &runtime,
+                select,
+                runtime,
             )
             .await?;
             let json = serde_json::to_string_pretty(&result)?;
