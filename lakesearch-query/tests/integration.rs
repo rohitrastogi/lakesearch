@@ -539,3 +539,268 @@ async fn select_without_columns_omits_field() {
     // columns field should be None (omitted in JSON)
     assert!(result.matches[0].columns.is_none());
 }
+
+// --- Optimization tests ---
+
+#[tokio::test]
+async fn top_k_heap_picks_highest_scores() {
+    // Use documents with genuinely different BM25 scores: varying document
+    // lengths with the same query term produces different scores due to
+    // BM25's length normalization.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/topk.parquet",
+        120,
+        25,
+        &[
+            "error",                                                    // 1 token  → highest score
+            "error timeout connection refused upstream",                // 5 tokens → medium
+            "error timeout connection refused upstream gateway disk space network health batch upload", // 12 tokens → lowest
+            "success response ok completed",                            // no match
+        ],
+    )
+    .await;
+
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    // Get all matches to know the full score distribution
+    let all = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        true,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // There are 90 matches (3/4 * 120), with 3 distinct score levels
+    assert_eq!(all.stats.rows_matched, 90);
+    let best_score = all.matches[0].score.unwrap();
+    let worst_score = all.matches.last().unwrap().score.unwrap();
+    assert!(
+        best_score > worst_score,
+        "scores should differ: best={best_score}, worst={worst_score}"
+    );
+
+    // Now query with limit=5 — the heap should pick the 5 highest-scored rows
+    let top5 = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        true,
+        Some(5),
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(top5.matches.len(), 5);
+    // All top-5 should have the best possible score (short "error" docs)
+    for m in &top5.matches {
+        assert_eq!(
+            m.score.unwrap(),
+            best_score,
+            "top-K should only contain highest-scored rows"
+        );
+    }
+    // Sorted descending
+    for w in top5.matches.windows(2) {
+        assert!(w[0].score.unwrap() >= w[1].score.unwrap());
+    }
+}
+
+#[tokio::test]
+async fn single_term_query_correctness() {
+    // Single-term queries exercise the fast path that skips HashSet.
+    // Verify exact match count and that AND/OR produce identical results.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // 3 descriptions, "alpha" appears in 2 of them
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/single.parquet",
+        60, // divisible by 3
+        20,
+        &["alpha bravo", "charlie delta", "alpha echo"],
+    )
+    .await;
+
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    let result_and = run_query(
+        &store,
+        &base,
+        "description",
+        "alpha",
+        Operator::And,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let result_or = run_query(
+        &store,
+        &base,
+        "description",
+        "alpha",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Single term: AND and OR must match
+    assert_eq!(result_and.stats.rows_matched, result_or.stats.rows_matched);
+    // Exactly 2/3 of 60 = 40
+    assert_eq!(result_and.stats.rows_matched, 40);
+    // All matched text should contain "alpha"
+    for m in &result_and.matches {
+        assert!(
+            m.text.contains("alpha"),
+            "matched row should contain 'alpha': {}",
+            m.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn segment_pruning_skips_irrelevant_segments() {
+    // Two segments with non-overlapping term ranges.
+    // Query for a term in one should not scan the other.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // Segment A: terms "apple", "banana", "cherry" (range a-c)
+    let file_a = upload_test_parquet(
+        store.as_ref(),
+        "data/a.parquet",
+        20,
+        10,
+        &["apple banana cherry"],
+    )
+    .await;
+    run_index(&store, &base, &[file_a], "description", &runtime)
+        .await
+        .unwrap();
+
+    // Segment B: terms "xray", "yankee", "zulu" (range x-z)
+    let file_b = upload_test_parquet(
+        store.as_ref(),
+        "data/b.parquet",
+        20,
+        10,
+        &["xray yankee zulu"],
+    )
+    .await;
+    run_index(&store, &base, &[file_b], "description", &runtime)
+        .await
+        .unwrap();
+
+    // "apple" is in segment A's range, outside segment B's → prune B
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "apple",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.rows_matched, 20);
+    assert_eq!(result.stats.rows_scanned, 20, "should prune segment B");
+}
+
+#[tokio::test]
+async fn segment_pruning_boundary_term_not_pruned() {
+    // A query term that exactly equals min_term or max_term should NOT be pruned.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/boundary.parquet",
+        20,
+        10,
+        &["alpha omega"],
+    )
+    .await;
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    // "alpha" is the min_term, "omega" is the max_term — both should match
+    let result_min = run_query(
+        &store,
+        &base,
+        "description",
+        "alpha",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_min.stats.rows_matched, 20,
+        "min_term boundary should not be pruned"
+    );
+
+    let result_max = run_query(
+        &store,
+        &base,
+        "description",
+        "omega",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        result_max.stats.rows_matched, 20,
+        "max_term boundary should not be pruned"
+    );
+}

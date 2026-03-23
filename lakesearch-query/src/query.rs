@@ -101,8 +101,7 @@ pub async fn run_query(
         }
     }
 
-    let manifest_path_strs: Vec<String> =
-        manifest_paths.iter().map(|(p, _)| p.clone()).collect();
+    let manifest_path_strs: Vec<String> = manifest_paths.iter().map(|(p, _)| p.clone()).collect();
     let manifests: Vec<lakesearch_core::metadata::Manifest> =
         stream::iter(manifest_path_strs.into_iter())
             .map(|path| {
