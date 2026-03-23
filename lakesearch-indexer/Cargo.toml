@@ -24,3 +24,11 @@ serde_yaml = "0.9"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+lakesearch-core = { path = "../lakesearch-core", features = ["test-utils"] }
+lakesearch-admin = { path = "../lakesearch-admin" }
+lakesearch-query = { path = "../lakesearch-query" }
+bytes = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tempfile = "3"
