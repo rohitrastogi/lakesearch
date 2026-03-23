@@ -52,6 +52,7 @@ async fn run_query(
         limit,
         select_columns.to_vec(),
         8,
+        64,
         Arc::new(LakeRuntime::new(2)),
     )
     .await
@@ -1389,6 +1390,7 @@ async fn streaming_query_returns_all_results() {
         None,
         vec![],
         8,
+        64,
         Arc::new(LakeRuntime::new(2)),
     )
     .await

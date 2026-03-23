@@ -188,7 +188,8 @@ async fn main() -> Result<()> {
                 score.into(),
                 limit,
                 select,
-                8, // default io_concurrency for CLI
+                8,  // default io_concurrency for CLI
+                64, // default max_io_tasks for CLI
                 runtime,
             )
             .await?;

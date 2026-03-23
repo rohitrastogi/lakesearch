@@ -37,7 +37,7 @@ use evaluate::{evaluate_segment, group_candidates};
 use pipeline::run_pipeline;
 use plan::{plan_query, resolve_schema};
 use rank::rank_batches;
-use types::SharedQueryContext;
+use types::{BruteForceScoring, SharedQueryContext, SCORE_COL, TEXT_COL};
 
 // ---------------------------------------------------------------------------
 // Schema construction
@@ -58,7 +58,7 @@ fn build_result_schema(
     )
     .context("converting parquet schema to arrow")?;
 
-    let mut fields = vec![Field::new("text", DataType::Utf8, true)];
+    let mut fields = vec![Field::new(TEXT_COL, DataType::Utf8, true)];
 
     for sel in select_columns {
         if sel == column {
@@ -71,7 +71,7 @@ fn build_result_schema(
     }
 
     if with_score {
-        fields.push(Field::new("score", DataType::Float64, true));
+        fields.push(Field::new(SCORE_COL, DataType::Float64, true));
     }
 
     Ok(Arc::new(Schema::new(fields)))
@@ -79,7 +79,7 @@ fn build_result_schema(
 
 /// Builds a fallback schema when no parquet metadata is available (empty table).
 fn build_empty_schema(select_columns: &[String], column: &str, with_score: bool) -> SchemaRef {
-    let mut fields = vec![Field::new("text", DataType::Utf8, true)];
+    let mut fields = vec![Field::new(TEXT_COL, DataType::Utf8, true)];
     for sel in select_columns {
         if sel == column {
             continue;
@@ -87,7 +87,7 @@ fn build_empty_schema(select_columns: &[String], column: &str, with_score: bool)
         fields.push(Field::new(sel, DataType::Utf8, true));
     }
     if with_score {
-        fields.push(Field::new("score", DataType::Float64, true));
+        fields.push(Field::new(SCORE_COL, DataType::Float64, true));
     }
     Arc::new(Schema::new(fields))
 }
@@ -102,21 +102,22 @@ pub(crate) struct AggregateStats {
     pub term_df: HashMap<String, u64>,
 }
 
-fn collect_aggregate_stats(segments: &[SegmentReader], query_terms: &[String]) -> AggregateStats {
+/// Builds aggregate stats from per-segment term_infos already collected
+/// during evaluation — no additional FST lookups needed.
+fn collect_aggregate_stats(
+    segments: &[SegmentReader],
+    segment_term_infos: &[Vec<(String, u32)>],
+) -> AggregateStats {
     let mut total_rows = 0u64;
     let mut total_tokens = 0u64;
     let mut term_df: HashMap<String, u64> = HashMap::new();
 
-    for reader in segments {
+    for (reader, infos) in segments.iter().zip(segment_term_infos.iter()) {
         let cs = reader.corpus_stats();
         total_rows += cs.total_rows;
         total_tokens += cs.total_tokens;
-        for term in query_terms {
-            if let Some(ord) = reader.term_ordinal(term) {
-                if let Ok(info) = reader.term_info(ord) {
-                    *term_df.entry(term.clone()).or_default() += info.doc_frequency as u64;
-                }
-            }
+        for (term, df) in infos {
+            *term_df.entry(term.clone()).or_default() += *df as u64;
         }
     }
 
@@ -168,17 +169,102 @@ async fn setup_query(
         );
     }
 
-    let agg = collect_aggregate_stats(&readers, query_terms);
-
+    // Evaluate all segments: single set of FST lookups per segment produces
+    // both candidates and term_infos for aggregate stats.
     let mut all_work_items = Vec::new();
+    let mut all_term_infos = Vec::new();
     for reader in &readers {
-        let candidates = evaluate_segment(reader, query_terms, operator)?;
-        if !candidates.is_empty() {
-            all_work_items.extend(group_candidates(reader, &candidates, query_terms));
+        let eval = evaluate_segment(reader, query_terms, operator)?;
+        all_term_infos.push(eval.term_infos.clone());
+        if !eval.candidates.is_empty() {
+            all_work_items.extend(group_candidates(reader, &eval.candidates, &eval.term_infos));
         }
     }
 
+    let agg = collect_aggregate_stats(&readers, &all_term_infos);
+
     Ok((all_work_items, plan.unindexed_files, schema, agg))
+}
+
+/// Launches the three-stage pipeline from setup results.
+/// Shared between `run_query` and `run_query_collected`.
+#[allow(clippy::too_many_arguments)]
+fn launch_pipeline(
+    work_items: Vec<types::IndexedWorkItem>,
+    unindexed_files: Vec<String>,
+    cache: Arc<ObjectCache>,
+    column: String,
+    query_terms: Vec<String>,
+    operator: Operator,
+    score_mode: crate::ScoreMode,
+    with_score: bool,
+    limit: Option<usize>,
+    agg: &AggregateStats,
+    schema: SchemaRef,
+    max_io_tasks: usize,
+    runtime: Arc<LakeRuntime>,
+) -> (
+    tokio::sync::mpsc::Receiver<Result<RecordBatch>>,
+    tokio::task::JoinHandle<QueryStats>,
+) {
+    let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
+    let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
+    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
+        query_terms
+            .iter()
+            .map(|t| {
+                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
+                (t.clone(), df)
+            })
+            .collect(),
+    );
+
+    let shared_ctx = Arc::new(SharedQueryContext {
+        query_terms: Arc::new(query_terms),
+        operator,
+        with_score,
+        schema,
+    });
+
+    let select_columns: Arc<[String]> = shared_ctx
+        .schema
+        .fields()
+        .iter()
+        .filter_map(|f| {
+            let n = f.name().as_str();
+            if n == TEXT_COL || n == SCORE_COL {
+                None
+            } else {
+                Some(n.to_owned())
+            }
+        })
+        .collect();
+
+    let early_limit = if !with_score { limit } else { None };
+
+    let bf_scoring = BruteForceScoring {
+        total_rows: agg.total_rows,
+        avg_dl: agg_avg_dl,
+        term_infos: agg_term_infos,
+    };
+
+    // Only enable brute-force scoring when ScoreMode::All
+    let bf_with_score = score_mode == crate::ScoreMode::All;
+
+    run_pipeline(
+        work_items,
+        unindexed_files,
+        cache,
+        shared_ctx,
+        bf_scoring,
+        bf_with_score,
+        Arc::from(column),
+        select_columns,
+        early_limit,
+        candidate_pages,
+        max_io_tasks,
+        runtime,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -200,6 +286,7 @@ pub async fn run_query(
     limit: Option<usize>,
     select_columns: Vec<String>,
     io_concurrency: usize,
+    max_io_tasks: usize,
     runtime: Arc<LakeRuntime>,
 ) -> Result<(SendableRecordBatchStream, QueryStats)> {
     let with_score = score_mode != crate::ScoreMode::None;
@@ -227,39 +314,20 @@ pub async fn run_query(
     .await?;
 
     let needs_top_k = with_score && limit.is_some();
-    let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
-    let bf_score = score_mode == crate::ScoreMode::All;
-    let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
-    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-        query_terms
-            .iter()
-            .map(|t| {
-                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                (t.clone(), df)
-            })
-            .collect(),
-    );
 
-    let shared_ctx = Arc::new(SharedQueryContext {
-        query_terms: Arc::new(query_terms),
-        operator,
-        with_score: bf_score || with_score,
-        schema: schema.clone(),
-    });
-
-    let early_limit = if !with_score { limit } else { None };
-
-    let (mut final_rx, stats_handle) = run_pipeline(
+    let (mut final_rx, stats_handle) = launch_pipeline(
         work_items,
         unindexed_files,
         cache,
-        shared_ctx,
-        agg.total_rows,
-        agg_avg_dl,
-        agg_term_infos,
         column,
-        early_limit,
-        candidate_pages,
+        query_terms,
+        operator,
+        score_mode,
+        with_score,
+        limit,
+        &agg,
+        schema.clone(),
+        max_io_tasks,
         runtime,
     );
 
@@ -314,6 +382,7 @@ pub async fn run_query_collected(
     limit: Option<usize>,
     select_columns: Vec<String>,
     io_concurrency: usize,
+    max_io_tasks: usize,
     runtime: Arc<LakeRuntime>,
 ) -> Result<CollectedQueryResult> {
     let with_score = score_mode != crate::ScoreMode::None;
@@ -337,39 +406,19 @@ pub async fn run_query_collected(
     )
     .await?;
 
-    let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
-    let bf_score = score_mode == crate::ScoreMode::All;
-    let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
-    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-        query_terms
-            .iter()
-            .map(|t| {
-                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                (t.clone(), df)
-            })
-            .collect(),
-    );
-
-    let shared_ctx = Arc::new(SharedQueryContext {
-        query_terms: Arc::new(query_terms),
-        operator,
-        with_score: bf_score || with_score,
-        schema: schema.clone(),
-    });
-
-    let early_limit = if !with_score { limit } else { None };
-
-    let (mut final_rx, stats_handle) = run_pipeline(
+    let (mut final_rx, stats_handle) = launch_pipeline(
         work_items,
         unindexed_files,
         cache,
-        shared_ctx,
-        agg.total_rows,
-        agg_avg_dl,
-        agg_term_infos,
         column,
-        early_limit,
-        candidate_pages,
+        query_terms,
+        operator,
+        score_mode,
+        with_score,
+        limit,
+        &agg,
+        schema.clone(),
+        max_io_tasks,
         runtime,
     );
 

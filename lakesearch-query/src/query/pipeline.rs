@@ -11,15 +11,20 @@ use std::sync::Arc;
 use anyhow::Result;
 use arrow::record_batch::RecordBatch;
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
+use parquet::arrow::arrow_reader::ArrowReaderOptions;
+use parquet::arrow::{arrow_reader::ArrowReaderMetadata, ParquetRecordBatchStreamBuilder};
 use tokio::sync::mpsc;
 use tracing::warn;
 
 use lakesearch_core::runtime::LakeRuntime;
 
 use crate::object_cache::ObjectCache;
-use crate::parquet_util::{build_row_selection, find_column, open_parquet_stream};
+use crate::parquet_util::{build_row_selection, find_column};
 
-use super::types::{CpuWorkItem, IndexedWorkItem, QueryStats, SharedQueryContext};
+use super::types::{
+    BruteForceScoring, CpuWorkItem, FileProjection, IndexedWorkItem, QueryStats,
+    SharedQueryContext, VerifyMode,
+};
 use super::verify::{brute_force_verify_batch, resolve_projection, verify_batch, VerifyContext};
 
 /// Target rows per coalesced output batch.
@@ -35,12 +40,13 @@ pub(crate) fn run_pipeline(
     unindexed_files: Vec<String>,
     cache: Arc<ObjectCache>,
     shared_ctx: Arc<SharedQueryContext>,
-    agg_total_rows: u64,
-    agg_avg_dl: f64,
-    agg_term_infos: Arc<Vec<(String, u32)>>,
-    column: String,
+    bf_scoring: BruteForceScoring,
+    bf_with_score: bool,
+    column: Arc<str>,
+    select_columns: Arc<[String]>,
     early_limit: Option<usize>,
     candidate_pages: usize,
+    max_io_tasks: usize,
     runtime: Arc<LakeRuntime>,
 ) -> (
     mpsc::Receiver<Result<RecordBatch>>,
@@ -55,11 +61,11 @@ pub(crate) fn run_pipeline(
         work_items,
         unindexed_files,
         cache,
-        &shared_ctx,
-        agg_total_rows,
-        agg_avg_dl,
-        agg_term_infos,
+        bf_scoring,
+        bf_with_score,
         column,
+        select_columns,
+        max_io_tasks,
         input_tx,
         final_tx.clone(),
     );
@@ -84,19 +90,18 @@ pub(crate) fn run_pipeline(
 // Stage 1: I/O Producers
 // ---------------------------------------------------------------------------
 
-/// Spawns one tokio task per indexed work item and one per unindexed file.
-/// Each task streams Parquet batches and sends `CpuWorkItem`s to `input_tx`.
-/// Errors are sent to `error_tx` (the final output channel).
+/// Spawns one tokio task per file (indexed and unindexed). A shared
+/// semaphore limits the number of concurrently active I/O tasks.
 #[allow(clippy::too_many_arguments)]
 fn spawn_io_producers(
     work_items: Vec<IndexedWorkItem>,
     unindexed_files: Vec<String>,
     cache: Arc<ObjectCache>,
-    shared_ctx: &Arc<SharedQueryContext>,
-    agg_total_rows: u64,
-    agg_avg_dl: f64,
-    agg_term_infos: Arc<Vec<(String, u32)>>,
-    column: String,
+    bf_scoring: BruteForceScoring,
+    bf_with_score: bool,
+    column: Arc<str>,
+    select_columns: Arc<[String]>,
+    max_io_tasks: usize,
     input_tx: mpsc::Sender<CpuWorkItem>,
     error_tx: mpsc::Sender<Result<RecordBatch>>,
 ) {
@@ -109,29 +114,19 @@ fn spawn_io_producers(
             .push(item);
     }
 
-    let select_columns: Vec<String> = shared_ctx
-        .schema
-        .fields()
-        .iter()
-        .filter_map(|f| {
-            let n = f.name().as_str();
-            if n == "text" || n == "score" {
-                None
-            } else {
-                Some(n.to_owned())
-            }
-        })
-        .collect();
+    let sem = Arc::new(tokio::sync::Semaphore::new(max_io_tasks));
 
     // Spawn indexed I/O producers (one task per file)
     for (file_path, file_items) in items_by_file {
         let cache = Arc::clone(&cache);
         let input_tx = input_tx.clone();
         let error_tx = error_tx.clone();
-        let column = column.clone();
-        let select_columns = select_columns.clone();
+        let column = Arc::clone(&column);
+        let select_columns = Arc::clone(&select_columns);
+        let sem = Arc::clone(&sem);
 
         tokio::spawn(async move {
+            let _permit = sem.acquire().await;
             if let Err(e) = indexed_io_producer(
                 &file_path,
                 file_items,
@@ -148,23 +143,25 @@ fn spawn_io_producers(
     }
 
     // Spawn brute-force I/O producers (one task per file)
+    let bf_scoring = Arc::new(bf_scoring);
     for file_path in unindexed_files {
         let cache = Arc::clone(&cache);
         let input_tx = input_tx.clone();
         let error_tx = error_tx.clone();
-        let column = column.clone();
-        let select_columns = select_columns.clone();
-        let agg_term_infos = Arc::clone(&agg_term_infos);
+        let column = Arc::clone(&column);
+        let select_columns = Arc::clone(&select_columns);
+        let bf_scoring = Arc::clone(&bf_scoring);
+        let sem = Arc::clone(&sem);
 
         tokio::spawn(async move {
+            let _permit = sem.acquire().await;
             if let Err(e) = brute_force_io_producer(
                 &file_path,
                 &cache,
                 &column,
                 &select_columns,
-                agg_total_rows,
-                agg_avg_dl,
-                agg_term_infos,
+                &bf_scoring,
+                bf_with_score,
                 &input_tx,
             )
             .await
@@ -180,6 +177,8 @@ fn spawn_io_producers(
 }
 
 /// I/O producer for indexed work items from a single file.
+/// Uses cached `ParquetMetaData` to build the stream without re-reading
+/// the footer or issuing a HEAD request per row group.
 async fn indexed_io_producer(
     file_path: &str,
     items: Vec<IndexedWorkItem>,
@@ -190,37 +189,50 @@ async fn indexed_io_producer(
 ) -> Result<()> {
     let pq_meta = cache.get_parquet_metadata(file_path).await?;
     let projection = resolve_projection(&pq_meta, column, select_columns)?;
+    let file_proj = Arc::new(FileProjection {
+        indexed_batch_col: projection.indexed_batch_col,
+        select_col_map: projection.select_col_map,
+        is_large: projection.is_large,
+    });
 
-    let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
-        pq_meta.file_metadata().schema_descr(),
-        pq_meta.file_metadata().key_value_metadata(),
+    let object_meta = cache
+        .store()
+        .head(&object_store::path::Path::from(file_path))
+        .await?;
+    let reader_meta = ArrowReaderMetadata::try_new(
+        Arc::new(pq_meta.as_ref().clone()),
+        ArrowReaderOptions::default(),
     )?;
-    let is_large = arrow_schema
-        .field_with_name(column)
-        .map(|f| f.data_type() == &arrow::datatypes::DataType::LargeUtf8)
-        .unwrap_or(false);
 
     for item in &items {
-        let rg_total_rows = pq_meta.row_group(item.rg_idx as usize).num_rows();
+        let rg_total_rows = reader_meta
+            .metadata()
+            .row_group(item.rg_idx as usize)
+            .num_rows();
         let entry_refs: Vec<&lakesearch_core::types::DocTableEntry> = item.entries.iter().collect();
         let selection = build_row_selection(&entry_refs, rg_total_rows);
 
-        let mut pq_stream = open_parquet_stream(
-            cache.store(),
-            file_path,
-            item.rg_idx as usize,
-            &projection.leaf_indices,
-            Some(selection),
-        )
-        .await?;
+        let obj_reader = parquet::arrow::async_reader::ParquetObjectReader::new(
+            Arc::clone(cache.store()),
+            object_meta.clone(),
+        );
+        let mask = parquet::arrow::ProjectionMask::leaves(
+            reader_meta.parquet_schema(),
+            projection.leaf_indices.iter().copied(),
+        );
+        let mut pq_stream =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(obj_reader, reader_meta.clone())
+                .with_row_groups(vec![item.rg_idx as usize])
+                .with_projection(mask)
+                .with_row_selection(selection)
+                .build()?;
 
         while let Some(batch) = pq_stream.try_next().await? {
             let work = CpuWorkItem {
                 batch,
-                use_ilike: false,
-                indexed_batch_col: projection.indexed_batch_col,
-                select_col_map: projection.select_col_map.clone(),
-                is_large,
+                mode: VerifyMode::Indexed,
+                with_score: true, // indexed always scores when schema has score col
+                file_proj: Arc::clone(&file_proj),
                 avg_dl: item.avg_dl,
                 total_rows: item.total_rows,
                 term_infos: Arc::clone(&item.term_infos),
@@ -234,15 +246,13 @@ async fn indexed_io_producer(
 }
 
 /// I/O producer for brute-force scanning a single unindexed file.
-#[allow(clippy::too_many_arguments)]
 async fn brute_force_io_producer(
     file_path: &str,
     cache: &ObjectCache,
     column: &str,
     select_columns: &[String],
-    agg_total_rows: u64,
-    agg_avg_dl: f64,
-    agg_term_infos: Arc<Vec<(String, u32)>>,
+    bf_scoring: &BruteForceScoring,
+    bf_with_score: bool,
     input_tx: &mpsc::Sender<CpuWorkItem>,
 ) -> Result<()> {
     let pq_meta = match cache.get_parquet_metadata(file_path).await {
@@ -259,36 +269,47 @@ async fn brute_force_io_producer(
     }
 
     let projection = resolve_projection(&pq_meta, column, select_columns)?;
+    let file_proj = Arc::new(FileProjection {
+        indexed_batch_col: projection.indexed_batch_col,
+        select_col_map: projection.select_col_map,
+        is_large: projection.is_large,
+    });
 
-    let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
-        pq_meta.file_metadata().schema_descr(),
-        pq_meta.file_metadata().key_value_metadata(),
-    )?;
-    let is_large = arrow_schema
-        .field_with_name(column)
-        .map(|f| f.data_type() == &arrow::datatypes::DataType::LargeUtf8)
-        .unwrap_or(false);
-
-    for rg_idx in 0..pq_meta.num_row_groups() {
-        let mut pq_stream = open_parquet_stream(
-            cache.store(),
-            file_path,
-            rg_idx,
-            &projection.leaf_indices,
-            None,
-        )
+    let object_meta = cache
+        .store()
+        .head(&object_store::path::Path::from(file_path))
         .await?;
+    let reader_meta = ArrowReaderMetadata::try_new(
+        Arc::new(pq_meta.as_ref().clone()),
+        ArrowReaderOptions::default(),
+    )?;
+
+    let term_infos = Arc::clone(&bf_scoring.term_infos);
+
+    for rg_idx in 0..reader_meta.metadata().num_row_groups() {
+        let obj_reader = parquet::arrow::async_reader::ParquetObjectReader::new(
+            Arc::clone(cache.store()),
+            object_meta.clone(),
+        );
+        let mask = parquet::arrow::ProjectionMask::leaves(
+            reader_meta.parquet_schema(),
+            projection.leaf_indices.iter().copied(),
+        );
+        let mut pq_stream =
+            ParquetRecordBatchStreamBuilder::new_with_metadata(obj_reader, reader_meta.clone())
+                .with_row_groups(vec![rg_idx])
+                .with_projection(mask)
+                .build()?;
 
         while let Some(batch) = pq_stream.try_next().await? {
             let work = CpuWorkItem {
                 batch,
-                use_ilike: true,
-                indexed_batch_col: projection.indexed_batch_col,
-                select_col_map: projection.select_col_map.clone(),
-                is_large,
-                avg_dl: agg_avg_dl,
-                total_rows: agg_total_rows,
-                term_infos: Arc::clone(&agg_term_infos),
+                mode: VerifyMode::BruteForce,
+                with_score: bf_with_score,
+                file_proj: Arc::clone(&file_proj),
+                avg_dl: bf_scoring.avg_dl,
+                total_rows: bf_scoring.total_rows,
+                term_infos: Arc::clone(&term_infos),
             };
             if input_tx.send(work).await.is_err() {
                 return Ok(()); // pipeline shut down
@@ -383,18 +404,17 @@ fn dispatch_verify(
         query_terms: &ctx.query_terms,
         term_infos: &work.term_infos,
         operator: ctx.operator,
-        with_score: ctx.with_score,
+        with_score: work.with_score && ctx.with_score,
         avg_dl: work.avg_dl,
         total_rows: work.total_rows,
-        is_large: work.is_large,
-        indexed_batch_col: work.indexed_batch_col,
-        select_col_map: &work.select_col_map,
+        is_large: work.file_proj.is_large,
+        indexed_batch_col: work.file_proj.indexed_batch_col,
+        select_col_map: &work.file_proj.select_col_map,
     };
 
-    if work.use_ilike {
-        brute_force_verify_batch(&work.batch, &verify_ctx, &ctx.schema)
-    } else {
-        verify_batch(&work.batch, &verify_ctx, &ctx.schema)
+    match work.mode {
+        VerifyMode::BruteForce => brute_force_verify_batch(&work.batch, &verify_ctx, &ctx.schema),
+        VerifyMode::Indexed => verify_batch(&work.batch, &verify_ctx, &ctx.schema),
     }
 }
 
@@ -418,17 +438,23 @@ fn spawn_coalescer(
             pending.push(batch);
 
             if pending_rows >= TARGET_BATCH_SIZE {
-                if let Some(flushed) = coalesce_batches(&schema, &mut pending) {
-                    pending_rows = 0;
-                    if final_tx.send(Ok(flushed)).await.is_err() {
-                        return;
+                match coalesce_batches(&schema, &mut pending) {
+                    Ok(flushed) => {
+                        pending_rows = 0;
+                        if final_tx.send(Ok(flushed)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "coalescer concat failed");
+                        pending_rows = 0;
                     }
                 }
             }
         }
 
         // Flush remaining
-        if let Some(flushed) = coalesce_batches(&schema, &mut pending) {
+        if let Ok(flushed) = coalesce_batches(&schema, &mut pending) {
             let _ = final_tx.send(Ok(flushed)).await;
         }
     });
@@ -438,12 +464,9 @@ fn spawn_coalescer(
 fn coalesce_batches(
     schema: &arrow::datatypes::SchemaRef,
     pending: &mut Vec<RecordBatch>,
-) -> Option<RecordBatch> {
-    if pending.is_empty() {
-        return None;
-    }
+) -> Result<RecordBatch> {
     let refs: Vec<&RecordBatch> = pending.iter().collect();
-    let result = arrow::compute::concat_batches(schema, refs.iter().copied()).ok();
+    let result = arrow::compute::concat_batches(schema, refs.iter().copied())?;
     pending.clear();
-    result
+    Ok(result)
 }

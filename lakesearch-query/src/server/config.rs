@@ -14,6 +14,7 @@ use serde::Deserialize;
 /// metadata_poll_secs: 5
 /// cpu_threads: 8
 /// io_concurrency: 8
+/// max_io_tasks: 64
 /// tables:
 ///   events: "s3://bucket/lakesearch/tables/events/"
 ///   logs: "file:///tmp/lakesearch/logs/"
@@ -30,6 +31,9 @@ pub struct ServerConfig {
     pub cpu_threads: usize,
     #[serde(default = "default_io_concurrency")]
     pub io_concurrency: usize,
+    /// Maximum concurrent I/O producer tasks per query pipeline.
+    #[serde(default = "default_max_io_tasks")]
+    pub max_io_tasks: usize,
     /// Table definitions: name → location URL.
     #[serde(default)]
     pub tables: std::collections::HashMap<String, String>,
@@ -60,6 +64,7 @@ impl Default for ServerConfig {
             metadata_poll_secs: default_metadata_poll_secs(),
             cpu_threads: default_cpu_threads(),
             io_concurrency: default_io_concurrency(),
+            max_io_tasks: default_max_io_tasks(),
             tables: std::collections::HashMap::new(),
         }
     }
@@ -85,4 +90,8 @@ fn default_cpu_threads() -> usize {
 
 fn default_io_concurrency() -> usize {
     8
+}
+
+fn default_max_io_tasks() -> usize {
+    64
 }

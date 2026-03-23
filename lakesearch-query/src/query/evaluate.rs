@@ -14,31 +14,48 @@ use crate::Operator;
 
 use super::types::IndexedWorkItem;
 
+/// Result of evaluating a segment: candidate doc IDs and per-term info
+/// (term string, doc_frequency). Returned together so the FST lookups
+/// happen only once per segment.
+pub(crate) struct SegmentEvaluation {
+    pub candidates: Vec<DocId>,
+    pub term_infos: Vec<(String, u32)>,
+}
+
 /// Looks up posting lists for each query term and combines them with boolean
-/// ops. For AND queries, terms are sorted by doc_frequency (rarest first).
+/// ops. Returns candidates and term infos from a single set of FST lookups.
 pub(crate) fn evaluate_segment(
     reader: &SegmentReader,
     query_terms: &[String],
     operator: Operator,
-) -> Result<Vec<DocId>> {
+) -> Result<SegmentEvaluation> {
     let mut entries: Vec<(u32, Vec<DocId>)> = Vec::new();
+    let mut term_infos: Vec<(String, u32)> = Vec::new();
+
     for term in query_terms {
         match reader.term_ordinal(term) {
             Some(ord) => {
                 let info = reader.term_info(ord)?;
                 let postings = reader.posting_list(ord)?;
+                term_infos.push((term.clone(), info.doc_frequency));
                 entries.push((info.doc_frequency, postings));
             }
             None => {
                 if operator == Operator::And {
-                    return Ok(vec![]);
+                    return Ok(SegmentEvaluation {
+                        candidates: vec![],
+                        term_infos: vec![],
+                    });
                 }
             }
         }
     }
 
     if entries.is_empty() {
-        return Ok(vec![]);
+        return Ok(SegmentEvaluation {
+            candidates: vec![],
+            term_infos,
+        });
     }
 
     if operator == Operator::And {
@@ -52,7 +69,10 @@ pub(crate) fn evaluate_segment(
             Operator::Or => boolean::union(&combined, postings),
         };
     }
-    Ok(combined)
+    Ok(SegmentEvaluation {
+        candidates: combined,
+        term_infos,
+    })
 }
 
 /// Groups evaluated candidates into `IndexedWorkItem`s, one per (file, row_group).
@@ -63,23 +83,13 @@ pub(crate) fn evaluate_segment(
 pub(crate) fn group_candidates(
     reader: &SegmentReader,
     candidates: &[DocId],
-    query_terms: &[String],
+    term_infos: &[(String, u32)],
 ) -> Vec<IndexedWorkItem> {
     let file_table = reader.file_table();
     let corpus_stats = reader.corpus_stats();
     let avg_dl = bm25::avg_dl(corpus_stats.total_tokens, corpus_stats.total_rows);
 
-    let term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-        query_terms
-            .iter()
-            .filter_map(|t| {
-                reader.term_ordinal(t).map(|ord| {
-                    let info = reader.term_info(ord).expect("valid ordinal from FST");
-                    (t.clone(), info.doc_frequency)
-                })
-            })
-            .collect(),
-    );
+    let term_infos: Arc<Vec<(String, u32)>> = Arc::new(term_infos.to_vec());
 
     let mut groups: BTreeMap<(u32, u16), Vec<lakesearch_core::types::DocTableEntry>> =
         BTreeMap::new();

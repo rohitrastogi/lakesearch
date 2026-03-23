@@ -110,6 +110,7 @@ pub async fn search(
             req.limit,
             req.select.clone(),
             state.config.io_concurrency,
+            state.config.max_io_tasks,
             Arc::clone(&state.runtime),
         ),
     )

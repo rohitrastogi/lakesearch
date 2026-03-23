@@ -20,10 +20,10 @@ use parquet::file::metadata::ParquetMetaData;
 use lakesearch_core::bm25;
 use lakesearch_core::tokenizer::tokenize;
 
-use crate::parquet_util::{find_column, string_value};
+use crate::parquet_util::{find_column, string_value, validate_arrow_column};
 use crate::Operator;
 
-use super::types::QueryStats;
+use super::types::{QueryStats, SCORE_COL, TEXT_COL};
 
 // ---------------------------------------------------------------------------
 // Projection resolution
@@ -34,10 +34,13 @@ use super::types::QueryStats;
 pub(crate) struct Projection {
     pub leaf_indices: Vec<usize>,
     pub indexed_batch_col: usize,
-    pub select_col_map: Vec<(usize, String)>,
+    pub select_col_map: Arc<[(usize, String)]>,
+    /// True when the indexed column is LargeUtf8 (vs Utf8).
+    pub is_large: bool,
 }
 
 /// Resolves parquet leaf indices for the indexed column + select columns.
+/// Also detects whether the indexed column is LargeUtf8.
 pub(crate) fn resolve_projection(
     pq_meta: &ParquetMetaData,
     column: &str,
@@ -45,6 +48,13 @@ pub(crate) fn resolve_projection(
 ) -> Result<Projection> {
     let indexed_leaf = find_column(pq_meta, column)
         .with_context(|| format!("resolving indexed column '{column}'"))?;
+
+    let arrow_schema = parquet::arrow::parquet_to_arrow_schema(
+        pq_meta.file_metadata().schema_descr(),
+        pq_meta.file_metadata().key_value_metadata(),
+    )
+    .context("converting parquet schema to arrow")?;
+    let is_large = validate_arrow_column(&arrow_schema, column)?;
 
     let mut select_leaves: Vec<(usize, String)> = Vec::new();
     for sel in select_columns {
@@ -67,7 +77,7 @@ pub(crate) fn resolve_projection(
         .iter()
         .position(|(l, _)| *l == indexed_leaf)
         .unwrap();
-    let select_col_map: Vec<(usize, String)> = all_leaves
+    let select_col_map: Arc<[(usize, String)]> = all_leaves
         .iter()
         .enumerate()
         .filter_map(|(idx, (_, name))| name.as_ref().map(|n| (idx, n.clone())))
@@ -77,6 +87,7 @@ pub(crate) fn resolve_projection(
         leaf_indices,
         indexed_batch_col,
         select_col_map,
+        is_large,
     })
 }
 
@@ -107,46 +118,7 @@ pub(crate) fn verify_batch(
     ctx: &VerifyContext<'_>,
     schema: &SchemaRef,
 ) -> (Option<RecordBatch>, QueryStats) {
-    let mut stats = QueryStats::default();
-    let col = batch.column(ctx.indexed_batch_col);
-    let mut match_mask = BooleanBuilder::with_capacity(batch.num_rows());
-    let mut text_builder = StringBuilder::new();
-    let mut score_builder = if ctx.with_score {
-        Some(Float64Builder::new())
-    } else {
-        None
-    };
-
-    for row in 0..batch.num_rows() {
-        stats.rows_scanned += 1;
-        if col.is_null(row) {
-            match_mask.append_value(false);
-            continue;
-        }
-        let text = string_value(col.as_ref(), row, ctx.is_large);
-        let tokens = tokenize(text);
-
-        if !matches_predicate(&tokens, ctx.query_terms, ctx.operator) {
-            match_mask.append_value(false);
-            continue;
-        }
-
-        match_mask.append_value(true);
-        stats.rows_matched += 1;
-        text_builder.append_value(text);
-
-        if let Some(ref mut sb) = score_builder {
-            sb.append_value(compute_bm25(&tokens, ctx));
-        }
-    }
-
-    if stats.rows_matched == 0 {
-        return (None, stats);
-    }
-
-    let mask = match_mask.finish();
-    let batch = build_output_batch(schema, text_builder, score_builder, batch, &mask, ctx);
-    (batch, stats)
+    verify_rows(batch, ctx, schema, None)
 }
 
 /// CPU-bound: applies ilike pre-filter to a single batch, then verifies
@@ -156,7 +128,6 @@ pub(crate) fn brute_force_verify_batch(
     ctx: &VerifyContext<'_>,
     schema: &SchemaRef,
 ) -> (Option<RecordBatch>, QueryStats) {
-    let mut stats = QueryStats::default();
     let col = batch.column(ctx.indexed_batch_col);
 
     // Arrow pre-filter: case-insensitive substring check via ILIKE
@@ -170,20 +141,34 @@ pub(crate) fn brute_force_verify_batch(
         })
         .collect();
 
-    let candidate_mask = if term_masks.is_empty() {
+    if term_masks.is_empty() {
+        let mut stats = QueryStats::default();
         stats.rows_scanned += batch.num_rows();
         return (None, stats);
-    } else {
-        let mut mask = term_masks[0].clone();
-        for m in &term_masks[1..] {
-            mask = match ctx.operator {
-                Operator::And => compute::and(&mask, m).unwrap_or(mask),
-                Operator::Or => compute::or(&mask, m).unwrap_or(mask),
-            };
-        }
-        mask
-    };
+    }
 
+    let mut candidate = term_masks[0].clone();
+    for m in &term_masks[1..] {
+        candidate = match ctx.operator {
+            Operator::And => compute::and(&candidate, m).unwrap_or(candidate),
+            Operator::Or => compute::or(&candidate, m).unwrap_or(candidate),
+        };
+    }
+
+    verify_rows(batch, ctx, schema, Some(&candidate))
+}
+
+/// Shared row-verification loop used by both indexed and brute-force paths.
+/// When `pre_filter` is `Some`, rows that fail the pre-filter are skipped
+/// without tokenization.
+fn verify_rows(
+    batch: &RecordBatch,
+    ctx: &VerifyContext<'_>,
+    schema: &SchemaRef,
+    pre_filter: Option<&BooleanArray>,
+) -> (Option<RecordBatch>, QueryStats) {
+    let mut stats = QueryStats::default();
+    let col = batch.column(ctx.indexed_batch_col);
     let mut match_mask = BooleanBuilder::with_capacity(batch.num_rows());
     let mut text_builder = StringBuilder::new();
     let mut score_builder = if ctx.with_score {
@@ -194,7 +179,8 @@ pub(crate) fn brute_force_verify_batch(
 
     for row in 0..batch.num_rows() {
         stats.rows_scanned += 1;
-        if !candidate_mask.value(row) || col.is_null(row) {
+        let skip = col.is_null(row) || pre_filter.is_some_and(|pf| !pf.value(row));
+        if skip {
             match_mask.append_value(false);
             continue;
         }
@@ -281,10 +267,10 @@ fn build_output_batch(
 
     for field in schema.fields() {
         match field.name().as_str() {
-            "text" => {
+            TEXT_COL => {
                 columns.push(Arc::new(text_builder.finish()));
             }
-            "score" => {
+            SCORE_COL => {
                 if let Some(ref mut sb) = score_builder {
                     columns.push(Arc::new(sb.finish()));
                 }
@@ -292,14 +278,16 @@ fn build_output_batch(
             name => {
                 if let Some((src_idx, _)) = ctx.select_col_map.iter().find(|(_, n)| n == name) {
                     let src_col = source_batch.column(*src_idx);
-                    match compute::filter(src_col.as_ref(), mask) {
-                        Ok(filtered) => columns.push(filtered),
-                        Err(_) => columns.push(arrow::array::new_empty_array(field.data_type())),
-                    }
+                    let filtered = compute::filter(src_col.as_ref(), mask)
+                        .expect("filter on matched mask should not fail");
+                    columns.push(filtered);
                 }
             }
         }
     }
 
-    RecordBatch::try_new(schema.clone(), columns).ok()
+    Some(
+        RecordBatch::try_new(schema.clone(), columns)
+            .expect("output schema/columns mismatch is a bug"),
+    )
 }

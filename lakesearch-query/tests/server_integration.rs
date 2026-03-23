@@ -38,6 +38,7 @@ async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task:
         metadata_poll_secs: 60,
         cpu_threads: 2,
         io_concurrency: 8,
+        max_io_tasks: 64,
         tables: std::collections::HashMap::new(),
     };
 
