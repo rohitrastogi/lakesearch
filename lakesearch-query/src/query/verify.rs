@@ -130,21 +130,16 @@ pub(crate) fn brute_force_verify_batch(
 ) -> (Option<RecordBatch>, QueryStats) {
     let col = batch.column(ctx.indexed_batch_col);
 
-    // Arrow pre-filter: case-insensitive ILIKE check.
-    // Pattern depends on match type:
-    //   Exact("conn")  → "%conn%"  (substring)
-    //   Prefix("conn") → "conn%"   (starts with, after tokenization)
-    //   Suffix("tion") → "%tion"   (ends with, after tokenization)
+    // Arrow pre-filter: case-insensitive substring ILIKE check.
+    // All patterns use "%term%" because ILIKE operates on raw text (not
+    // tokenized). This is a coarse filter — matches_predicate does the
+    // real prefix/suffix check on tokenized output.
     let term_masks: Vec<BooleanArray> = ctx
         .query_terms
         .iter()
         .filter_map(|qt| {
-            use lakesearch_core::tokenizer::QueryTerm;
-            let pattern = match qt {
-                QueryTerm::Exact(t) => format!("%{t}%"),
-                QueryTerm::Prefix(p) => format!("%{p}%"),
-                QueryTerm::Suffix(s) => format!("%{s}%"),
-            };
+            let t = qt.term();
+            let pattern = format!("%{t}%");
             let scalar = Scalar::new(StringArray::from(vec![pattern.as_str()]));
             arrow::compute::kernels::comparison::ilike(col, &scalar).ok()
         })
@@ -229,14 +224,8 @@ fn matches_predicate(
     query_terms: &[lakesearch_core::tokenizer::QueryTerm],
     operator: Operator,
 ) -> bool {
-    use lakesearch_core::tokenizer::QueryTerm;
-
-    let term_matches = |qt: &QueryTerm| -> bool {
-        match qt {
-            QueryTerm::Exact(q) => tokens.iter().any(|t| t == q),
-            QueryTerm::Prefix(p) => tokens.iter().any(|t| t.starts_with(p.as_str())),
-            QueryTerm::Suffix(s) => tokens.iter().any(|t| t.ends_with(s.as_str())),
-        }
+    let term_matches = |qt: &lakesearch_core::tokenizer::QueryTerm| -> bool {
+        tokens.iter().any(|t| qt.matches_token(t))
     };
 
     match operator {

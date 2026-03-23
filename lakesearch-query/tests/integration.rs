@@ -1448,7 +1448,15 @@ async fn prefix_query_matches_expanded_terms() {
 
     // "conn*" should match "connection" and "connector"
     let result = run_query(
-        &store, &base, "description", "conn*", Operator::Or, false, None, &[], &runtime,
+        &store,
+        &base,
+        "description",
+        "conn*",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
     )
     .await
     .unwrap();
@@ -1500,7 +1508,15 @@ async fn suffix_query_matches_expanded_terms() {
 
     // "*ion" should match "connection" and "permission"
     let result = run_query(
-        &store, &base, "description", "*ion", Operator::Or, false, None, &[], &runtime,
+        &store,
+        &base,
+        "description",
+        "*ion",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
     )
     .await
     .unwrap();

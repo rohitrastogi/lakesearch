@@ -55,30 +55,15 @@ pub(crate) fn evaluate_segment(
                     }
                 }
             },
-            QueryTerm::Prefix(prefix) => {
-                let expanded = reader.prefix_terms(prefix);
+            QueryTerm::Prefix(pat) | QueryTerm::Suffix(pat) => {
+                let expanded = if matches!(qt, QueryTerm::Prefix(_)) {
+                    reader.prefix_terms(pat)
+                } else {
+                    reader.suffix_terms(pat)
+                };
                 if expanded.len() > MAX_WILDCARD_EXPANSION {
                     bail!(
-                        "prefix '{prefix}*' expanded to {} terms (max {MAX_WILDCARD_EXPANSION})",
-                        expanded.len()
-                    );
-                }
-                let postings = expand_wildcard(reader, &expanded, &mut term_infos)?;
-                if let Some(p) = postings {
-                    let df = p.len() as u32;
-                    entries.push((df, p));
-                } else if operator == Operator::And {
-                    return Ok(SegmentEvaluation {
-                        candidates: vec![],
-                        term_infos: vec![],
-                    });
-                }
-            }
-            QueryTerm::Suffix(suffix) => {
-                let expanded = reader.suffix_terms(suffix);
-                if expanded.len() > MAX_WILDCARD_EXPANSION {
-                    bail!(
-                        "'*{suffix}' expanded to {} terms (max {MAX_WILDCARD_EXPANSION})",
+                        "wildcard '{pat}' expanded to {} terms (max {MAX_WILDCARD_EXPANSION})",
                         expanded.len()
                     );
                 }

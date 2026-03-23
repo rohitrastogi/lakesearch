@@ -165,6 +165,15 @@ impl QueryTerm {
     pub fn is_wildcard(&self) -> bool {
         !matches!(self, Self::Exact(_))
     }
+
+    /// Returns true if a tokenized token matches this query term.
+    pub fn matches_token(&self, token: &str) -> bool {
+        match self {
+            Self::Exact(q) => token == q,
+            Self::Prefix(p) => token.starts_with(p.as_str()),
+            Self::Suffix(s) => token.ends_with(s.as_str()),
+        }
+    }
 }
 
 #[cfg(test)]
