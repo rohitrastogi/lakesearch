@@ -2183,3 +2183,31 @@ Add or remove indexed columns on a live table.
 4. **Backfill parallelism**: When adding a column, how many files should the
    indexer process in parallel? This is a resource/throughput tradeoff.
 
+5. **Phrase queries**: The current index supports bag-of-words term matching
+   (AND/OR over individual tokens). Phrase queries ("connection refused")
+   require knowing token positions within a document. Two approaches:
+   - **Naive (no index changes)**: AND-query the individual terms to get
+     candidate pages, then post-filter by reading the actual text and
+     checking for the exact phrase. Works today with no format changes.
+     Cost is proportional to the number of candidate pages, not total pages.
+   - **Positional index**: Store token positions in the posting lists.
+     Enables exact phrase matching and proximity queries at the index
+     level. Increases index size but avoids the post-filter I/O.
+
+6. **Lazy batch decoding**: Currently, posting lists and doc table entries
+   are fully decoded when a segment is read. For queries that hit many
+   segments but only need a few results (e.g., top-K with early
+   termination), lazily decoding posting list blocks on demand could
+   avoid wasted work. The block-based posting codec already supports
+   this — each block is independently decodable — but the reader API
+   currently materializes the full list.
+
+7. **Distributed query path**: Query processing is embarrassingly parallel
+   for large tables. Each segment can be searched independently — term
+   lookup, posting list decode, boolean ops, and BM25 scoring are all
+   per-segment with no cross-segment dependencies until the final merge.
+   A distributed query layer could partition segments across workers,
+   scatter the query, and gather/merge results. The existing single-node
+   pipeline (concurrent segment loads via `FuturesUnordered`, rayon CPU
+   pool) maps directly to a scatter-gather architecture.
+
