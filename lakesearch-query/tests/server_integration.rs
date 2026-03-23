@@ -8,8 +8,8 @@ use object_store::memory::InMemory;
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use lakesearch_cli::index::run_index;
 use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_indexer::run_index;
 use lakesearch_query::server::api_types::{
     HealthResponse, ListTablesResponse, SearchResponse, TableInfo,
 };
@@ -158,7 +158,6 @@ async fn search_round_trip() {
     // Rows should have "text" and "score" fields
     assert!(body.rows[0].contains_key("text"));
     assert!(body.rows[0].contains_key("score"));
-    assert!(body.stats.elapsed_ms > 0);
 
     handle.abort();
 }

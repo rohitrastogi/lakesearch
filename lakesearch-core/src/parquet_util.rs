@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
+use crate::types::{DocId, DocTableEntry, FileTableEntry};
 use anyhow::{bail, Context, Result};
 use arrow::array::{Array, LargeStringArray, RecordBatch, StringArray};
 use arrow::datatypes::DataType;
 use futures::TryStreamExt;
-use lakesearch_core::types::{DocId, DocTableEntry, FileTableEntry};
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parquet::arrow::arrow_reader::{RowSelection, RowSelector};

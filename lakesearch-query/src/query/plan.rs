@@ -10,8 +10,8 @@ use lakesearch_core::metadata::{Manifest, ManifestList, TermStats};
 use lakesearch_core::segment::SegmentReader;
 
 use crate::object_cache::ObjectCache;
-use crate::storage::{read_current, read_metadata};
 use crate::Operator;
+use lakesearch_core::storage::{read_current, read_metadata};
 
 use object_store::path::Path;
 

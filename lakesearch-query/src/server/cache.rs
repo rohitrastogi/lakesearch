@@ -12,7 +12,7 @@ use tracing::{debug, warn};
 use lakesearch_core::metadata::Metadata;
 
 use crate::object_cache::ObjectCache;
-use crate::storage::{parse_location, read_current, read_metadata};
+use lakesearch_core::storage::{parse_location, read_current, read_metadata};
 
 /// Cached state for a single table.
 struct TableState {

@@ -12,8 +12,8 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
+use lakesearch_core::storage::write_json;
 use lakesearch_core::tokenizer::DEFAULT_TOKENIZER;
-use lakesearch_query::storage::write_json;
 
 /// Creates a test Parquet file and uploads it to the object store.
 /// Returns the path where it was stored.
