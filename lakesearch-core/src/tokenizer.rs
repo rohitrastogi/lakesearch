@@ -132,23 +132,31 @@ pub fn parse_query(text: &str) -> Vec<QueryTerm> {
         if stripped.is_empty() {
             continue;
         }
-        // Tokenize the stripped portion (lowercases + normalizes)
+        // Tokenize the stripped portion (lowercases + normalizes).
+        // Punctuation in the input may produce multiple tokens
+        // (e.g. "error:timeout" → ["error", "timeout"]).
         let tokens = tokenize(stripped);
         if tokens.is_empty() {
             continue;
         }
-        // Use the first token (wildcard applies to a single term)
-        let token = tokens.into_iter().next().expect("tokens is non-empty");
-        let term = match (is_prefix, is_suffix) {
-            (true, true) => {
-                // *foo* — not supported, treat as prefix for now
-                QueryTerm::Prefix(token)
-            }
-            (true, false) => QueryTerm::Prefix(token),
-            (false, true) => QueryTerm::Suffix(token),
-            (false, false) => QueryTerm::Exact(token),
-        };
-        terms.push(term);
+
+        if !is_prefix && !is_suffix {
+            // No wildcard: emit all tokens as exact matches
+            terms.extend(tokens.into_iter().map(QueryTerm::Exact));
+        } else {
+            // Wildcard applies to the first token only. Any extra tokens
+            // from punctuation splitting become exact matches.
+            let mut iter = tokens.into_iter();
+            let first = iter.next().expect("tokens is non-empty");
+            let wildcard = match (is_prefix, is_suffix) {
+                (true, true) => QueryTerm::Prefix(first),
+                (true, false) => QueryTerm::Prefix(first),
+                (false, true) => QueryTerm::Suffix(first),
+                _ => unreachable!(),
+            };
+            terms.push(wildcard);
+            terms.extend(iter.map(QueryTerm::Exact));
+        }
     }
     terms
 }
@@ -312,6 +320,39 @@ mod tests {
             vec![
                 QueryTerm::Exact("hello".to_owned()),
                 QueryTerm::Exact("world".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_punctuated_emits_all_tokens() {
+        // "error:timeout" should produce two exact terms, not just "error"
+        assert_eq!(
+            parse_query("error:timeout"),
+            vec![
+                QueryTerm::Exact("error".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_wildcard_with_punctuation() {
+        // "conn*:refused" — the * is mid-token, not at the end of the
+        // whitespace-delimited word, so no wildcard is detected.
+        assert_eq!(
+            parse_query("conn*:refused"),
+            vec![
+                QueryTerm::Exact("conn".to_owned()),
+                QueryTerm::Exact("refused".to_owned()),
+            ]
+        );
+        // But "conn* refused" has * at the end of the first word.
+        assert_eq!(
+            parse_query("conn* refused"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Exact("refused".to_owned()),
             ]
         );
     }

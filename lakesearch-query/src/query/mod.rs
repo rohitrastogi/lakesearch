@@ -210,16 +210,38 @@ fn launch_pipeline(
 ) {
     let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
     let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
-    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-        query_terms
-            .iter()
-            .map(|qt| {
-                let t = qt.term();
-                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                (t.to_owned(), df)
-            })
-            .collect(),
-    );
+    // For exact terms, look up df directly. For wildcards, include all
+    // expanded terms from agg stats so brute-force BM25 scoring works.
+    let mut agg_term_vec: Vec<(String, u32)> = Vec::new();
+    for qt in &query_terms {
+        match qt {
+            QueryTerm::Exact(t) => {
+                let df = agg.term_df.get(t.as_str()).copied().unwrap_or(1) as u32;
+                agg_term_vec.push((t.clone(), df));
+            }
+            QueryTerm::Prefix(p) => {
+                for (term, &df) in &agg.term_df {
+                    if term.starts_with(p.as_str()) {
+                        agg_term_vec.push((term.clone(), df as u32));
+                    }
+                }
+            }
+            QueryTerm::Suffix(s) => {
+                for (term, &df) in &agg.term_df {
+                    if term.ends_with(s.as_str()) {
+                        agg_term_vec.push((term.clone(), df as u32));
+                    }
+                }
+            }
+        }
+    }
+    if agg_term_vec.is_empty() {
+        // Fallback: ensure at least something for scoring
+        for qt in &query_terms {
+            agg_term_vec.push((qt.term().to_owned(), 1));
+        }
+    }
+    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(agg_term_vec);
 
     let shared_ctx = Arc::new(SharedQueryContext {
         query_terms: Arc::new(query_terms),
