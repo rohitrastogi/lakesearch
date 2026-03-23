@@ -41,6 +41,27 @@ inter-service coordination. More complexity than needed.
 
 ## 2. Architecture Principles
 
+### Append-only and rewrite-only data lakes
+LakeSearch targets data lakes with two mutation patterns:
+- **Append-only** — new Parquet files arrive over time, existing
+  files are never modified or deleted (e.g., event logs, CDC streams).
+- **Rewrite-only** — periodic compaction replaces a set of files with
+  new, consolidated files (e.g., Hive/Iceberg compaction, partition
+  rewrites). Existing files are never mutated in place — they're
+  either kept as-is or replaced wholesale.
+
+LakeSearch does not support in-place mutation of individual rows or
+files. It provides clean APIs that hook into both patterns:
+- **Register** for appends — call when new files land.
+- **Replace** for rewrites — call after upstream compaction with the
+  new complete file set.
+
+These APIs are designed to work across workflows: manual uploads,
+streaming ingestion, scheduled ETL, table-format compaction. The user
+integrates at whatever point files change, and LakeSearch handles
+the rest (indexing, segment invalidation, reindexing) in the
+background.
+
 ### Query and maintenance are independent
 - **Query** is stateless and read-only. Reads metadata + segments,
   returns results. Deployable as a server, Lambda, CLI, or embedded
