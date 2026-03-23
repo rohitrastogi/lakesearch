@@ -11,7 +11,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use lakesearch_core::metadata::{CurrentPointer, Manifest, ManifestList, Metadata};
+use crate::metadata::{CurrentPointer, Manifest, ManifestList, Metadata};
 
 /// Result of reading a JSON object: the deserialized value and the ETag
 /// (used for CAS conditional PUT).

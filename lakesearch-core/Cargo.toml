@@ -6,6 +6,20 @@ edition = "2021"
 [features]
 test-utils = ["dep:parquet", "dep:arrow"]
 runtime = ["dep:tokio", "dep:rayon"]
+io = [
+    "dep:parquet", "parquet/async", "parquet/object_store",
+    "dep:arrow",
+    "dep:object_store",
+    "dep:anyhow",
+    "dep:bytes",
+    "dep:chrono",
+    "dep:futures",
+    "dep:sha2",
+    "dep:tokio", "tokio/time",
+    "dep:tracing",
+    "dep:url",
+    "dep:uuid",
+]
 
 [dependencies]
 crc32fast = "1"
@@ -19,6 +33,15 @@ parquet = { version = "54", features = ["arrow"], optional = true }
 arrow = { version = "54", optional = true }
 tokio = { version = "1", features = ["sync"], optional = true }
 rayon = { version = "1", optional = true }
+object_store = { version = "0.11", features = ["aws"], optional = true }
+anyhow = { version = "1", optional = true }
+bytes = { version = "1", optional = true }
+chrono = { version = "0.4", features = ["serde"], optional = true }
+futures = { version = "0.3", optional = true }
+sha2 = { version = "0.10", optional = true }
+tracing = { version = "0.1", optional = true }
+url = { version = "2", optional = true }
+uuid = { version = "1", features = ["v4"], optional = true }
 
 [dev-dependencies]
 proptest = "1"

@@ -9,7 +9,7 @@ use object_store::path::Path;
 use object_store::{ObjectStore, PutMode, PutOptions, PutPayload, UpdateVersion};
 use tracing::{info, warn};
 
-use lakesearch_core::metadata::{CurrentPointer, Metadata};
+use crate::metadata::{CurrentPointer, Metadata};
 
 use crate::storage::{read_current, read_manifest_list, read_metadata, write_metadata};
 
@@ -134,7 +134,7 @@ pub async fn is_batch_duplicate(
     Ok(false)
 }
 
-/// Simple jitter: 0–49ms.
+/// Simple jitter: 0-49ms.
 fn rand_jitter() -> u64 {
     // Use a simple source — exact randomness doesn't matter for backoff.
     let t = std::time::SystemTime::now()
@@ -146,7 +146,7 @@ fn rand_jitter() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lakesearch_core::metadata::{ColumnStatus, IndexedColumn, Snapshot};
+    use crate::metadata::{ColumnStatus, IndexedColumn, Snapshot};
     use object_store::memory::InMemory;
 
     fn test_metadata(manifest_lists: Vec<String>) -> Metadata {
@@ -157,7 +157,7 @@ mod tests {
             location: "mem://table/".to_owned(),
             indexed_columns: vec![IndexedColumn {
                 name: "description".to_owned(),
-                tokenizer: lakesearch_core::tokenizer::DEFAULT_TOKENIZER.to_owned(),
+                tokenizer: crate::tokenizer::DEFAULT_TOKENIZER.to_owned(),
                 status: ColumnStatus::Active,
             }],
             snapshot: Snapshot {
@@ -211,8 +211,8 @@ mod tests {
         let store = InMemory::new();
 
         // Write a manifest list with a known batch_id
-        let ml = lakesearch_core::metadata::ManifestList {
-            job_kind: lakesearch_core::metadata::JobKind::Append,
+        let ml = crate::metadata::ManifestList {
+            job_kind: crate::metadata::JobKind::Append,
             batch_id: "sha256:abc".to_owned(),
             data_files: vec![],
             manifests: vec![],
@@ -269,8 +269,8 @@ mod tests {
 
         // Simulate concurrent worker B committing the same batch_id first.
         // Write a manifest list with batch_id "sha256:same"
-        let ml = lakesearch_core::metadata::ManifestList {
-            job_kind: lakesearch_core::metadata::JobKind::Append,
+        let ml = crate::metadata::ManifestList {
+            job_kind: crate::metadata::JobKind::Append,
             batch_id: "sha256:same".to_owned(),
             data_files: vec![],
             manifests: vec![],

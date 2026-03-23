@@ -19,7 +19,7 @@ use tracing::warn;
 use lakesearch_core::runtime::LakeRuntime;
 
 use crate::object_cache::ObjectCache;
-use crate::parquet_util::{build_row_selection, find_column};
+use lakesearch_core::parquet_util::{build_row_selection, find_column};
 
 use super::types::{
     BruteForceScoring, CpuWorkItem, FileProjection, IndexedWorkItem, QueryStats,

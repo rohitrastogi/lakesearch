@@ -10,8 +10,8 @@ use lakesearch_core::metadata::{Manifest, ManifestList, TermStats};
 use lakesearch_core::segment::SegmentReader;
 
 use crate::object_cache::ObjectCache;
-use crate::storage::{read_current, read_metadata};
 use crate::Operator;
+use lakesearch_core::storage::{read_current, read_metadata};
 
 use object_store::path::Path;
 
@@ -140,8 +140,8 @@ pub async fn resolve_schema_from_table(
 ) -> Result<arrow::datatypes::SchemaRef> {
     use super::{build_empty_schema, build_result_schema};
 
-    let current = crate::storage::read_current(cache.store().as_ref(), base).await?;
-    let metadata = crate::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
+    let current = lakesearch_core::storage::read_current(cache.store().as_ref(), base).await?;
+    let metadata = lakesearch_core::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
 
     // Try to find any data file from manifest lists to read its parquet schema.
     for ml_path in &metadata.snapshot.manifest_lists {

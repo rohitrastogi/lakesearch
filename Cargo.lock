@@ -1525,11 +1525,10 @@ dependencies = [
  "arrow-json",
  "chrono",
  "clap",
- "futures",
  "lakesearch-core",
+ "lakesearch-indexer",
  "lakesearch-query",
  "object_store",
- "parquet",
  "serde_json",
  "tempfile",
  "tokio",
@@ -1542,18 +1541,41 @@ dependencies = [
 name = "lakesearch-core"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "arrow",
+ "bytes",
+ "chrono",
  "crc32fast",
  "fst",
+ "futures",
  "lz4_flex",
+ "object_store",
  "parquet",
  "proptest",
  "rayon",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "tokio",
+ "tracing",
  "unicode-normalization",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "lakesearch-indexer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "chrono",
+ "futures",
+ "lakesearch-core",
+ "object_store",
+ "parquet",
+ "tracing",
 ]
 
 [[package]]
@@ -1566,11 +1588,10 @@ dependencies = [
  "arrow-json",
  "axum 0.8.8",
  "bytes",
- "chrono",
  "clap",
  "futures",
- "lakesearch-cli",
  "lakesearch-core",
+ "lakesearch-indexer",
  "moka",
  "object_store",
  "parquet",
@@ -1579,7 +1600,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "sha2",
  "tempfile",
  "tokio",
  "tokio-stream",
@@ -1587,8 +1607,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
- "url",
- "uuid",
 ]
 
 [[package]]

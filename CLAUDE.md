@@ -25,8 +25,10 @@ Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
 
 ## Design
 
-- `lakesearch-core` is sync, pure, no I/O. Takes bytes in, gives bytes out.
-  Service crates handle all async I/O and compose core's building blocks.
+- `lakesearch-core` is sync and pure by default. The optional `io` feature
+  gate adds shared async I/O utilities (storage, CAS, parquet helpers) that
+  both `lakesearch-indexer` and `lakesearch-query` depend on. Without `io`,
+  core has no I/O, no `anyhow`, and no async code.
 - No service crate depends on another service crate. They only share core.
 - Before exposing a public API from core, review: are internal details leaked?
   Would a caller find the API obvious without reading the implementation?
@@ -37,8 +39,9 @@ Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
   requests, Flight tickets). Validate and parse into domain types early.
   Internally, pass typed structs, not raw JSON or `serde_json::Value`.
 - Use `thiserror` for error types in core (structured, matchable errors).
-  Use `anyhow` in service crate binaries for top-level error handling.
-  Do not mix: core should never depend on anyhow.
+  Use `anyhow` in service crate binaries and in core's `io` modules for
+  top-level error handling. Core's default (non-`io`) modules must not
+  depend on anyhow.
 - Prefer pure functions where practical. Keep mutation localized to builders
   (`SegmentBuilder`, `PostingListBuilder`) and clearly stateful structs.
 - Use `#[must_use]` on functions whose return value should not be ignored.

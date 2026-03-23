@@ -1,10 +1,16 @@
 pub mod bm25;
 pub mod boolean;
+#[cfg(feature = "io")]
+pub mod cas;
 pub mod metadata;
+#[cfg(feature = "io")]
+pub mod parquet_util;
 pub mod posting;
 #[cfg(feature = "runtime")]
 pub mod runtime;
 pub mod segment;
+#[cfg(feature = "io")]
+pub mod storage;
 #[cfg(feature = "test-utils")]
 pub mod test_utils;
 pub mod tokenizer;
