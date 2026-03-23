@@ -12,7 +12,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use uuid::Uuid;
 
-use lakesearch_core::metadata::{CurrentPointer, ManifestList, Metadata};
+use lakesearch_core::metadata::{CurrentPointer, Manifest, ManifestList, Metadata};
 
 /// Result of reading a JSON object: the deserialized value and the ETag
 /// (used for CAS conditional PUT).
@@ -73,6 +73,13 @@ pub async fn read_metadata(store: &dyn ObjectStore, pointer: &CurrentPointer) ->
 pub async fn read_manifest_list(store: &dyn ObjectStore, path: &str) -> Result<ManifestList> {
     let path = Path::from(path);
     let result: ReadResult<ManifestList> = read_json(store, &path).await?;
+    Ok(result.value)
+}
+
+/// Reads a manifest from its path.
+pub async fn read_manifest(store: &dyn ObjectStore, path: &str) -> Result<Manifest> {
+    let path = Path::from(path);
+    let result: ReadResult<Manifest> = read_json(store, &path).await?;
     Ok(result.value)
 }
 

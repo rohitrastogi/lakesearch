@@ -20,6 +20,14 @@ pub fn router(state: AppState) -> Router {
             "/tables/{table_id}/ingest",
             post(handlers::ingest),
         )
+        .route(
+            "/tables/{table_id}/backfill",
+            post(handlers::start_backfill),
+        )
+        .route(
+            "/tables/{table_id}/backfill/{column}",
+            get(handlers::backfill_status),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

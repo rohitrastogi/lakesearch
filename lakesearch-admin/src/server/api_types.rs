@@ -106,3 +106,27 @@ pub struct IndexTaskPayload {
 pub struct IngestResponse {
     pub tasks_pushed: usize,
 }
+
+// --- Backfill ---
+
+#[derive(Debug, Deserialize)]
+pub struct StartBackfillRequest {
+    pub column: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StartBackfillResponse {
+    pub column: String,
+    pub status: String,
+    pub manifest_lists_snapshot: usize,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackfillStatusResponse {
+    pub column: String,
+    pub status: String,
+    pub total_files: usize,
+    pub indexed_files: usize,
+    pub uncovered_files: usize,
+    pub progress_pct: f64,
+}

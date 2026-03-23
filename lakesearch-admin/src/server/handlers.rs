@@ -330,6 +330,147 @@ pub async fn ingest(
     Ok(Json(IngestResponse { tasks_pushed }))
 }
 
+pub async fn start_backfill(
+    State(state): State<AppState>,
+    Path(table_id): Path<String>,
+    Json(req): Json<StartBackfillRequest>,
+) -> Result<Json<StartBackfillResponse>, ApiError> {
+    let reg = state
+        .registry
+        .get(&table_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+
+    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // Validate column exists and is not dropped
+    let col = metadata
+        .indexed_columns
+        .iter()
+        .find(|c| c.name == req.column)
+        .ok_or_else(|| ApiError::NotFound(format!("column '{}' not found", req.column)))?;
+    if col.status == ColumnStatus::Dropped {
+        return Err(ApiError::BadRequest(format!(
+            "column '{}' is dropped",
+            req.column
+        )));
+    }
+
+    // Snapshot current manifest lists
+    let snapshot_lists = metadata.snapshot.manifest_lists.clone();
+    let snapshot_count = snapshot_lists.len();
+    let column_name = req.column.clone();
+
+    // CAS commit: set column status to Backfilling with frozen snapshot
+    cas::commit_metadata(
+        reg.store.as_ref(),
+        &reg.base,
+        current.e_tag,
+        &metadata,
+        |meta| {
+            let mut new = meta.clone();
+            if let Some(col) = new.indexed_columns.iter_mut().find(|c| c.name == column_name) {
+                col.status = ColumnStatus::Backfilling;
+                col.backfill_manifest_lists = Some(snapshot_lists.clone());
+            }
+            new
+        },
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    info!(
+        table_id = %table_id,
+        column = %req.column,
+        manifest_lists = snapshot_count,
+        "started backfill"
+    );
+
+    Ok(Json(StartBackfillResponse {
+        column: req.column,
+        status: "backfilling".to_owned(),
+        manifest_lists_snapshot: snapshot_count,
+    }))
+}
+
+pub async fn backfill_status(
+    State(state): State<AppState>,
+    Path((table_id, column)): Path<(String, String)>,
+) -> Result<Json<BackfillStatusResponse>, ApiError> {
+    let reg = state
+        .registry
+        .get(&table_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+
+    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let col = metadata
+        .indexed_columns
+        .iter()
+        .find(|c| c.name == column)
+        .ok_or_else(|| ApiError::NotFound(format!("column '{column}' not found")))?;
+
+    let status_str = serde_json::to_value(&col.status)
+        .ok()
+        .and_then(|v| v.as_str().map(String::from))
+        .unwrap_or_else(|| format!("{:?}", col.status));
+
+    // If not backfilling (or no snapshot), return zeroed progress
+    let backfill_lists = match &col.backfill_manifest_lists {
+        Some(lists) if col.status == ColumnStatus::Backfilling => lists,
+        _ => {
+            return Ok(Json(BackfillStatusResponse {
+                column,
+                status: status_str,
+                total_files: 0,
+                indexed_files: 0,
+                uncovered_files: 0,
+                progress_pct: if col.status == ColumnStatus::Active {
+                    100.0
+                } else {
+                    0.0
+                },
+            }));
+        }
+    };
+
+    let result = crate::backfill::find_uncovered_files(
+        reg.store.as_ref(),
+        &metadata,
+        &column,
+        backfill_lists,
+        8, // default io_concurrency
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    let progress_pct = if result.total_files == 0 {
+        100.0
+    } else {
+        (result.indexed_files as f64 / result.total_files as f64) * 100.0
+    };
+
+    Ok(Json(BackfillStatusResponse {
+        column,
+        status: status_str,
+        total_files: result.total_files,
+        indexed_files: result.indexed_files,
+        uncovered_files: result.uncovered.len(),
+        progress_pct,
+    }))
+}
+
 fn columns_to_info(columns: &[IndexedColumn]) -> Vec<ColumnInfo> {
     columns
         .iter()
