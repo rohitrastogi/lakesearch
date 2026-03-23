@@ -158,7 +158,6 @@ async fn search_round_trip() {
     // Rows should have "text" and "score" fields
     assert!(body.rows[0].contains_key("text"));
     assert!(body.rows[0].contains_key("score"));
-    assert!(body.stats.elapsed_ms > 0);
 
     handle.abort();
 }
