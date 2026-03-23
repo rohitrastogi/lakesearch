@@ -30,7 +30,7 @@ pub enum OperatorStr {
     Or,
 }
 
-fn default_operator() -> OperatorStr {
+pub(crate) fn default_operator() -> OperatorStr {
     OperatorStr::Or
 }
 

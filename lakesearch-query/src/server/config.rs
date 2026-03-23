@@ -10,6 +10,7 @@ use serde::Deserialize;
 /// Example `config.yaml`:
 /// ```yaml
 /// bind_addr: "0.0.0.0:8080"
+/// flight_addr: "0.0.0.0:8081"
 /// query_timeout_secs: 300
 /// metadata_poll_secs: 5
 /// cpu_threads: 8
@@ -23,6 +24,8 @@ use serde::Deserialize;
 pub struct ServerConfig {
     #[serde(default = "default_bind_addr")]
     pub bind_addr: SocketAddr,
+    #[serde(default = "default_flight_addr")]
+    pub flight_addr: SocketAddr,
     #[serde(default = "default_query_timeout_secs")]
     pub query_timeout_secs: u64,
     #[serde(default = "default_metadata_poll_secs")]
@@ -66,6 +69,7 @@ impl Default for ServerConfig {
     fn default() -> Self {
         Self {
             bind_addr: default_bind_addr(),
+            flight_addr: default_flight_addr(),
             query_timeout_secs: default_query_timeout_secs(),
             metadata_poll_secs: default_metadata_poll_secs(),
             cpu_threads: default_cpu_threads(),
@@ -78,6 +82,10 @@ impl Default for ServerConfig {
 
 fn default_bind_addr() -> SocketAddr {
     "0.0.0.0:8080".parse().unwrap()
+}
+
+fn default_flight_addr() -> SocketAddr {
+    "0.0.0.0:8081".parse().unwrap()
 }
 
 fn default_query_timeout_secs() -> u64 {

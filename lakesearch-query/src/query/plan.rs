@@ -126,6 +126,37 @@ fn should_prune_segment(
     }
 }
 
+/// Resolves the output schema from table metadata without planning a full query.
+///
+/// Loads the metadata chain, finds any data file, and reads its Parquet
+/// schema to build the result schema. Used by Flight `get_flight_info` to
+/// return schema without executing a query.
+pub async fn resolve_schema_from_table(
+    cache: &Arc<ObjectCache>,
+    base: &Path,
+    column: &str,
+    select_columns: &[String],
+    with_score: bool,
+) -> Result<arrow::datatypes::SchemaRef> {
+    use super::{build_empty_schema, build_result_schema};
+
+    let current = lakesearch_core::storage::read_current(cache.store().as_ref(), base).await?;
+    let metadata = lakesearch_core::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
+
+    // Try to find any data file from manifest lists to read its parquet schema.
+    for ml_path in &metadata.snapshot.manifest_lists {
+        let ml: lakesearch_core::metadata::ManifestList = cache.get_json(ml_path).await?;
+        for df in &ml.data_files {
+            if let Ok(pq_meta) = cache.get_parquet_metadata(&df.path).await {
+                return build_result_schema(&pq_meta, column, select_columns, with_score);
+            }
+        }
+    }
+
+    // Fallback when no data files exist yet.
+    Ok(build_empty_schema(select_columns, column, with_score))
+}
+
 /// Resolves the output schema from available parquet metadata.
 pub(crate) async fn resolve_schema(
     cache: &Arc<ObjectCache>,
