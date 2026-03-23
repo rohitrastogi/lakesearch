@@ -31,6 +31,11 @@ impl LakeRuntime {
         }
     }
 
+    /// Returns the number of threads in the CPU pool.
+    pub fn num_threads(&self) -> usize {
+        self.cpu_pool.current_num_threads()
+    }
+
     /// Run a CPU-bound closure on the rayon pool, returning the result
     /// to the tokio async context via a oneshot channel.
     pub async fn cpu<F, R>(&self, f: F) -> R

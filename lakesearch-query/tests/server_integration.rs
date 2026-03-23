@@ -26,7 +26,7 @@ async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task:
     let base = Path::from("table");
     create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60)));
+    let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60), 8));
     cache
         .register_with_store("test", store.clone(), base)
         .await
@@ -38,6 +38,7 @@ async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task:
         metadata_poll_secs: 60,
         cpu_threads: 2,
         io_concurrency: 8,
+        max_io_tasks: 64,
         tables: std::collections::HashMap::new(),
     };
 
@@ -136,10 +137,6 @@ async fn search_round_trip() {
     .await
     .unwrap();
 
-    // Force cache refresh (metadata changed after indexing)
-    // We need to wait or re-register. For tests, just re-query — run_query
-    // reads current.json directly so it picks up the new metadata.
-
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base_url}/v1/tables/test/search"))
@@ -158,7 +155,9 @@ async fn search_round_trip() {
     // 2/5 descriptions have both "error" and "timeout" → 40 matches
     assert_eq!(body.stats.rows_matched, 40);
     assert_eq!(body.rows.len(), 3);
-    assert!(body.rows[0].score.is_some());
+    // Rows should have "text" and "score" fields
+    assert!(body.rows[0].contains_key("text"));
+    assert!(body.rows[0].contains_key("score"));
     assert!(body.stats.elapsed_ms > 0);
 
     handle.abort();

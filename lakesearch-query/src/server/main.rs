@@ -28,7 +28,10 @@ async fn main() -> Result<()> {
     let config = ServerConfig::from_file(std::path::Path::new(&args.config))?;
 
     let runtime = Arc::new(LakeRuntime::new(config.cpu_threads));
-    let cache = Arc::new(MetadataCache::new(config.metadata_poll_interval()));
+    let cache = Arc::new(MetadataCache::new(
+        config.metadata_poll_interval(),
+        config.io_concurrency,
+    ));
 
     // Register tables from config
     for (name, location) in &config.tables {

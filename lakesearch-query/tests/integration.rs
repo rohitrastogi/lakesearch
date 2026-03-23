@@ -2,10 +2,9 @@
 
 mod helpers;
 
-use std::collections::HashSet;
 use std::sync::Arc;
 
-use arrow::array::{ArrayRef, Int32Array, StringArray};
+use arrow::array::{Array, ArrayRef, Float64Array, Int32Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
@@ -18,13 +17,13 @@ use parquet::file::properties::WriterProperties;
 use lakesearch_cli::index::run_index;
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_query::object_cache::ObjectCache;
-use lakesearch_query::query::{self, QueryResult};
+use lakesearch_query::query::{self, CollectedQueryResult};
 use lakesearch_query::storage::{read_current, read_metadata};
 use lakesearch_query::Operator;
 
 use helpers::{create_test_table, upload_test_parquet};
 
-/// Test helper: wraps run_query with reference-based args for convenience.
+/// Test helper: wraps run_query_collected with reference-based args for convenience.
 #[allow(clippy::too_many_arguments)]
 async fn run_query(
     store: &Arc<dyn ObjectStore>,
@@ -36,14 +35,14 @@ async fn run_query(
     limit: Option<usize>,
     select_columns: &[String],
     _runtime: &LakeRuntime,
-) -> anyhow::Result<QueryResult> {
+) -> anyhow::Result<CollectedQueryResult> {
     let score_mode = if with_score {
         lakesearch_query::ScoreMode::Indexed
     } else {
         lakesearch_query::ScoreMode::None
     };
     let cache = Arc::new(ObjectCache::new(Arc::clone(store)));
-    query::run_query(
+    query::run_query_collected(
         cache,
         base.clone(),
         column.to_owned(),
@@ -53,9 +52,54 @@ async fn run_query(
         limit,
         select_columns.to_vec(),
         8,
+        64,
         Arc::new(LakeRuntime::new(2)),
     )
     .await
+}
+
+/// Helper: count total rows across batches.
+fn total_rows(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(|b| b.num_rows()).sum()
+}
+
+/// Helper: extract all "text" column values from batches.
+fn extract_texts(batches: &[RecordBatch]) -> Vec<String> {
+    let mut texts = Vec::new();
+    for batch in batches {
+        let col = batch
+            .column_by_name("text")
+            .expect("should have 'text' column");
+        let arr = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("text should be StringArray");
+        for i in 0..arr.len() {
+            if !arr.is_null(i) {
+                texts.push(arr.value(i).to_owned());
+            }
+        }
+    }
+    texts
+}
+
+/// Helper: extract all "score" column values from batches.
+fn extract_scores(batches: &[RecordBatch]) -> Vec<f64> {
+    let mut scores = Vec::new();
+    for batch in batches {
+        if let Some(col) = batch.column_by_name("score") {
+            let arr = col
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("score should be Float64Array");
+            for i in 0..arr.len() {
+                if !arr.is_null(i) {
+                    scores.push(arr.value(i));
+                }
+            }
+        }
+    }
+    scores
 }
 
 #[tokio::test]
@@ -326,15 +370,16 @@ async fn bm25_scoring_across_segments() {
     .await
     .unwrap();
 
-    assert_eq!(result.matches.len(), 5);
+    let rows = total_rows(&result.batches);
+    assert_eq!(rows, 5);
     // All scores should be positive and finite
-    for m in &result.matches {
-        let s = m.score.unwrap();
-        assert!(s > 0.0 && s.is_finite(), "bad score: {s}");
+    let scores = extract_scores(&result.batches);
+    for s in &scores {
+        assert!(*s > 0.0 && s.is_finite(), "bad score: {s}");
     }
     // Scores should be sorted descending
-    for w in result.matches.windows(2) {
-        assert!(w[0].score.unwrap() >= w[1].score.unwrap());
+    for w in scores.windows(2) {
+        assert!(w[0] >= w[1]);
     }
 }
 
@@ -360,7 +405,7 @@ async fn empty_table_query() {
     .await
     .unwrap();
 
-    assert!(result.matches.is_empty());
+    assert_eq!(total_rows(&result.batches), 0);
     assert_eq!(result.stats.rows_matched, 0);
 }
 
@@ -406,11 +451,18 @@ async fn select_projects_additional_columns() {
     .await
     .unwrap();
 
-    assert_eq!(result.matches.len(), 3);
-    for m in &result.matches {
-        let cols = m.columns.as_ref().expect("should have columns");
-        assert!(cols.contains_key("id"), "should have 'id' column");
-        assert!(cols["id"].is_number(), "id should be a number");
+    let rows = total_rows(&result.batches);
+    assert_eq!(rows, 3);
+    // Verify "id" column exists and has Int32 values
+    for batch in &result.batches {
+        let id_col = batch.column_by_name("id").expect("should have 'id' column");
+        let id_arr = id_col
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .expect("id should be Int32Array");
+        for i in 0..id_arr.len() {
+            assert!(!id_arr.is_null(i), "id should not be null");
+        }
     }
 }
 
@@ -455,18 +507,23 @@ async fn select_without_columns_omits_field() {
     .await
     .unwrap();
 
-    assert_eq!(result.matches.len(), 1);
-    // columns field should be None (omitted in JSON)
-    assert!(result.matches[0].columns.is_none());
+    let rows = total_rows(&result.batches);
+    assert_eq!(rows, 1);
+    // Schema should only have "text", no extra columns
+    for batch in &result.batches {
+        assert_eq!(
+            batch.schema().fields().len(),
+            1,
+            "should only have 'text' column"
+        );
+        assert_eq!(batch.schema().field(0).name(), "text");
+    }
 }
 
 // --- Optimization tests ---
 
 #[tokio::test]
 async fn top_k_heap_picks_highest_scores() {
-    // Use documents with genuinely different BM25 scores: varying document
-    // lengths with the same query term produces different scores due to
-    // BM25's length normalization.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -508,8 +565,9 @@ async fn top_k_heap_picks_highest_scores() {
 
     // There are 90 matches (3/4 * 120), with 3 distinct score levels
     assert_eq!(all.stats.rows_matched, 90);
-    let best_score = all.matches[0].score.unwrap();
-    let worst_score = all.matches.last().unwrap().score.unwrap();
+    let all_scores = extract_scores(&all.batches);
+    let best_score = all_scores[0];
+    let worst_score = *all_scores.last().unwrap();
     assert!(
         best_score > worst_score,
         "scores should differ: best={best_score}, worst={worst_score}"
@@ -530,25 +588,24 @@ async fn top_k_heap_picks_highest_scores() {
     .await
     .unwrap();
 
-    assert_eq!(top5.matches.len(), 5);
+    let top5_rows = total_rows(&top5.batches);
+    assert_eq!(top5_rows, 5);
     // All top-5 should have the best possible score (short "error" docs)
-    for m in &top5.matches {
+    let top5_scores = extract_scores(&top5.batches);
+    for s in &top5_scores {
         assert_eq!(
-            m.score.unwrap(),
-            best_score,
+            *s, best_score,
             "top-K should only contain highest-scored rows"
         );
     }
     // Sorted descending
-    for w in top5.matches.windows(2) {
-        assert!(w[0].score.unwrap() >= w[1].score.unwrap());
+    for w in top5_scores.windows(2) {
+        assert!(w[0] >= w[1]);
     }
 }
 
 #[tokio::test]
 async fn single_term_query_correctness() {
-    // Single-term queries exercise the fast path that skips HashSet.
-    // Verify exact match count and that AND/OR produce identical results.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -602,19 +659,17 @@ async fn single_term_query_correctness() {
     // Exactly 2/3 of 60 = 40
     assert_eq!(result_and.stats.rows_matched, 40);
     // All matched text should contain "alpha"
-    for m in &result_and.matches {
+    let texts = extract_texts(&result_and.batches);
+    for t in &texts {
         assert!(
-            m.text.contains("alpha"),
-            "matched row should contain 'alpha': {}",
-            m.text
+            t.contains("alpha"),
+            "matched row should contain 'alpha': {t}",
         );
     }
 }
 
 #[tokio::test]
 async fn segment_pruning_skips_irrelevant_segments() {
-    // Two segments with non-overlapping term ranges.
-    // Query for a term in one should not scan the other.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -668,7 +723,6 @@ async fn segment_pruning_skips_irrelevant_segments() {
 
 #[tokio::test]
 async fn segment_pruning_boundary_term_not_pruned() {
-    // A query term that exactly equals min_term or max_term should NOT be pruned.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -729,9 +783,6 @@ async fn segment_pruning_boundary_term_not_pruned() {
 
 #[tokio::test]
 async fn brute_force_matches_indexed_results() {
-    // Upload two identical files with the same content.
-    // Index only one. Query should find the same matches from both
-    // (indexed path for file A, brute-force for file B).
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -753,12 +804,9 @@ async fn brute_force_matches_indexed_results() {
     .unwrap();
 
     // Upload file B with same content but DON'T index it.
-    // It becomes part of data_files (via the manifest list) but has no
-    // manifest entry for "description" — so it's un-indexed.
     let file_b = upload_test_parquet(store.as_ref(), "data/b.parquet", 20, 10, descs).await;
 
     // Manually add file B to the data_files of a new manifest list
-    // (simulates a new append that hasn't been indexed yet for this column)
     let current = read_current(store.as_ref(), &base).await.unwrap();
     let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
 
@@ -770,7 +818,7 @@ async fn brute_force_matches_indexed_results() {
             file_size_bytes: 0,
             row_count: 20,
         }],
-        manifests: vec![], // No manifests — file is un-indexed
+        manifests: vec![],
         replaces: None,
         compacted_column: None,
     };
@@ -814,28 +862,18 @@ async fn brute_force_matches_indexed_results() {
         "should find matches from both indexed and un-indexed files"
     );
 
-    // Verify matches come from both files
-    let files: HashSet<&str> = result.matches.iter().map(|m| m.file.as_str()).collect();
-    assert!(files.contains("data/a.parquet"), "should have indexed file");
-    assert!(
-        files.contains("data/b.parquet"),
-        "should have brute-force file"
-    );
-
     // All matched text should contain "error"
-    for m in &result.matches {
+    let texts = extract_texts(&result.batches);
+    for t in &texts {
         assert!(
-            m.text.contains("error"),
-            "matched row should contain 'error': {}",
-            m.text
+            t.contains("error"),
+            "matched row should contain 'error': {t}",
         );
     }
 }
 
 #[tokio::test]
 async fn fully_indexed_and_fully_unindexed_same_results() {
-    // Same data, query both ways: fully indexed vs fully un-indexed.
-    // Match counts should be identical.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
@@ -850,7 +888,6 @@ async fn fully_indexed_and_fully_unindexed_same_results() {
     let file_path = upload_test_parquet(store.as_ref(), "data/test.parquet", 30, 10, descs).await;
 
     // First: query with no index at all (file is un-indexed).
-    // Add file to data_files without any manifest.
     let ml = lakesearch_core::metadata::ManifestList {
         job_kind: lakesearch_core::metadata::JobKind::Append,
         batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
@@ -927,15 +964,12 @@ async fn fully_indexed_and_fully_unindexed_same_results() {
 
 #[tokio::test]
 async fn brute_force_case_insensitive() {
-    // Un-indexed file with mixed-case text. Query in lowercase should match
-    // because the tokenizer lowercases and the pre-filter must be case-insensitive.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
 
     create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    // Upload file with mixed-case descriptions — NOT indexed
     let file_path = upload_test_parquet(
         store.as_ref(),
         "data/mixed_case.parquet",
@@ -979,7 +1013,6 @@ async fn brute_force_case_insensitive() {
     .await
     .unwrap();
 
-    // Query lowercase "error" — should match mixed-case "Error"
     let result = run_query(
         &store,
         &base,
@@ -999,28 +1032,24 @@ async fn brute_force_case_insensitive() {
         result.stats.rows_matched, 10,
         "case-insensitive pre-filter should match mixed-case text"
     );
-    for m in &result.matches {
-        let lower = m.text.to_lowercase();
+    let texts = extract_texts(&result.batches);
+    for t in &texts {
+        let lower = t.to_lowercase();
         assert!(
             lower.contains("error"),
-            "matched row should contain 'error': {}",
-            m.text
+            "matched row should contain 'error': {t}",
         );
     }
 }
 
 #[tokio::test]
 async fn brute_force_early_termination_with_limit() {
-    // With a small limit on an unscored brute-force query, the scan should
-    // stop early — rows_scanned should be less than total rows.
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
     let base = Path::from("table");
     let runtime = LakeRuntime::new(2);
 
     create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    // Create with multiple small row groups so early termination can
-    // kick in between them. 4 row groups × 25 rows = 100 rows.
     let file_path = {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
@@ -1104,11 +1133,278 @@ async fn brute_force_early_termination_with_limit() {
     .await
     .unwrap();
 
-    assert_eq!(result.matches.len(), 3, "should return exactly 3 matches");
+    let rows = total_rows(&result.batches);
+    assert_eq!(rows, 3, "should return exactly 3 matches");
     // Early termination: should NOT have scanned all 100 rows
     assert!(
         result.stats.rows_scanned < 100,
         "should stop early, scanned {} of 100",
         result.stats.rows_scanned
     );
+}
+
+// --- Pipeline-specific tests ---
+
+#[tokio::test]
+async fn coalescer_merges_small_batches() {
+    // With many small pages, the pipeline produces many tiny batches.
+    // The coalescer should merge them into fewer, larger ones.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // 500 rows, 10 rows per page → ~50 pages → many small batches
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/coalesce.parquet",
+        500,
+        10,
+        &["hello world"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.rows_matched, 500);
+    // Without coalescing, we'd get dozens of tiny batches (one per parquet
+    // page batch). The coalescer should merge them into very few.
+    assert!(
+        result.batches.len() <= 3,
+        "coalescer should merge small batches, got {} batches",
+        result.batches.len()
+    );
+    // Each batch should have a substantial number of rows
+    for batch in &result.batches {
+        assert!(
+            batch.num_rows() > 10,
+            "coalesced batch should be larger than a single page, got {} rows",
+            batch.num_rows()
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidate_pages_tracked_in_stats() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // 100 rows, 25 per page → 4 pages per row group
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/pages.parquet",
+        100,
+        25,
+        &[
+            "error timeout connection",
+            "success response ok",
+            "error connection reset",
+            "warning slow query",
+        ],
+    )
+    .await;
+
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // "error" appears in 2/4 descriptions → candidate pages should be >0
+    // but less than total pages (pruning eliminated some)
+    assert!(
+        result.stats.candidate_pages > 0,
+        "indexed query should report candidate_pages"
+    );
+    assert!(
+        result.stats.candidate_pages <= 4,
+        "candidate_pages should not exceed total pages, got {}",
+        result.stats.candidate_pages
+    );
+    assert_eq!(result.stats.rows_matched, 50);
+}
+
+#[tokio::test]
+async fn concurrent_indexed_files_through_pipeline() {
+    // Three separately indexed files exercising concurrent I/O producers.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_a = upload_test_parquet(
+        store.as_ref(),
+        "data/a.parquet",
+        30,
+        10,
+        &["alpha bravo charlie"],
+    )
+    .await;
+    run_index(&store, &base, &[file_a], "description", &runtime)
+        .await
+        .unwrap();
+
+    let file_b = upload_test_parquet(
+        store.as_ref(),
+        "data/b.parquet",
+        30,
+        10,
+        &["alpha delta echo"],
+    )
+    .await;
+    run_index(&store, &base, &[file_b], "description", &runtime)
+        .await
+        .unwrap();
+
+    let file_c = upload_test_parquet(
+        store.as_ref(),
+        "data/c.parquet",
+        30,
+        10,
+        &["foxtrot golf hotel"],
+    )
+    .await;
+    run_index(&store, &base, &[file_c], "description", &runtime)
+        .await
+        .unwrap();
+
+    // "alpha" is in files A and B but not C → 60 matches
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "alpha",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.stats.rows_matched, 60,
+        "should find matches from both files containing 'alpha'"
+    );
+    assert!(
+        result.stats.candidate_pages > 0,
+        "should have candidate pages from indexed segments"
+    );
+
+    // "foxtrot" is only in file C → 30 matches
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "foxtrot",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.rows_matched, 30);
+}
+
+#[tokio::test]
+async fn streaming_query_returns_all_results() {
+    // Test the run_query (streaming) path directly, not just run_query_collected.
+    use futures::TryStreamExt;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/stream.parquet",
+        60,
+        20,
+        &["hello world", "goodbye world", "hello there"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let cache = Arc::new(ObjectCache::new(Arc::clone(&store)));
+    let stream = query::run_query(
+        cache,
+        base,
+        "description".to_owned(),
+        "hello",
+        Operator::Or,
+        lakesearch_query::ScoreMode::None,
+        None,
+        vec![],
+        8,
+        64,
+        Arc::new(LakeRuntime::new(2)),
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let rows = total_rows(&batches);
+    // "hello" appears in 2/3 descriptions → 40 matches
+    assert_eq!(rows, 40, "streaming path should return all matched rows");
+    let texts = extract_texts(&batches);
+    for t in &texts {
+        assert!(
+            t.contains("hello"),
+            "matched row should contain 'hello': {t}"
+        );
+    }
 }

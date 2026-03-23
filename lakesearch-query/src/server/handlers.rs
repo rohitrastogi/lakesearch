@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use arrow::record_batch::RecordBatch;
 use axum::extract::{Path, State};
 use axum::Json;
 
@@ -15,6 +16,24 @@ fn active_column_names(columns: &[IndexedColumn]) -> Vec<String> {
         .filter(|c| c.status != ColumnStatus::Dropped)
         .map(|c| c.name.clone())
         .collect()
+}
+
+/// Converts `RecordBatch`es to JSON row maps using `arrow_json::ArrayWriter`.
+fn batches_to_json_rows(
+    batches: &[RecordBatch],
+) -> Result<Vec<serde_json::Map<String, serde_json::Value>>, anyhow::Error> {
+    if batches.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
+        writer.write_batches(&batch_refs)?;
+        writer.finish()?;
+    }
+    let rows: Vec<serde_json::Map<String, serde_json::Value>> = serde_json::from_slice(&buf)?;
+    Ok(rows)
 }
 
 pub async fn health() -> Json<HealthResponse> {
@@ -62,14 +81,12 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, ApiError> {
     let start = std::time::Instant::now();
 
-    // Single lookup: get cache, base path, and metadata together
     let (object_cache, base, meta) = state
         .cache
         .get_table_state(&table_name)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
 
-    // Validate column exists and is active
     meta.indexed_columns
         .iter()
         .find(|c| c.name == req.search.column && c.status != ColumnStatus::Dropped)
@@ -80,11 +97,10 @@ pub async fn search(
             ))
         })?;
 
-    // Execute query with timeout
     let operator: crate::Operator = req.search.operator.into();
     let result = tokio::time::timeout(
         state.config.query_timeout(),
-        crate::query::run_query(
+        crate::query::run_query_collected(
             object_cache,
             base,
             req.search.column.clone(),
@@ -94,6 +110,7 @@ pub async fn search(
             req.limit,
             req.select.clone(),
             state.config.io_concurrency,
+            state.config.max_io_tasks,
             Arc::clone(&state.runtime),
         ),
     )
@@ -103,8 +120,10 @@ pub async fn search(
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
+    let json_rows = batches_to_json_rows(&result.batches).map_err(ApiError::Internal)?;
+
     Ok(Json(SearchResponse {
-        rows: result.matches,
+        rows: json_rows,
         stats: SearchStats {
             candidate_pages: result.stats.candidate_pages,
             rows_scanned: result.stats.rows_scanned,
