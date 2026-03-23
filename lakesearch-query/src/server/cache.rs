@@ -75,13 +75,18 @@ impl MetadataCache {
             .map(|s| Arc::clone(&s.metadata))
     }
 
-    /// Returns the shared object cache and base path for a table.
-    pub async fn get_cache(&self, name: &str) -> Option<(Arc<ObjectCache>, Path)> {
-        self.tables
-            .read()
-            .await
-            .get(name)
-            .map(|s| (Arc::clone(&s.object_cache), s.base.clone()))
+    /// Returns the object cache, base path, and metadata for a table in one lookup.
+    pub async fn get_table_state(
+        &self,
+        name: &str,
+    ) -> Option<(Arc<ObjectCache>, Path, Arc<Metadata>)> {
+        self.tables.read().await.get(name).map(|s| {
+            (
+                Arc::clone(&s.object_cache),
+                s.base.clone(),
+                Arc::clone(&s.metadata),
+            )
+        })
     }
 
     /// Returns names of all registered tables.
@@ -103,11 +108,15 @@ impl MetadataCache {
 
     async fn refresh_all(&self) {
         let names: Vec<String> = self.tables.read().await.keys().cloned().collect();
-        for name in names {
-            if let Err(e) = self.refresh_one(&name).await {
-                warn!(table = %name, error = %e, "failed to refresh metadata");
-            }
-        }
+        let futs: Vec<_> = names
+            .iter()
+            .map(|name| async move {
+                if let Err(e) = self.refresh_one(name).await {
+                    warn!(table = %name, error = %e, "failed to refresh metadata");
+                }
+            })
+            .collect();
+        futures::future::join_all(futs).await;
     }
 
     async fn refresh_one(&self, name: &str) -> Result<()> {

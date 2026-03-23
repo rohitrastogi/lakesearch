@@ -3,11 +3,19 @@ use std::sync::Arc;
 use axum::extract::{Path, State};
 use axum::Json;
 
-use lakesearch_core::metadata::ColumnStatus;
+use lakesearch_core::metadata::{ColumnStatus, IndexedColumn};
 
 use super::api_types::*;
 use super::error::ApiError;
 use super::state::AppState;
+
+fn active_column_names(columns: &[IndexedColumn]) -> Vec<String> {
+    columns
+        .iter()
+        .filter(|c| c.status != ColumnStatus::Dropped)
+        .map(|c| c.name.clone())
+        .collect()
+}
 
 pub async fn health() -> Json<HealthResponse> {
     Json(HealthResponse {
@@ -23,12 +31,7 @@ pub async fn list_tables(State(state): State<AppState>) -> Json<ListTablesRespon
             tables.push(TableInfo {
                 name,
                 location: meta.location.clone(),
-                indexed_columns: meta
-                    .indexed_columns
-                    .iter()
-                    .filter(|c| c.status != ColumnStatus::Dropped)
-                    .map(|c| c.name.clone())
-                    .collect(),
+                indexed_columns: active_column_names(&meta.indexed_columns),
             });
         }
     }
@@ -48,12 +51,7 @@ pub async fn get_table(
     Ok(Json(TableInfo {
         name: table_name,
         location: meta.location.clone(),
-        indexed_columns: meta
-            .indexed_columns
-            .iter()
-            .filter(|c| c.status != ColumnStatus::Dropped)
-            .map(|c| c.name.clone())
-            .collect(),
+        indexed_columns: active_column_names(&meta.indexed_columns),
     }))
 }
 
@@ -64,22 +62,15 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, ApiError> {
     let start = std::time::Instant::now();
 
-    // Look up table — get the shared object cache (persists across queries)
-    let (object_cache, base) = state
+    // Single lookup: get cache, base path, and metadata together
+    let (object_cache, base, meta) = state
         .cache
-        .get_cache(&table_name)
+        .get_table_state(&table_name)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
 
-    // Validate column exists
-    let meta = state
-        .cache
-        .get_metadata(&table_name)
-        .await
-        .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
-
-    let _col = meta
-        .indexed_columns
+    // Validate column exists and is active
+    meta.indexed_columns
         .iter()
         .find(|c| c.name == req.search.column && c.status != ColumnStatus::Dropped)
         .ok_or_else(|| {

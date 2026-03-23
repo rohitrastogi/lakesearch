@@ -240,16 +240,23 @@ fn should_prune_segment(
 // ---------------------------------------------------------------------------
 
 /// Looks up posting lists for each query term and combines them with boolean
-/// ops. Returns candidate doc_ids (page-level, may contain false positives).
+/// ops. For AND queries, terms are sorted by doc_frequency (rarest first) so
+/// the smallest posting list drives the intersection, reducing intermediate
+/// sizes and downstream work.
 fn evaluate_segment(
     reader: &SegmentReader,
     query_terms: &[String],
     operator: Operator,
 ) -> Result<Vec<DocId>> {
-    let mut posting_lists: Vec<Vec<DocId>> = Vec::new();
+    // Collect (doc_frequency, posting_list) per term
+    let mut entries: Vec<(u32, Vec<DocId>)> = Vec::new();
     for term in query_terms {
-        match reader.search_term(term)? {
-            Some(postings) => posting_lists.push(postings),
+        match reader.term_ordinal(term) {
+            Some(ord) => {
+                let info = reader.term_info(ord)?;
+                let postings = reader.posting_list(ord)?;
+                entries.push((info.doc_frequency, postings));
+            }
             None => {
                 if operator == Operator::And {
                     return Ok(vec![]);
@@ -258,12 +265,18 @@ fn evaluate_segment(
         }
     }
 
-    if posting_lists.is_empty() {
+    if entries.is_empty() {
         return Ok(vec![]);
     }
 
-    let mut combined = posting_lists[0].clone();
-    for postings in &posting_lists[1..] {
+    // For AND: sort by doc_frequency ascending (rarest first) to minimize
+    // intermediate result sizes during intersection.
+    if operator == Operator::And {
+        entries.sort_by_key(|(df, _)| *df);
+    }
+
+    let mut combined = entries.swap_remove(0).1;
+    for (_, postings) in &entries {
         combined = match operator {
             Operator::And => boolean::intersect(&combined, postings),
             Operator::Or => boolean::union(&combined, postings),
@@ -575,10 +588,14 @@ fn verify_and_score(
 
             let score = if with_score {
                 let dl = tokens.len() as u32;
+                // Build frequency map once per row instead of scanning per term
+                let mut freq: HashMap<&str, u32> = HashMap::new();
+                for t in &tokens {
+                    *freq.entry(t.as_str()).or_default() += 1;
+                }
                 let mut total_score = 0.0;
                 for (term, df) in term_infos {
-                    let tf = tokens.iter().filter(|t| *t == term).count() as u32;
-                    if tf > 0 {
+                    if let Some(&tf) = freq.get(term.as_str()) {
                         total_score += bm25::score(tf, dl, avg_dl, *df as u64, total_rows);
                     }
                 }
