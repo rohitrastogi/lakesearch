@@ -397,18 +397,21 @@ async fn fetch_and_verify(
         }
     }
 
-    // Scoring context
+    // Scoring context — Arc-wrap shared data to avoid deep-cloning per row group
     let corpus_stats = reader.corpus_stats();
     let avg_dl = bm25::avg_dl(corpus_stats.total_tokens, corpus_stats.total_rows);
-    let term_infos: Vec<(String, u32)> = query_terms
-        .iter()
-        .filter_map(|t| {
-            reader.term_ordinal(t).map(|ord| {
-                let info = reader.term_info(ord).expect("valid ordinal from FST");
-                (t.clone(), info.doc_frequency)
+    let qt_arc: Arc<Vec<String>> = Arc::new(query_terms.to_vec());
+    let ti_arc: Arc<Vec<(String, u32)>> = Arc::new(
+        query_terms
+            .iter()
+            .filter_map(|t| {
+                reader.term_ordinal(t).map(|ord| {
+                    let info = reader.term_info(ord).expect("valid ordinal from FST");
+                    (t.clone(), info.doc_frequency)
+                })
             })
-        })
-        .collect();
+            .collect(),
+    );
 
     let file_table = reader.file_table();
 
@@ -466,9 +469,9 @@ async fn fetch_and_verify(
             })
             .unwrap_or(false);
 
-        // CPU: verify and score
-        let qt = query_terms.to_vec();
-        let ti = term_infos.clone();
+        // CPU: verify and score (Arc::clone is a pointer bump, not a deep copy)
+        let qt = Arc::clone(&qt_arc);
+        let ti = Arc::clone(&ti_arc);
         let fp = file_path.clone();
         let rg = *rg_idx;
         let scm = projection.select_col_map.clone();
@@ -575,6 +578,10 @@ async fn brute_force_scan(
     let mut all_matches = Vec::new();
     let mut stats = QueryStats::default();
 
+    // Arc-wrap shared read-only data to avoid deep-cloning per row group
+    let qt_arc: Arc<Vec<String>> = Arc::new(query_terms.to_vec());
+    let ti_arc: Arc<Vec<(String, u32)>> = Arc::new(agg_term_infos.to_vec());
+
     for file_path in files {
         let pq_meta = cache.get_parquet_metadata(file_path).await?;
 
@@ -607,8 +614,8 @@ async fn brute_force_scan(
                 .unwrap_or(false);
 
             // CPU: pre-filter with arrow ilike, then tokenize+verify candidates
-            let qt = query_terms.to_vec();
-            let ti = agg_term_infos.to_vec();
+            let qt = Arc::clone(&qt_arc);
+            let ti = Arc::clone(&ti_arc);
             let fp = file_path.clone();
             let rg = rg_idx as u16;
             let scm = projection.select_col_map.clone();
