@@ -1141,3 +1141,268 @@ async fn brute_force_early_termination_with_limit() {
         result.stats.rows_scanned
     );
 }
+
+// --- Pipeline-specific tests ---
+
+#[tokio::test]
+async fn coalescer_merges_small_batches() {
+    // With many small pages, the pipeline produces many tiny batches.
+    // The coalescer should merge them into fewer, larger ones.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // 500 rows, 10 rows per page → ~50 pages → many small batches
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/coalesce.parquet",
+        500,
+        10,
+        &["hello world"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.rows_matched, 500);
+    // Without coalescing, we'd get dozens of tiny batches (one per parquet
+    // page batch). The coalescer should merge them into very few.
+    assert!(
+        result.batches.len() <= 3,
+        "coalescer should merge small batches, got {} batches",
+        result.batches.len()
+    );
+    // Each batch should have a substantial number of rows
+    for batch in &result.batches {
+        assert!(
+            batch.num_rows() > 10,
+            "coalesced batch should be larger than a single page, got {} rows",
+            batch.num_rows()
+        );
+    }
+}
+
+#[tokio::test]
+async fn candidate_pages_tracked_in_stats() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // 100 rows, 25 per page → 4 pages per row group
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/pages.parquet",
+        100,
+        25,
+        &[
+            "error timeout connection",
+            "success response ok",
+            "error connection reset",
+            "warning slow query",
+        ],
+    )
+    .await;
+
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // "error" appears in 2/4 descriptions → candidate pages should be >0
+    // but less than total pages (pruning eliminated some)
+    assert!(
+        result.stats.candidate_pages > 0,
+        "indexed query should report candidate_pages"
+    );
+    assert!(
+        result.stats.candidate_pages <= 4,
+        "candidate_pages should not exceed total pages, got {}",
+        result.stats.candidate_pages
+    );
+    assert_eq!(result.stats.rows_matched, 50);
+}
+
+#[tokio::test]
+async fn concurrent_indexed_files_through_pipeline() {
+    // Three separately indexed files exercising concurrent I/O producers.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_a = upload_test_parquet(
+        store.as_ref(),
+        "data/a.parquet",
+        30,
+        10,
+        &["alpha bravo charlie"],
+    )
+    .await;
+    run_index(&store, &base, &[file_a], "description", &runtime)
+        .await
+        .unwrap();
+
+    let file_b = upload_test_parquet(
+        store.as_ref(),
+        "data/b.parquet",
+        30,
+        10,
+        &["alpha delta echo"],
+    )
+    .await;
+    run_index(&store, &base, &[file_b], "description", &runtime)
+        .await
+        .unwrap();
+
+    let file_c = upload_test_parquet(
+        store.as_ref(),
+        "data/c.parquet",
+        30,
+        10,
+        &["foxtrot golf hotel"],
+    )
+    .await;
+    run_index(&store, &base, &[file_c], "description", &runtime)
+        .await
+        .unwrap();
+
+    // "alpha" is in files A and B but not C → 60 matches
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "alpha",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.stats.rows_matched, 60,
+        "should find matches from both files containing 'alpha'"
+    );
+    assert!(
+        result.stats.candidate_pages > 0,
+        "should have candidate pages from indexed segments"
+    );
+
+    // "foxtrot" is only in file C → 30 matches
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "foxtrot",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.stats.rows_matched, 30);
+}
+
+#[tokio::test]
+async fn streaming_query_returns_all_results() {
+    // Test the run_query (streaming) path directly, not just run_query_collected.
+    use futures::TryStreamExt;
+
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/stream.parquet",
+        60,
+        20,
+        &["hello world", "goodbye world", "hello there"],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let cache = Arc::new(ObjectCache::new(Arc::clone(&store)));
+    let (stream, _stats) = query::run_query(
+        cache,
+        base,
+        "description".to_owned(),
+        "hello",
+        Operator::Or,
+        lakesearch_query::ScoreMode::None,
+        None,
+        vec![],
+        8,
+        Arc::new(LakeRuntime::new(2)),
+    )
+    .await
+    .unwrap();
+
+    let batches: Vec<RecordBatch> = stream.try_collect().await.unwrap();
+    let rows = total_rows(&batches);
+    // "hello" appears in 2/3 descriptions → 40 matches
+    assert_eq!(rows, 40, "streaming path should return all matched rows");
+    let texts = extract_texts(&batches);
+    for t in &texts {
+        assert!(
+            t.contains("hello"),
+            "matched row should contain 'hello': {t}"
+        );
+    }
+}
