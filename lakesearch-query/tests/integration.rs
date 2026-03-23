@@ -828,9 +828,15 @@ async fn brute_force_matches_indexed_results() {
 
     // Upload file A and index it
     let file_a = upload_test_parquet(store.as_ref(), "data/a.parquet", 20, 10, descs).await;
-    run_index(&store, &base, std::slice::from_ref(&file_a), "description", &runtime)
-        .await
-        .unwrap();
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_a),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
 
     // Upload file B with same content but DON'T index it.
     // It becomes part of data_files (via the manifest list) but has no
@@ -1003,4 +1009,88 @@ async fn fully_indexed_and_fully_unindexed_same_results() {
         "brute-force ({}) and indexed ({}) should find same match count",
         brute_result.stats.rows_matched, indexed_result.stats.rows_matched
     );
+}
+
+#[tokio::test]
+async fn brute_force_case_insensitive() {
+    // Un-indexed file with mixed-case text. Query in lowercase should match
+    // because the tokenizer lowercases and the pre-filter must be case-insensitive.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // Upload file with mixed-case descriptions — NOT indexed
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/mixed_case.parquet",
+        20,
+        10,
+        &["Error Timeout CONNECTION", "Success Response OK"],
+    )
+    .await;
+
+    // Add to data_files without indexing
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    let ml = lakesearch_core::metadata::ManifestList {
+        job_kind: lakesearch_core::metadata::JobKind::Append,
+        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        data_files: vec![lakesearch_core::metadata::DataFileEntry {
+            path: file_path.clone(),
+            file_size_bytes: 0,
+            row_count: 20,
+        }],
+        manifests: vec![],
+        replaces: None,
+        compacted_column: None,
+    };
+    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+        .await
+        .unwrap();
+    meta.snapshot.manifest_lists.push(ml_path);
+    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+        .await
+        .unwrap();
+    let pointer = lakesearch_core::metadata::CurrentPointer {
+        metadata_path: meta_path,
+        updated_at: "now".to_owned(),
+    };
+    lakesearch_query::storage::write_json(
+        store.as_ref(),
+        &base.child("metadata").child("current.json"),
+        &pointer,
+    )
+    .await
+    .unwrap();
+
+    // Query lowercase "error" — should match mixed-case "Error"
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // 1/2 descriptions contain "error" (case-insensitive) → 10 matches
+    assert_eq!(
+        result.stats.rows_matched, 10,
+        "case-insensitive pre-filter should match mixed-case text"
+    );
+    for m in &result.matches {
+        let lower = m.text.to_lowercase();
+        assert!(
+            lower.contains("error"),
+            "matched row should contain 'error': {}",
+            m.text
+        );
+    }
 }

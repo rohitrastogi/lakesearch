@@ -30,8 +30,7 @@ use arrow::compute;
 
 use crate::object_cache::ObjectCache;
 use crate::parquet_util::{
-    arrow_value_to_json, build_row_selection, read_parquet_batches_async, string_value,
-    validate_column,
+    arrow_value_to_json, build_row_selection, find_column, read_parquet_batches_async, string_value,
 };
 use crate::storage::{read_current, read_metadata};
 use crate::Operator;
@@ -541,7 +540,7 @@ fn resolve_projection(
     column: &str,
     select_columns: &[String],
 ) -> Result<Projection> {
-    let indexed_leaf = validate_column(pq_meta, column)
+    let indexed_leaf = find_column(pq_meta, column)
         .with_context(|| format!("resolving indexed column '{column}'"))?;
 
     let mut select_leaves: Vec<(usize, String)> = Vec::new();
@@ -549,7 +548,7 @@ fn resolve_projection(
         if sel == column {
             continue;
         }
-        let leaf = validate_column(pq_meta, sel)
+        let leaf = find_column(pq_meta, sel)
             .with_context(|| format!("resolving select column '{sel}'"))?;
         select_leaves.push((leaf, sel.clone()));
     }
@@ -603,10 +602,14 @@ async fn brute_force_scan(
 
     for file_path in files {
         let pq_meta = cache.get_parquet_metadata(file_path).await?;
-        validate_column(&pq_meta, column)
-            .with_context(|| format!("brute-force: column '{column}' in '{file_path}'"))?;
 
-        // Resolve projection (indexed column + select columns)
+        // Brute-force reads don't need offset_index (no RowSelection).
+        // Skip files that don't have the target column rather than erroring.
+        if find_column(&pq_meta, column).is_err() {
+            tracing::warn!(file = %file_path, column, "skipping file: column not found");
+            continue;
+        }
+
         let projection = resolve_projection(&pq_meta, column, select_columns)?;
 
         for rg_idx in 0..pq_meta.num_row_groups() {
@@ -680,12 +683,16 @@ fn brute_force_verify(
     for batch in batches {
         let col = batch.column(indexed_batch_col);
 
-        // Arrow pre-filter: for each query term, check substring containment
+        // Arrow pre-filter: case-insensitive substring check via ILIKE.
+        // Query terms are already lowercased by the tokenizer. Using ilike
+        // with %term% handles mixed-case input and works with both Utf8
+        // and LargeUtf8 columns.
         let term_masks: Vec<BooleanArray> = query_terms
             .iter()
             .filter_map(|term| {
-                let scalar = Scalar::new(StringArray::from(vec![term.as_str()]));
-                arrow::compute::kernels::comparison::contains(col, &scalar).ok()
+                let pattern = format!("%{term}%");
+                let scalar = Scalar::new(StringArray::from(vec![pattern.as_str()]));
+                arrow::compute::kernels::comparison::ilike(col, &scalar).ok()
             })
             .collect();
 

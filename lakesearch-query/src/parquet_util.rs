@@ -43,16 +43,9 @@ pub struct PageInventory {
     pub pages: Vec<Vec<RowGroupPages>>,
 }
 
-/// Validates that the Parquet file has offset_index and the target column
-/// exists. Returns the leaf column index in the parquet schema.
-pub fn validate_column(metadata: &ParquetMetaData, column: &str) -> Result<usize> {
-    if metadata.offset_index().is_none() {
-        bail!(
-            "Parquet file lacks offset_index (page locations). \
-             Rewrite with page_index enabled."
-        );
-    }
-
+/// Finds a column's leaf index in the parquet schema. Does not require
+/// offset_index — suitable for brute-force reads that don't use RowSelection.
+pub fn find_column(metadata: &ParquetMetaData, column: &str) -> Result<usize> {
     let schema_descr = metadata.file_metadata().schema_descr();
     schema_descr
         .columns()
@@ -62,6 +55,20 @@ pub fn validate_column(metadata: &ParquetMetaData, column: &str) -> Result<usize
             let names: Vec<&str> = schema_descr.columns().iter().map(|c| c.name()).collect();
             format!("column '{column}' not found. Available: {names:?}")
         })
+}
+
+/// Validates that the Parquet file has offset_index and the target column
+/// exists. Returns the leaf column index. Required for indexed reads that
+/// use RowSelection (page-level reads depend on offset_index for
+/// first_row_index boundaries).
+pub fn validate_column(metadata: &ParquetMetaData, column: &str) -> Result<usize> {
+    if metadata.offset_index().is_none() {
+        bail!(
+            "Parquet file lacks offset_index (page locations). \
+             Rewrite with page_index enabled."
+        );
+    }
+    find_column(metadata, column)
 }
 
 /// Validates that the arrow schema column is Utf8 or LargeUtf8.
