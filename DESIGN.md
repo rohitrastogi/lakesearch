@@ -1177,31 +1177,34 @@ compaction and dropped columns.
 
 GC runs periodically as part of the compaction service's loop:
 
-1. Read current metadata via `current.json`
-2. Walk all manifest lists → manifests → segments to build the live file set
-3. List files in the `segments/`, `manifests/`, and `manifest-lists/` prefixes
-4. Delete any file not in the live set **and** older than the GC grace period
+1. Read `current.json` and the last N metadata files (snapshot retention)
+2. For each retained metadata, walk manifest lists → manifests → segments
+   to build the **retained file set** (union across all retained snapshots)
+3. List files in `segments/`, `manifests/`, `manifest-lists/`, `metadata/`
+4. Delete any file not in the retained set
 
-The **grace period** must be longer than the maximum query execution time.
-This is the correctness link between GC and query timeouts: if a query can
-run for 10 minutes, GC must wait at least 10 minutes before deleting
-unreferenced files. Otherwise a long-running query that loaded an older
-metadata snapshot could try to read a segment file that GC already deleted.
+#### Snapshot Retention
 
-To make this guarantee enforceable, the query service enforces a hard
-**query timeout** (configurable, default 5 minutes). If a query exceeds
-this timeout, it is cancelled and returns a partial result or error. The
-GC grace period must be set to at least `query_timeout + indexer_upload_window`
-(e.g., query timeout of 5 minutes + 10 minutes for in-flight indexer uploads
-= 15 minute grace period).
+Queries pin a metadata snapshot at start. As long as that snapshot is
+retained by GC, all files it references are guaranteed to exist. GC
+never deletes files referenced by a retained snapshot.
 
-Both values are configurable:
-- `query_timeout`: set on the query service (default: 5 minutes)
-- `gc_grace_period`: set on the compactor (default: 30 minutes, must be >
-  `query_timeout`)
+Two configurable retention policies (both enforced, like Iceberg):
 
-Old metadata files (orphaned by CAS losers) are also cleaned up during GC,
-retaining the last few versions for debugging.
+- `min_snapshots_to_keep`: retain at least this many metadata files
+  (default: 10). Protects against burst compaction that rapidly produces
+  new snapshots.
+- `max_snapshot_age`: retain any metadata file younger than this duration
+  (default: 1 hour). Protects long-running queries.
+
+A metadata file is retained if it satisfies **either** policy. Files
+referenced only by expired snapshots are eligible for deletion.
+
+This eliminates the need for grace period coordination between the
+compactor and query service. The query service enforces a hard
+**query timeout** (configurable, default 5 minutes) to bound execution,
+but this is independent of GC — snapshot retention is what guarantees
+file availability.
 
 ---
 
