@@ -47,152 +47,170 @@ async fn reconcile_once(
 ) -> Result<()> {
     let tables = registry.list().await;
 
+    let mut tasks = futures::stream::FuturesUnordered::new();
     for table in tables {
-        let current = match storage::read_current(table.store.as_ref(), &table.base).await {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    table_id = %table.table_id,
-                    error = %e,
-                    "failed to read current.json, skipping"
-                );
-                continue;
-            }
+        tasks.push(reconcile_table(config, cascadq, table));
+    }
+
+    use futures::StreamExt;
+    while let Some(result) = tasks.next().await {
+        if let Err(e) = result {
+            error!(error = %e, "table reconciliation failed");
+        }
+    }
+
+    Ok(())
+}
+
+async fn reconcile_table(
+    config: &IngestConfig,
+    cascadq: &CascadqClient,
+    table: crate::registry::RegisteredTable,
+) -> Result<()> {
+    let current = match storage::read_current(table.store.as_ref(), &table.base).await {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                table_id = %table.table_id,
+                error = %e,
+                "failed to read current.json, skipping"
+            );
+            return Ok(());
+        }
+    };
+    let metadata = match storage::read_metadata(table.store.as_ref(), &current.value).await {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                table_id = %table.table_id,
+                error = %e,
+                "failed to read metadata, skipping"
+            );
+            return Ok(());
+        }
+    };
+
+    for col in &metadata.indexed_columns {
+        if col.status != ColumnStatus::Backfilling {
+            continue;
+        }
+        let backfill_lists = match &col.backfill_manifest_lists {
+            Some(lists) => lists,
+            None => continue,
         };
-        let metadata = match storage::read_metadata(table.store.as_ref(), &current.value).await {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    table_id = %table.table_id,
-                    error = %e,
-                    "failed to read metadata, skipping"
-                );
-                continue;
-            }
-        };
 
-        for col in &metadata.indexed_columns {
-            if col.status != ColumnStatus::Backfilling {
-                continue;
-            }
-            let backfill_lists = match &col.backfill_manifest_lists {
-                Some(lists) => lists,
-                None => continue,
-            };
-
-            // Empty snapshot (e.g. brand-new table) → nothing to backfill
-            if backfill_lists.is_empty() {
-                let column_name = col.name.clone();
-                info!(
-                    table_id = %table.table_id,
-                    column = %column_name,
-                    "empty backfill snapshot, transitioning to active"
-                );
-                if let Err(e) = transition_to_active(
-                    table.store.as_ref(),
-                    &table.base,
-                    current.e_tag.clone(),
-                    &metadata,
-                    &column_name,
-                )
-                .await
-                {
-                    warn!(
-                        table_id = %table.table_id,
-                        column = %col.name,
-                        error = %e,
-                        "failed to transition column to active"
-                    );
-                }
-                continue;
-            }
-
-            let uncovered = match find_uncovered_files(
+        // Empty snapshot (e.g. brand-new table) → nothing to backfill
+        if backfill_lists.is_empty() {
+            let column_name = col.name.clone();
+            info!(
+                table_id = %table.table_id,
+                column = %column_name,
+                "empty backfill snapshot, transitioning to active"
+            );
+            if let Err(e) = transition_to_active(
                 table.store.as_ref(),
+                &table.base,
+                current.e_tag.clone(),
                 &metadata,
-                &col.name,
-                backfill_lists,
-                config.io_concurrency,
+                &column_name,
             )
             .await
             {
-                Ok(u) => u,
-                Err(e) => {
-                    warn!(
-                        table_id = %table.table_id,
-                        column = %col.name,
-                        error = %e,
-                        "failed to find uncovered files"
-                    );
-                    continue;
-                }
-            };
-
-            if uncovered.uncovered.is_empty() {
-                let column_name = col.name.clone();
-                info!(
+                warn!(
                     table_id = %table.table_id,
-                    column = %column_name,
-                    "backfill complete, transitioning to active"
+                    column = %col.name,
+                    error = %e,
+                    "failed to transition column to active"
                 );
-                if let Err(e) = transition_to_active(
-                    table.store.as_ref(),
-                    &table.base,
-                    current.e_tag.clone(),
-                    &metadata,
-                    &column_name,
-                )
-                .await
-                {
-                    warn!(
-                        table_id = %table.table_id,
-                        column = %col.name,
-                        error = %e,
-                        "failed to transition column to active"
-                    );
-                }
+            }
+            continue;
+        }
+
+        let uncovered = match find_uncovered_files(
+            table.store.as_ref(),
+            &metadata,
+            &col.name,
+            backfill_lists,
+            config.io_concurrency,
+        )
+        .await
+        {
+            Ok(u) => u,
+            Err(e) => {
+                warn!(
+                    table_id = %table.table_id,
+                    column = %col.name,
+                    error = %e,
+                    "failed to find uncovered files"
+                );
                 continue;
             }
+        };
 
-            // Push one chunk of uncovered files
-            let chunk: Vec<String> = uncovered
-                .uncovered
-                .into_iter()
-                .take(config.backfill_chunk_size)
-                .collect();
+        if uncovered.uncovered.is_empty() {
+            let column_name = col.name.clone();
+            info!(
+                table_id = %table.table_id,
+                column = %column_name,
+                "backfill complete, transitioning to active"
+            );
+            if let Err(e) = transition_to_active(
+                table.store.as_ref(),
+                &table.base,
+                current.e_tag.clone(),
+                &metadata,
+                &column_name,
+            )
+            .await
+            {
+                warn!(
+                    table_id = %table.table_id,
+                    column = %col.name,
+                    error = %e,
+                    "failed to transition column to active"
+                );
+            }
+            continue;
+        }
 
-            let payload = IndexTaskPayload {
-                table_location: table.location.clone(),
-                files: chunk.clone(),
-                column: col.name.clone(),
-            };
+        // Push one chunk of uncovered files
+        let chunk: Vec<String> = uncovered
+            .uncovered
+            .into_iter()
+            .take(config.backfill_chunk_size)
+            .collect();
 
-            let json_payload = match serde_json::to_value(&payload) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(error = %e, "failed to serialize backfill task payload");
-                    continue;
-                }
-            };
+        let payload = IndexTaskPayload {
+            table_location: table.location.clone(),
+            files: chunk.clone(),
+            column: col.name.clone(),
+        };
 
-            match cascadq.push(&table.queue, json_payload).await {
-                Ok(()) => {
-                    info!(
-                        table_id = %table.table_id,
-                        column = %col.name,
-                        files = chunk.len(),
-                        remaining = uncovered.total_files - uncovered.indexed_files - chunk.len(),
-                        "pushed backfill chunk"
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        table_id = %table.table_id,
-                        column = %col.name,
-                        error = %e,
-                        "failed to push backfill chunk to cascadq"
-                    );
-                }
+        let json_payload = match serde_json::to_value(&payload) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(error = %e, "failed to serialize backfill task payload");
+                continue;
+            }
+        };
+
+        match cascadq.push(&table.queue, json_payload).await {
+            Ok(()) => {
+                info!(
+                    table_id = %table.table_id,
+                    column = %col.name,
+                    files = chunk.len(),
+                    remaining = uncovered.total_files - uncovered.indexed_files - chunk.len(),
+                    "pushed backfill chunk"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    table_id = %table.table_id,
+                    column = %col.name,
+                    error = %e,
+                    "failed to push backfill chunk to cascadq"
+                );
             }
         }
     }
