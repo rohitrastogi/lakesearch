@@ -1576,6 +1576,32 @@ dependencies = [
 ]
 
 [[package]]
+name = "lakesearch-compactor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "arrow",
+ "axum 0.8.8",
+ "bytes",
+ "chrono",
+ "clap",
+ "futures",
+ "lakesearch-core",
+ "lakesearch-indexer",
+ "lakesearch-query",
+ "object_store",
+ "parquet",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "lakesearch-core"
 version = "0.1.0"
 dependencies = [
@@ -1609,7 +1635,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
- "axum",
+ "axum 0.8.8",
  "bytes",
  "cascadq-client",
  "chrono",
