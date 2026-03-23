@@ -67,7 +67,7 @@ async fn reconcile_table(
     cascadq: &CascadqClient,
     table: TableInfo,
 ) -> Result<()> {
-    let current = match storage::read_current(table.store.as_ref(), &table.base).await {
+    let current = match storage::read_current(table.store.as_ref(), &table.index_base()).await {
         Ok(c) => c,
         Err(e) => {
             warn!(
@@ -109,7 +109,7 @@ async fn reconcile_table(
             );
             if let Err(e) = transition_to_active(
                 table.store.as_ref(),
-                &table.base,
+                &table.index_base(),
                 current.e_tag.clone(),
                 &metadata,
                 &column_name,
@@ -156,7 +156,7 @@ async fn reconcile_table(
             );
             if let Err(e) = transition_to_active(
                 table.store.as_ref(),
-                &table.base,
+                &table.index_base(),
                 current.e_tag.clone(),
                 &metadata,
                 &column_name,

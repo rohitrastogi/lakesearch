@@ -46,7 +46,8 @@ impl MetadataCache {
     pub async fn register_from_catalog(&self, catalog: &dyn CatalogClient) -> Result<()> {
         let tables = catalog.list_tables().await?;
         for table in tables {
-            self.register_with_store(&table.name, table.store, table.base)
+            let index_base = table.index_base();
+            self.register_with_store(&table.name, table.store, index_base)
                 .await?;
         }
         Ok(())

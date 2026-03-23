@@ -46,7 +46,7 @@ pub async fn create_table(
         .map_err(ApiError::Internal)?;
 
     // Check if index metadata already exists
-    if storage::current_exists(table.store.as_ref(), &table.base)
+    if storage::current_exists(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?
     {
@@ -81,7 +81,7 @@ pub async fn create_table(
         },
     };
 
-    let meta_path = storage::write_metadata(table.store.as_ref(), &table.base, &metadata)
+    let meta_path = storage::write_metadata(table.store.as_ref(), &table.index_base(), &metadata)
         .await
         .map_err(ApiError::Internal)?;
 
@@ -91,7 +91,7 @@ pub async fn create_table(
     };
     storage::write_json(
         table.store.as_ref(),
-        &table.base.child("metadata").child("current.json"),
+        &table.index_base().child("metadata").child("current.json"),
         &pointer,
     )
     .await
@@ -134,7 +134,7 @@ pub async fn get_table(
 ) -> Result<Json<TableInfoResponse>, ApiError> {
     let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(table.store.as_ref(), &table.base)
+    let current = storage::read_current(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?;
     let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
@@ -187,7 +187,7 @@ pub async fn update_columns(
 
     let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(table.store.as_ref(), &table.base)
+    let current = storage::read_current(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?;
     let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
@@ -224,7 +224,7 @@ pub async fn update_columns(
 
     cas::commit_metadata(
         table.store.as_ref(),
-        &table.base,
+        &table.index_base(),
         current.e_tag,
         &metadata,
         None,
@@ -252,7 +252,7 @@ pub async fn ingest(
 
     let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(table.store.as_ref(), &table.base)
+    let current = storage::read_current(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?;
     let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
@@ -328,7 +328,7 @@ pub async fn start_backfill(
 ) -> Result<Json<StartBackfillResponse>, ApiError> {
     let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(table.store.as_ref(), &table.base)
+    let current = storage::read_current(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?;
     let metadata = storage::read_metadata(table.store.as_ref(), &current.value)
@@ -353,7 +353,7 @@ pub async fn start_backfill(
 
     cas::commit_metadata(
         table.store.as_ref(),
-        &table.base,
+        &table.index_base(),
         current.e_tag,
         &metadata,
         None,
@@ -393,7 +393,7 @@ pub async fn backfill_status(
 ) -> Result<Json<BackfillStatusResponse>, ApiError> {
     let table = lookup_table(&state, &table_name).await?;
 
-    let current = storage::read_current(table.store.as_ref(), &table.base)
+    let current = storage::read_current(table.store.as_ref(), &table.index_base())
         .await
         .map_err(ApiError::Internal)?;
     let metadata = storage::read_metadata(table.store.as_ref(), &current.value)

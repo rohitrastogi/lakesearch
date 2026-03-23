@@ -30,6 +30,13 @@ impl TableInfo {
     pub fn queue_name(&self) -> String {
         self.name.clone()
     }
+
+    /// Base path for the LakeSearch index sidecar: `{table_base}/lakesearch/`.
+    /// All index metadata, segments, manifests live here, separate from
+    /// the user's data files.
+    pub fn index_base(&self) -> Path {
+        self.base.child("lakesearch")
+    }
 }
 
 /// Trait for discovering tables.
