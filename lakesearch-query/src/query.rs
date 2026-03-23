@@ -501,20 +501,20 @@ async fn fetch_and_verify(
 
         let (mut matches, scan) = runtime
             .cpu(move || {
-                verify_and_score(
-                    &batches,
-                    &qt,
-                    &ti,
+                let ctx = VerifyContext {
+                    query_terms: &qt,
+                    term_infos: &ti,
                     operator,
                     with_score,
                     avg_dl,
-                    corpus_stats.total_rows,
+                    total_rows: corpus_stats.total_rows,
                     is_large,
-                    &fp,
-                    rg,
-                    ibc,
-                    &scm,
-                )
+                    file_path: &fp,
+                    rg_idx: rg,
+                    indexed_batch_col: ibc,
+                    select_col_map: &scm,
+                };
+                verify_and_score(&batches, &ctx)
             })
             .await;
 
@@ -631,23 +631,32 @@ async fn brute_force_scan(
                 })
                 .unwrap_or(false);
 
-            // CPU: pre-filter with arrow contains, then tokenize+verify candidates
+            // CPU: pre-filter with arrow ilike, then tokenize+verify candidates
             let qt = query_terms.to_vec();
-            let op = operator;
+            let ti = agg_term_infos.to_vec();
             let fp = file_path.clone();
             let rg = rg_idx as u16;
             let scm = projection.select_col_map.clone();
             let ibc = projection.indexed_batch_col;
-
-            let ati = agg_term_infos.to_vec();
             let atr = agg_total_rows;
             let aad = agg_avg_dl;
 
             let (mut matches, scan) = runtime
                 .cpu(move || {
-                    brute_force_verify(
-                        &batches, &qt, &ati, op, with_score, is_large, &fp, rg, ibc, &scm, atr, aad,
-                    )
+                    let ctx = VerifyContext {
+                        query_terms: &qt,
+                        term_infos: &ti,
+                        operator,
+                        with_score,
+                        avg_dl: aad,
+                        total_rows: atr,
+                        is_large,
+                        file_path: &fp,
+                        rg_idx: rg,
+                        indexed_batch_col: ibc,
+                        select_col_map: &scm,
+                    };
+                    brute_force_verify(&batches, &ctx)
                 })
                 .await;
 
@@ -660,34 +669,24 @@ async fn brute_force_scan(
     Ok((all_matches, stats))
 }
 
-/// CPU-bound: uses arrow `contains` as pre-filter, then tokenizes candidates.
-/// Scores using aggregate corpus stats from indexed segments when `with_score`.
-#[allow(clippy::too_many_arguments)]
+/// CPU-bound: uses arrow `ilike` as pre-filter, then delegates to `verify_row`
+/// for exact tokenization and matching.
 fn brute_force_verify(
     batches: &[arrow::array::RecordBatch],
-    query_terms: &[String],
-    term_infos: &[(String, u32)],
-    operator: Operator,
-    with_score: bool,
-    is_large: bool,
-    file_path: &str,
-    rg_idx: u16,
-    indexed_batch_col: usize,
-    select_col_map: &[(usize, String)],
-    total_rows: u64,
-    avg_dl: f64,
+    ctx: &VerifyContext<'_>,
 ) -> (Vec<MatchedRow>, QueryStats) {
     let mut matches = Vec::new();
     let mut stats = QueryStats::default();
 
     for batch in batches {
-        let col = batch.column(indexed_batch_col);
+        let col = batch.column(ctx.indexed_batch_col);
 
         // Arrow pre-filter: case-insensitive substring check via ILIKE.
         // Query terms are already lowercased by the tokenizer. Using ilike
         // with %term% handles mixed-case input and works with both Utf8
         // and LargeUtf8 columns.
-        let term_masks: Vec<BooleanArray> = query_terms
+        let term_masks: Vec<BooleanArray> = ctx
+            .query_terms
             .iter()
             .filter_map(|term| {
                 let pattern = format!("%{term}%");
@@ -702,7 +701,7 @@ fn brute_force_verify(
         } else {
             let mut mask = term_masks[0].clone();
             for m in &term_masks[1..] {
-                mask = match operator {
+                mask = match ctx.operator {
                     Operator::And => compute::and(&mask, m).unwrap_or(mask),
                     Operator::Or => compute::or(&mask, m).unwrap_or(mask),
                 };
@@ -710,68 +709,15 @@ fn brute_force_verify(
             mask
         };
 
-        // Only tokenize+verify rows that passed the pre-filter
         for row in 0..batch.num_rows() {
             stats.rows_scanned += 1;
-
             if !candidate_mask.value(row) || col.is_null(row) {
                 continue;
             }
-
-            let text = string_value(col.as_ref(), row, is_large);
-            let tokens = tokenize(text);
-
-            // Exact verification using tokenizer semantics
-            let matches_query = if query_terms.len() == 1 {
-                tokens.iter().any(|t| t == &query_terms[0])
-            } else {
-                match operator {
-                    Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
-                    Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
-                }
-            };
-
-            if !matches_query {
-                continue;
+            if let Some(m) = verify_row(batch, col.as_ref(), row, ctx) {
+                stats.rows_matched += 1;
+                matches.push(m);
             }
-
-            stats.rows_matched += 1;
-
-            let score = if with_score {
-                let dl = tokens.len() as u32;
-                let mut freq: HashMap<&str, u32> = HashMap::new();
-                for t in &tokens {
-                    *freq.entry(t.as_str()).or_default() += 1;
-                }
-                let mut total_score = 0.0;
-                for (term, df) in term_infos {
-                    if let Some(&tf) = freq.get(term.as_str()) {
-                        total_score += bm25::score(tf, dl, avg_dl, *df as u64, total_rows);
-                    }
-                }
-                Some(total_score)
-            } else {
-                None
-            };
-
-            let columns = if select_col_map.is_empty() {
-                None
-            } else {
-                let mut map = serde_json::Map::new();
-                for (batch_idx, name) in select_col_map {
-                    let val = arrow_value_to_json(batch.column(*batch_idx).as_ref(), row);
-                    map.insert(name.clone(), val);
-                }
-                Some(map)
-            };
-
-            matches.push(MatchedRow {
-                file: file_path.to_owned(),
-                row_group: rg_idx,
-                text: text.to_owned(),
-                score,
-                columns,
-            });
         }
     }
 
@@ -837,102 +783,129 @@ impl Ord for ScoredMatch {
 }
 
 // ---------------------------------------------------------------------------
-// Row verification (CPU-bound)
+// Row verification (CPU-bound, shared between indexed and brute-force paths)
 // ---------------------------------------------------------------------------
 
-/// Re-tokenizes each row, checks the boolean predicate, optionally scores.
-#[allow(clippy::too_many_arguments)]
-fn verify_and_score(
-    batches: &[arrow::array::RecordBatch],
-    query_terms: &[String],
-    term_infos: &[(String, u32)],
+/// Context for row verification — groups the read-only query state to avoid
+/// parameter sprawl in the verify functions.
+struct VerifyContext<'a> {
+    query_terms: &'a [String],
+    term_infos: &'a [(String, u32)],
     operator: Operator,
     with_score: bool,
     avg_dl: f64,
     total_rows: u64,
     is_large: bool,
-    file_path: &str,
+    file_path: &'a str,
     rg_idx: u16,
     indexed_batch_col: usize,
-    select_col_map: &[(usize, String)],
+    select_col_map: &'a [(usize, String)],
+}
+
+/// Verifies all rows in the given batches. Used by the indexed path.
+fn verify_and_score(
+    batches: &[arrow::array::RecordBatch],
+    ctx: &VerifyContext<'_>,
 ) -> (Vec<MatchedRow>, QueryStats) {
     let mut matches = Vec::new();
     let mut stats = QueryStats::default();
-    let single_term = query_terms.len() == 1;
-    let few_terms = query_terms.len() <= 4;
 
     for batch in batches {
-        let col = batch.column(indexed_batch_col);
-
+        let col = batch.column(ctx.indexed_batch_col);
         for row in 0..batch.num_rows() {
             stats.rows_scanned += 1;
-
             if col.is_null(row) {
                 continue;
             }
-
-            let text = string_value(col.as_ref(), row, is_large);
-            let tokens = tokenize(text);
-
-            let matches_query = if single_term {
-                tokens.iter().any(|t| t == &query_terms[0])
-            } else if few_terms {
-                match operator {
-                    Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
-                    Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
-                }
-            } else {
-                let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
-                match operator {
-                    Operator::And => query_terms.iter().all(|t| token_set.contains(t.as_str())),
-                    Operator::Or => query_terms.iter().any(|t| token_set.contains(t.as_str())),
-                }
-            };
-
-            if !matches_query {
-                continue;
+            if let Some(m) = verify_row(batch, col.as_ref(), row, ctx) {
+                stats.rows_matched += 1;
+                matches.push(m);
             }
-
-            stats.rows_matched += 1;
-
-            let score = if with_score {
-                let dl = tokens.len() as u32;
-                // Build frequency map once per row instead of scanning per term
-                let mut freq: HashMap<&str, u32> = HashMap::new();
-                for t in &tokens {
-                    *freq.entry(t.as_str()).or_default() += 1;
-                }
-                let mut total_score = 0.0;
-                for (term, df) in term_infos {
-                    if let Some(&tf) = freq.get(term.as_str()) {
-                        total_score += bm25::score(tf, dl, avg_dl, *df as u64, total_rows);
-                    }
-                }
-                Some(total_score)
-            } else {
-                None
-            };
-
-            let columns = if select_col_map.is_empty() {
-                None
-            } else {
-                let mut map = serde_json::Map::new();
-                for (batch_idx, name) in select_col_map {
-                    let val = arrow_value_to_json(batch.column(*batch_idx).as_ref(), row);
-                    map.insert(name.clone(), val);
-                }
-                Some(map)
-            };
-
-            matches.push(MatchedRow {
-                file: file_path.to_owned(),
-                row_group: rg_idx,
-                text: text.to_owned(),
-                score,
-                columns,
-            });
         }
     }
 
     (matches, stats)
+}
+
+/// Tokenizes a single row, checks the boolean predicate, optionally scores,
+/// and extracts select columns. Returns None if the row doesn't match.
+fn verify_row(
+    batch: &arrow::array::RecordBatch,
+    col: &dyn Array,
+    row: usize,
+    ctx: &VerifyContext<'_>,
+) -> Option<MatchedRow> {
+    let text = string_value(col, row, ctx.is_large);
+    let tokens = tokenize(text);
+
+    // Fast path: single-term or few-term queries skip HashSet
+    let single_term = ctx.query_terms.len() == 1;
+    let few_terms = ctx.query_terms.len() <= 4;
+
+    let matches_query = if single_term {
+        tokens.iter().any(|t| t == &ctx.query_terms[0])
+    } else if few_terms {
+        match ctx.operator {
+            Operator::And => ctx
+                .query_terms
+                .iter()
+                .all(|q| tokens.iter().any(|t| t == q)),
+            Operator::Or => ctx
+                .query_terms
+                .iter()
+                .any(|q| tokens.iter().any(|t| t == q)),
+        }
+    } else {
+        let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
+        match ctx.operator {
+            Operator::And => ctx
+                .query_terms
+                .iter()
+                .all(|t| token_set.contains(t.as_str())),
+            Operator::Or => ctx
+                .query_terms
+                .iter()
+                .any(|t| token_set.contains(t.as_str())),
+        }
+    };
+
+    if !matches_query {
+        return None;
+    }
+
+    let score = if ctx.with_score {
+        let dl = tokens.len() as u32;
+        let mut freq: HashMap<&str, u32> = HashMap::new();
+        for t in &tokens {
+            *freq.entry(t.as_str()).or_default() += 1;
+        }
+        let mut total_score = 0.0;
+        for (term, df) in ctx.term_infos {
+            if let Some(&tf) = freq.get(term.as_str()) {
+                total_score += bm25::score(tf, dl, ctx.avg_dl, *df as u64, ctx.total_rows);
+            }
+        }
+        Some(total_score)
+    } else {
+        None
+    };
+
+    let columns = if ctx.select_col_map.is_empty() {
+        None
+    } else {
+        let mut map = serde_json::Map::new();
+        for (batch_idx, name) in ctx.select_col_map {
+            let val = arrow_value_to_json(batch.column(*batch_idx).as_ref(), row);
+            map.insert(name.clone(), val);
+        }
+        Some(map)
+    };
+
+    Some(MatchedRow {
+        file: ctx.file_path.to_owned(),
+        row_group: ctx.rg_idx,
+        text: text.to_owned(),
+        score,
+        columns,
+    })
 }
