@@ -90,7 +90,7 @@ pub async fn search(
             req.search.column.clone(),
             &req.search.match_text,
             operator,
-            req.score,
+            req.score.into(),
             req.limit,
             req.select.clone(),
             Arc::clone(&state.runtime),

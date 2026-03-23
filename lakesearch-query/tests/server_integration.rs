@@ -224,7 +224,7 @@ async fn search_round_trip() {
         .post(format!("{base_url}/v1/tables/test/search"))
         .json(&serde_json::json!({
             "search": {"column": "description", "match": "error timeout", "operator": "and"},
-            "score": true,
+            "score": "indexed",
             "limit": 3
         }))
         .send()

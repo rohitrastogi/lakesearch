@@ -1,5 +1,6 @@
 //! Integration tests for object storage commands using InMemory store.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use arrow::array::{ArrayRef, Int32Array, StringArray};
@@ -33,6 +34,11 @@ async fn run_query(
     select_columns: &[String],
     _runtime: &LakeRuntime,
 ) -> anyhow::Result<QueryResult> {
+    let score_mode = if with_score {
+        lakesearch_query::ScoreMode::Indexed
+    } else {
+        lakesearch_query::ScoreMode::None
+    };
     let cache = Arc::new(ObjectCache::new(Arc::clone(store)));
     query::run_query(
         cache,
@@ -40,7 +46,7 @@ async fn run_query(
         column.to_owned(),
         query_text,
         operator,
-        with_score,
+        score_mode,
         limit,
         select_columns.to_vec(),
         Arc::new(LakeRuntime::new(2)),
@@ -802,5 +808,199 @@ async fn segment_pruning_boundary_term_not_pruned() {
     assert_eq!(
         result_max.stats.rows_matched, 20,
         "max_term boundary should not be pruned"
+    );
+}
+
+// --- Brute-force fallback tests ---
+
+#[tokio::test]
+async fn brute_force_matches_indexed_results() {
+    // Upload two identical files with the same content.
+    // Index only one. Query should find the same matches from both
+    // (indexed path for file A, brute-force for file B).
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let descs = &["error timeout connection", "success response ok"];
+
+    // Upload file A and index it
+    let file_a = upload_test_parquet(store.as_ref(), "data/a.parquet", 20, 10, descs).await;
+    run_index(&store, &base, std::slice::from_ref(&file_a), "description", &runtime)
+        .await
+        .unwrap();
+
+    // Upload file B with same content but DON'T index it.
+    // It becomes part of data_files (via the manifest list) but has no
+    // manifest entry for "description" — so it's un-indexed.
+    let file_b = upload_test_parquet(store.as_ref(), "data/b.parquet", 20, 10, descs).await;
+
+    // Manually add file B to the data_files of a new manifest list
+    // (simulates a new append that hasn't been indexed yet for this column)
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+
+    let ml = lakesearch_core::metadata::ManifestList {
+        job_kind: lakesearch_core::metadata::JobKind::Append,
+        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_b]),
+        data_files: vec![lakesearch_core::metadata::DataFileEntry {
+            path: file_b.clone(),
+            file_size_bytes: 0,
+            row_count: 20,
+        }],
+        manifests: vec![], // No manifests — file is un-indexed
+        replaces: None,
+        compacted_column: None,
+    };
+    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+        .await
+        .unwrap();
+    meta.snapshot.manifest_lists.push(ml_path);
+    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+        .await
+        .unwrap();
+    let pointer = lakesearch_core::metadata::CurrentPointer {
+        metadata_path: meta_path,
+        updated_at: "now".to_owned(),
+    };
+    lakesearch_query::storage::write_json(
+        store.as_ref(),
+        &base.child("metadata").child("current.json"),
+        &pointer,
+    )
+    .await
+    .unwrap();
+
+    // Query "error" — should find 10 matches from file A (indexed)
+    // and 10 from file B (brute-force) = 20 total
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.stats.rows_matched, 20,
+        "should find matches from both indexed and un-indexed files"
+    );
+
+    // Verify matches come from both files
+    let files: HashSet<&str> = result.matches.iter().map(|m| m.file.as_str()).collect();
+    assert!(files.contains("data/a.parquet"), "should have indexed file");
+    assert!(
+        files.contains("data/b.parquet"),
+        "should have brute-force file"
+    );
+
+    // All matched text should contain "error"
+    for m in &result.matches {
+        assert!(
+            m.text.contains("error"),
+            "matched row should contain 'error': {}",
+            m.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn fully_indexed_and_fully_unindexed_same_results() {
+    // Same data, query both ways: fully indexed vs fully un-indexed.
+    // Match counts should be identical.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let descs = &[
+        "error timeout connection",
+        "success response ok",
+        "error reset",
+    ];
+    let file_path = upload_test_parquet(store.as_ref(), "data/test.parquet", 30, 10, descs).await;
+
+    // First: query with no index at all (file is un-indexed).
+    // Add file to data_files without any manifest.
+    let ml = lakesearch_core::metadata::ManifestList {
+        job_kind: lakesearch_core::metadata::JobKind::Append,
+        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        data_files: vec![lakesearch_core::metadata::DataFileEntry {
+            path: file_path.clone(),
+            file_size_bytes: 0,
+            row_count: 30,
+        }],
+        manifests: vec![],
+        replaces: None,
+        compacted_column: None,
+    };
+    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+        .await
+        .unwrap();
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    meta.snapshot.manifest_lists.push(ml_path);
+    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+        .await
+        .unwrap();
+    let pointer = lakesearch_core::metadata::CurrentPointer {
+        metadata_path: meta_path,
+        updated_at: "t1".to_owned(),
+    };
+    lakesearch_query::storage::write_json(
+        store.as_ref(),
+        &base.child("metadata").child("current.json"),
+        &pointer,
+    )
+    .await
+    .unwrap();
+
+    let brute_result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Now index the file
+    run_index(&store, &base, &[file_path], "description", &runtime)
+        .await
+        .unwrap();
+
+    let indexed_result = run_query(
+        &store,
+        &base,
+        "description",
+        "error",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // Same number of matches
+    assert_eq!(
+        brute_result.stats.rows_matched, indexed_result.stats.rows_matched,
+        "brute-force ({}) and indexed ({}) should find same match count",
+        brute_result.stats.rows_matched, indexed_result.stats.rows_matched
     );
 }

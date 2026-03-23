@@ -55,9 +55,9 @@ enum Command {
         /// Boolean operator (and / or)
         #[arg(long, value_enum, default_value_t = OperatorArg::Or)]
         operator: OperatorArg,
-        /// Compute BM25 relevance scores
-        #[arg(long)]
-        score: bool,
+        /// Scoring mode: none, indexed, all
+        #[arg(long, value_enum, default_value_t = ScoreModeArg::None)]
+        score: ScoreModeArg,
         /// Maximum number of results
         #[arg(long)]
         limit: Option<usize>,
@@ -78,6 +78,23 @@ impl From<OperatorArg> for lakesearch_query::Operator {
         match arg {
             OperatorArg::And => Self::And,
             OperatorArg::Or => Self::Or,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ScoreModeArg {
+    None,
+    Indexed,
+    All,
+}
+
+impl From<ScoreModeArg> for lakesearch_query::ScoreMode {
+    fn from(arg: ScoreModeArg) -> Self {
+        match arg {
+            ScoreModeArg::None => Self::None,
+            ScoreModeArg::Indexed => Self::Indexed,
+            ScoreModeArg::All => Self::All,
         }
     }
 }
@@ -168,7 +185,7 @@ async fn main() -> Result<()> {
                 column,
                 &match_text,
                 operator.into(),
-                score,
+                score.into(),
                 limit,
                 select,
                 runtime,

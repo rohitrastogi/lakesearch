@@ -8,8 +8,10 @@ pub struct SearchRequest {
     pub select: Vec<String>,
     pub search: SearchClause,
     pub limit: Option<usize>,
+    /// Scoring mode: "none" (default), "indexed" (score indexed results
+    /// only), or "all" (also score un-indexed files using aggregate stats).
     #[serde(default)]
-    pub score: bool,
+    pub score: ScoreMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +32,26 @@ pub enum OperatorStr {
 
 fn default_operator() -> OperatorStr {
     OperatorStr::Or
+}
+
+/// API-level score mode (serde-enabled). Maps to `crate::ScoreMode`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScoreMode {
+    #[default]
+    None,
+    Indexed,
+    All,
+}
+
+impl From<ScoreMode> for crate::ScoreMode {
+    fn from(m: ScoreMode) -> Self {
+        match m {
+            ScoreMode::None => Self::None,
+            ScoreMode::Indexed => Self::Indexed,
+            ScoreMode::All => Self::All,
+        }
+    }
 }
 
 impl From<OperatorStr> for crate::Operator {
