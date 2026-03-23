@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
+use object_store::limit::LimitStore;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use tokio::sync::RwLock;
@@ -28,13 +29,15 @@ struct TableState {
 pub struct MetadataCache {
     tables: RwLock<HashMap<String, TableState>>,
     poll_interval: Duration,
+    io_concurrency: usize,
 }
 
 impl MetadataCache {
-    pub fn new(poll_interval: Duration) -> Self {
+    pub fn new(poll_interval: Duration, io_concurrency: usize) -> Self {
         Self {
             tables: RwLock::new(HashMap::new()),
             poll_interval,
+            io_concurrency,
         }
     }
 
@@ -52,6 +55,7 @@ impl MetadataCache {
         store: Arc<dyn ObjectStore>,
         base: Path,
     ) -> Result<()> {
+        let store: Arc<dyn ObjectStore> = Arc::new(LimitStore::new(store, self.io_concurrency));
         let current = read_current(store.as_ref(), &base).await?;
         let metadata = read_metadata(store.as_ref(), &current.value).await?;
 

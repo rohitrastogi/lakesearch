@@ -26,7 +26,7 @@ async fn start_test_server(store: Arc<dyn ObjectStore>) -> (String, tokio::task:
     let base = Path::from("table");
     create_test_table(store.as_ref(), &base, &["description"]).await;
 
-    let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60)));
+    let cache = Arc::new(MetadataCache::new(std::time::Duration::from_secs(60), 8));
     cache
         .register_with_store("test", store.clone(), base)
         .await
