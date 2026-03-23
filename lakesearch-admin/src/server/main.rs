@@ -5,9 +5,11 @@ use clap::Parser;
 use tracing::info;
 
 use cascadq_client::{CascadqClient, ClientConfig};
+use lakesearch_admin::registry::TableRegistry;
 use lakesearch_admin::server::config::IngestConfig;
 use lakesearch_admin::server::routes::router;
 use lakesearch_admin::server::state::AppState;
+use lakesearch_admin::storage;
 
 #[derive(Parser)]
 #[command(name = "lakesearch-admin", about = "LakeSearch admin / ingest service")]
@@ -31,9 +33,34 @@ async fn main() -> Result<()> {
         ..ClientConfig::default()
     }));
 
+    let registry = Arc::new(TableRegistry::new());
+
+    // Register tables from config
+    for (name, table_cfg) in &config.tables {
+        let (store, base) = storage::parse_location(&table_cfg.location)?;
+        let current = storage::read_current(store.as_ref(), &base).await?;
+        let metadata = storage::read_metadata(store.as_ref(), &current.value).await?;
+
+        registry
+            .register(
+                &metadata.table_id,
+                name,
+                &table_cfg.location,
+                &table_cfg.queue,
+            )
+            .await?;
+        info!(
+            table = %name,
+            table_id = %metadata.table_id,
+            location = %table_cfg.location,
+            "registered table from config"
+        );
+    }
+
     let state = AppState {
         config: Arc::new(config.clone()),
         cascadq,
+        registry,
     };
 
     let app = router(state);
