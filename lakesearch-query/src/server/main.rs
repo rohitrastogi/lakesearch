@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow_flight::flight_service_server::FlightServiceServer;
 use clap::Parser;
 use tracing::info;
@@ -57,14 +57,18 @@ async fn main() -> Result<()> {
     let flight_addr = config.flight_addr;
     info!(addr = %flight_addr, "starting Flight query server");
 
-    let (rest_result, flight_result) = tokio::join!(
-        axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()),
-        tonic::transport::Server::builder()
+    // Use select! so an early failure in either server surfaces immediately
+    // instead of being masked by the other running indefinitely.
+    tokio::select! {
+        result = axum::serve(listener, app).with_graceful_shutdown(shutdown_signal()) => {
+            result.context("REST server exited")?;
+        }
+        result = tonic::transport::Server::builder()
             .add_service(FlightServiceServer::new(flight_svc))
-            .serve_with_shutdown(flight_addr, shutdown_signal()),
-    );
-    rest_result?;
-    flight_result?;
+            .serve_with_shutdown(flight_addr, shutdown_signal()) => {
+            result.context("Flight server exited")?;
+        }
+    }
 
     poll_handle.abort();
     info!("server stopped");

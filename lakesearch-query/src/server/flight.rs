@@ -13,7 +13,7 @@ use arrow_flight::{
     Action, ActionType, Criteria, Empty, FlightData, FlightDescriptor, FlightInfo,
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
-use futures::stream::TryStreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 use futures::Stream;
 use lakesearch_core::metadata::ColumnStatus;
 use object_store::path::Path;
@@ -173,8 +173,10 @@ impl FlightService for LakeSearchFlightService {
         let operator: crate::Operator = req.operator.into();
         let score_mode: crate::ScoreMode = req.score.into();
 
+        let timeout = self.state.config.query_timeout();
+
         let batch_stream = tokio::time::timeout(
-            self.state.config.query_timeout(),
+            timeout,
             crate::query::run_query(
                 object_cache,
                 base,
@@ -190,7 +192,7 @@ impl FlightService for LakeSearchFlightService {
             ),
         )
         .await
-        .map_err(|_| Status::deadline_exceeded("query timed out"))?
+        .map_err(|_| Status::deadline_exceeded("query setup timed out"))?
         .map_err(|e| Status::internal(e.to_string()))?;
 
         let schema = crate::RecordBatchStream::schema(&*batch_stream);
@@ -203,8 +205,21 @@ impl FlightService for LakeSearchFlightService {
             .build(mapped_stream)
             .map_err(|e| Status::internal(e.to_string()));
 
+        // Enforce a wall-clock deadline across the entire stream, not just
+        // per-batch. Once `timeout` elapses from stream creation, every
+        // subsequent poll yields DEADLINE_EXCEEDED.
+        let deadline = tokio::time::Instant::now() + timeout;
+        #[allow(clippy::result_large_err)] // Status is required by the Flight trait
+        let timed_stream = flight_data_stream.map(move |item| {
+            if tokio::time::Instant::now() >= deadline {
+                Err(Status::deadline_exceeded("query timed out"))
+            } else {
+                item
+            }
+        });
+
         Ok(Response::new(
-            Box::pin(flight_data_stream) as Self::DoGetStream
+            Box::pin(timed_stream) as Self::DoGetStream
         ))
     }
 
