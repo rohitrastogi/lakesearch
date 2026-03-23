@@ -53,6 +53,28 @@ impl MetadataCache {
         Ok(())
     }
 
+    /// Registers a table with an already-constructed object store and base path.
+    /// Used in tests where the store is created programmatically (e.g., InMemory).
+    pub async fn register_with_store(
+        &self,
+        name: &str,
+        store: Arc<dyn ObjectStore>,
+        base: Path,
+    ) -> Result<()> {
+        let current = read_current(store.as_ref(), &base).await?;
+        let metadata = read_metadata(store.as_ref(), &current.value).await?;
+
+        let state = TableState {
+            store,
+            base,
+            current_metadata_path: current.value.metadata_path.clone(),
+            metadata: Arc::new(metadata),
+        };
+
+        self.tables.write().await.insert(name.to_owned(), state);
+        Ok(())
+    }
+
     /// Returns the cached metadata for a table.
     pub async fn get_metadata(&self, name: &str) -> Option<Arc<Metadata>> {
         self.tables

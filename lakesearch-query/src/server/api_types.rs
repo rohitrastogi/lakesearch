@@ -41,13 +41,13 @@ impl From<OperatorStr> for crate::Operator {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
     pub rows: Vec<SearchRow>,
     pub stats: SearchStats,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchRow {
     pub file: String,
     pub row_group: u16,
@@ -58,7 +58,7 @@ pub struct SearchRow {
     pub columns: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SearchStats {
     pub candidate_pages: usize,
     pub rows_scanned: usize,
@@ -68,12 +68,12 @@ pub struct SearchStats {
 
 // --- Tables ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ListTablesResponse {
     pub tables: Vec<TableInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct TableInfo {
     pub name: String,
     pub location: String,
@@ -82,7 +82,7 @@ pub struct TableInfo {
 
 // --- Health ---
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
 }
