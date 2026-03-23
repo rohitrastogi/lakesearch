@@ -1,5 +1,5 @@
 //! Stage 3: Fetch, verify, and score — reads Parquet pages, re-tokenizes rows,
-//! produces `RecordBatch`es directly via Arrow column builders.
+//! produces `RecordBatch`es via pure functions: `(batch, context) → (Option<RecordBatch>, QueryStats)`.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -80,7 +80,7 @@ pub(crate) fn resolve_projection(
 }
 
 // ---------------------------------------------------------------------------
-// CPU-bound verification
+// CPU-bound verification (pure functions)
 // ---------------------------------------------------------------------------
 
 /// Context for row verification.
@@ -96,122 +96,25 @@ pub(crate) struct VerifyContext<'a> {
     pub select_col_map: &'a [(usize, String)],
 }
 
-/// Target rows per output batch. Balances vectorization efficiency
-/// against memory pressure and output latency.
-pub(crate) const TARGET_BATCH_SIZE: usize = 8192;
-
-/// Accumulates verified query results across multiple input batches.
+/// Verifies all rows in a single input batch. Pure function: takes a batch
+/// and context, returns matched rows as a new RecordBatch (or None) and stats.
 ///
-/// Text and score columns are built row-by-row (they're computed values).
-/// Select columns are projected via `arrow::compute::filter` and stored
-/// as array chunks, then concatenated at flush time. This handles all
-/// Arrow types without per-type dispatch.
-pub(crate) struct ColumnBuilders {
-    text: StringBuilder,
-    /// Accumulated filtered chunks for each select column.
-    select_chunks: Vec<(String, Vec<ArrayRef>)>,
-    score: Option<Float64Builder>,
-    count: usize,
-}
-
-impl ColumnBuilders {
-    pub fn new(schema: &SchemaRef) -> Self {
-        let text = StringBuilder::new();
-        let mut select_chunks: Vec<(String, Vec<ArrayRef>)> = Vec::new();
-        let mut score: Option<Float64Builder> = None;
-
-        for field in schema.fields() {
-            match field.name().as_str() {
-                "text" | "score" => {
-                    if field.name() == "score" {
-                        score = Some(Float64Builder::new());
-                    }
-                }
-                name => {
-                    select_chunks.push((name.to_owned(), Vec::new()));
-                }
-            }
-        }
-
-        Self {
-            text,
-            select_chunks,
-            score,
-            count: 0,
-        }
-    }
-
-    /// Returns true if enough rows have accumulated to justify flushing.
-    pub fn should_flush(&self) -> bool {
-        self.count >= TARGET_BATCH_SIZE
-    }
-
-    /// Materializes buffered rows as a `RecordBatch` and resets for reuse.
-    /// Returns `None` if no rows are buffered.
-    pub fn flush_batch(&mut self, schema: &SchemaRef) -> Option<RecordBatch> {
-        if self.count == 0 {
-            return None;
-        }
-
-        let mut columns: Vec<ArrayRef> = Vec::new();
-
-        for field in schema.fields() {
-            match field.name().as_str() {
-                "text" => {
-                    columns.push(Arc::new(self.text.finish()));
-                }
-                "score" => {
-                    if let Some(ref mut b) = self.score {
-                        columns.push(Arc::new(b.finish()));
-                    }
-                }
-                _ => {
-                    if let Some(pos) = self
-                        .select_chunks
-                        .iter()
-                        .position(|(n, _)| n == field.name().as_str())
-                    {
-                        let (_, chunks) = &mut self.select_chunks[pos];
-                        let refs: Vec<&dyn Array> = chunks.iter().map(|a| a.as_ref()).collect();
-                        if refs.is_empty() {
-                            columns.push(arrow::array::new_empty_array(field.data_type()));
-                        } else {
-                            match arrow::compute::concat(&refs) {
-                                Ok(arr) => columns.push(arr),
-                                Err(_) => {
-                                    columns.push(arrow::array::new_empty_array(field.data_type()))
-                                }
-                            }
-                        }
-                        chunks.clear();
-                    }
-                }
-            }
-        }
-
-        self.count = 0;
-        RecordBatch::try_new(schema.clone(), columns).ok()
-    }
-
-    /// Consumes the builders, returning any remaining rows as a final batch.
-    pub fn finish(mut self, schema: &SchemaRef) -> Option<RecordBatch> {
-        self.flush_batch(schema)
-    }
-}
-
-/// Verifies all rows in a single input batch. Builds a match mask via
-/// tokenization, appends text + score for matched rows, and filters
-/// select columns using `arrow::compute::filter` (type-generic).
-///
-/// Used by the indexed consumer path.
+/// Builds a match mask via row-by-row tokenization, constructs text + score
+/// for matched rows, filters select columns via `arrow::compute::filter`.
 pub(crate) fn verify_batch(
     batch: &RecordBatch,
     ctx: &VerifyContext<'_>,
-    builders: &mut ColumnBuilders,
-    stats: &mut QueryStats,
-) {
+    schema: &SchemaRef,
+) -> (Option<RecordBatch>, QueryStats) {
+    let mut stats = QueryStats::default();
     let col = batch.column(ctx.indexed_batch_col);
     let mut match_mask = BooleanBuilder::with_capacity(batch.num_rows());
+    let mut text_builder = StringBuilder::new();
+    let mut score_builder = if ctx.with_score {
+        Some(Float64Builder::new())
+    } else {
+        None
+    };
 
     for row in 0..batch.num_rows() {
         stats.rows_scanned += 1;
@@ -219,26 +122,40 @@ pub(crate) fn verify_batch(
             match_mask.append_value(false);
             continue;
         }
-        let matched = verify_row(col.as_ref(), row, ctx, builders);
-        match_mask.append_value(matched);
-        if matched {
-            stats.rows_matched += 1;
+        let text = string_value(col.as_ref(), row, ctx.is_large);
+        let tokens = tokenize(text);
+
+        if !matches_predicate(&tokens, ctx.query_terms, ctx.operator) {
+            match_mask.append_value(false);
+            continue;
+        }
+
+        match_mask.append_value(true);
+        stats.rows_matched += 1;
+        text_builder.append_value(text);
+
+        if let Some(ref mut sb) = score_builder {
+            sb.append_value(compute_bm25(&tokens, ctx));
         }
     }
 
+    if stats.rows_matched == 0 {
+        return (None, stats);
+    }
+
     let mask = match_mask.finish();
-    filter_select_columns(batch, &mask, ctx, builders);
+    let batch = build_output_batch(schema, text_builder, score_builder, batch, &mask, ctx);
+    (batch, stats)
 }
 
 /// CPU-bound: applies ilike pre-filter to a single batch, then verifies
-/// matching rows via tokenization. Uses `arrow::compute::filter` for
-/// select column projection (handles all Arrow types).
+/// matching rows via tokenization. Pure function returning matched rows.
 pub(crate) fn brute_force_verify_batch(
     batch: &RecordBatch,
     ctx: &VerifyContext<'_>,
-    builders: &mut ColumnBuilders,
-    stats: &mut QueryStats,
-) {
+    schema: &SchemaRef,
+) -> (Option<RecordBatch>, QueryStats) {
+    let mut stats = QueryStats::default();
     let col = batch.column(ctx.indexed_batch_col);
 
     // Arrow pre-filter: case-insensitive substring check via ILIKE
@@ -253,7 +170,8 @@ pub(crate) fn brute_force_verify_batch(
         .collect();
 
     let candidate_mask = if term_masks.is_empty() {
-        return;
+        stats.rows_scanned += batch.num_rows();
+        return (None, stats);
     } else {
         let mut mask = term_masks[0].clone();
         for m in &term_masks[1..] {
@@ -266,6 +184,12 @@ pub(crate) fn brute_force_verify_batch(
     };
 
     let mut match_mask = BooleanBuilder::with_capacity(batch.num_rows());
+    let mut text_builder = StringBuilder::new();
+    let mut score_builder = if ctx.with_score {
+        Some(Float64Builder::new())
+    } else {
+        None
+    };
 
     for row in 0..batch.num_rows() {
         stats.rows_scanned += 1;
@@ -273,110 +197,110 @@ pub(crate) fn brute_force_verify_batch(
             match_mask.append_value(false);
             continue;
         }
-        let matched = verify_row(col.as_ref(), row, ctx, builders);
-        match_mask.append_value(matched);
-        if matched {
-            stats.rows_matched += 1;
+        let text = string_value(col.as_ref(), row, ctx.is_large);
+        let tokens = tokenize(text);
+
+        if !matches_predicate(&tokens, ctx.query_terms, ctx.operator) {
+            match_mask.append_value(false);
+            continue;
         }
+
+        match_mask.append_value(true);
+        stats.rows_matched += 1;
+        text_builder.append_value(text);
+
+        if let Some(ref mut sb) = score_builder {
+            sb.append_value(compute_bm25(&tokens, ctx));
+        }
+    }
+
+    if stats.rows_matched == 0 {
+        return (None, stats);
     }
 
     let mask = match_mask.finish();
-    filter_select_columns(batch, &mask, ctx, builders);
+    let batch = build_output_batch(schema, text_builder, score_builder, batch, &mask, ctx);
+    (batch, stats)
 }
 
-/// Tokenizes a single row, checks the boolean predicate, optionally scores,
-/// and appends text + score to builders. Returns true if the row matched.
-fn verify_row(
-    col: &dyn Array,
-    row: usize,
-    ctx: &VerifyContext<'_>,
-    builders: &mut ColumnBuilders,
-) -> bool {
-    let text = string_value(col, row, ctx.is_large);
-    let tokens = tokenize(text);
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
 
-    let single_term = ctx.query_terms.len() == 1;
-    let few_terms = ctx.query_terms.len() <= 4;
+/// Checks whether the tokenized row matches the boolean query predicate.
+fn matches_predicate(tokens: &[String], query_terms: &[String], operator: Operator) -> bool {
+    let single_term = query_terms.len() == 1;
+    let few_terms = query_terms.len() <= 4;
 
-    let matches_query = if single_term {
-        tokens.iter().any(|t| t == &ctx.query_terms[0])
+    if single_term {
+        tokens.iter().any(|t| t == &query_terms[0])
     } else if few_terms {
-        match ctx.operator {
-            Operator::And => ctx
-                .query_terms
-                .iter()
-                .all(|q| tokens.iter().any(|t| t == q)),
-            Operator::Or => ctx
-                .query_terms
-                .iter()
-                .any(|q| tokens.iter().any(|t| t == q)),
+        match operator {
+            Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
+            Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
         }
     } else {
         let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        match ctx.operator {
-            Operator::And => ctx
-                .query_terms
-                .iter()
-                .all(|t| token_set.contains(t.as_str())),
-            Operator::Or => ctx
-                .query_terms
-                .iter()
-                .any(|t| token_set.contains(t.as_str())),
-        }
-    };
-
-    if !matches_query {
-        return false;
-    }
-
-    builders.text.append_value(text);
-
-    if let Some(ref mut score_builder) = builders.score {
-        if ctx.with_score {
-            let dl = tokens.len() as u32;
-            let mut freq: HashMap<&str, u32> = HashMap::new();
-            for t in &tokens {
-                *freq.entry(t.as_str()).or_default() += 1;
-            }
-            let mut total_score = 0.0;
-            for (term, df) in ctx.term_infos {
-                if let Some(&tf) = freq.get(term.as_str()) {
-                    total_score += bm25::score(tf, dl, ctx.avg_dl, *df as u64, ctx.total_rows);
-                }
-            }
-            score_builder.append_value(total_score);
-        } else {
-            score_builder.append_null();
+        match operator {
+            Operator::And => query_terms.iter().all(|t| token_set.contains(t.as_str())),
+            Operator::Or => query_terms.iter().any(|t| token_set.contains(t.as_str())),
         }
     }
-
-    builders.count += 1;
-    true
 }
 
-/// Filters select columns from the source batch using the match mask and
-/// stores the filtered arrays in the builders for later concatenation.
-/// Uses `arrow::compute::filter` which handles all Arrow types.
-fn filter_select_columns(
-    batch: &RecordBatch,
+/// Computes BM25 score for a matched row.
+fn compute_bm25(tokens: &[String], ctx: &VerifyContext<'_>) -> f64 {
+    let dl = tokens.len() as u32;
+    let mut freq: HashMap<&str, u32> = HashMap::new();
+    for t in tokens {
+        *freq.entry(t.as_str()).or_default() += 1;
+    }
+    let mut total_score = 0.0;
+    for (term, df) in ctx.term_infos {
+        if let Some(&tf) = freq.get(term.as_str()) {
+            total_score += bm25::score(tf, dl, ctx.avg_dl, *df as u64, ctx.total_rows);
+        }
+    }
+    total_score
+}
+
+/// Assembles a RecordBatch from matched-row builders, select column filters,
+/// and the output schema.
+fn build_output_batch(
+    schema: &SchemaRef,
+    text_builder: StringBuilder,
+    score_builder: Option<Float64Builder>,
+    source_batch: &RecordBatch,
     mask: &BooleanArray,
     ctx: &VerifyContext<'_>,
-    builders: &mut ColumnBuilders,
-) {
-    for (sel_name, chunks) in &mut builders.select_chunks {
-        if let Some((src_idx, _)) = ctx
-            .select_col_map
-            .iter()
-            .find(|(_, name)| name == sel_name.as_str())
-        {
-            let src_col = batch.column(*src_idx);
-            if let Ok(filtered) = compute::filter(src_col.as_ref(), mask) {
-                if !filtered.is_empty() {
-                    chunks.push(filtered);
+) -> Option<RecordBatch> {
+    let mut text_builder = text_builder;
+    let mut score_builder = score_builder;
+    let mut columns: Vec<ArrayRef> = Vec::new();
+
+    for field in schema.fields() {
+        match field.name().as_str() {
+            "text" => {
+                columns.push(Arc::new(text_builder.finish()));
+            }
+            "score" => {
+                if let Some(ref mut sb) = score_builder {
+                    columns.push(Arc::new(sb.finish()));
+                }
+            }
+            name => {
+                if let Some((src_idx, _)) = ctx.select_col_map.iter().find(|(_, n)| n == name) {
+                    let src_col = source_batch.column(*src_idx);
+                    match compute::filter(src_col.as_ref(), mask) {
+                        Ok(filtered) => columns.push(filtered),
+                        Err(_) => columns.push(arrow::array::new_empty_array(field.data_type())),
+                    }
                 }
             }
         }
     }
+
+    RecordBatch::try_new(schema.clone(), columns).ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +308,7 @@ fn filter_select_columns(
 // ---------------------------------------------------------------------------
 
 /// Runs the indexed path: processes work items by streaming Parquet pages,
-/// verifying on the CPU pool, coalescing results, and sending batches.
+/// verifying on the CPU pool, and sending output batches.
 ///
 /// Runs as a standalone tokio task. Returns accumulated `QueryStats`.
 #[allow(clippy::too_many_arguments)]
@@ -402,7 +326,6 @@ pub(crate) async fn indexed_consumer(
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
 ) -> QueryStats {
     let mut stats = QueryStats::default();
-    let mut builders = ColumnBuilders::new(&schema);
 
     // Pre-fetch parquet metadata for all unique files
     let unique_files: Vec<String> = work_items
@@ -491,6 +414,7 @@ pub(crate) async fn indexed_consumer(
             let ibc = projection.indexed_batch_col;
             let avg_dl = item.avg_dl;
             let total_rows = item.total_rows;
+            let schema_clone = schema.clone();
 
             let cpu_future = runtime.cpu(move || {
                 let ctx = VerifyContext {
@@ -504,17 +428,20 @@ pub(crate) async fn indexed_consumer(
                     indexed_batch_col: ibc,
                     select_col_map: &scm,
                 };
-                let mut batch_stats = QueryStats::default();
-                verify_batch(&input_batch, &ctx, &mut builders, &mut batch_stats);
-                (builders, batch_stats)
+                verify_batch(&input_batch, &ctx, &schema_clone)
             });
 
             // Overlap: I/O fetches batch N+1 while CPU processes batch N
             let (cpu_result, prefetched) = tokio::join!(cpu_future, pq_stream.try_next());
 
-            let (returned_builders, batch_stats) = cpu_result;
-            builders = returned_builders;
+            let (batch_opt, batch_stats) = cpu_result;
             stats.merge(&batch_stats);
+
+            if let Some(batch) = batch_opt {
+                if tx.send(Ok(batch)).await.is_err() {
+                    return stats;
+                }
+            }
 
             next_batch = match prefetched {
                 Ok(b) => b,
@@ -523,20 +450,7 @@ pub(crate) async fn indexed_consumer(
                     return stats;
                 }
             };
-
-            if builders.should_flush() {
-                if let Some(batch) = builders.flush_batch(&schema) {
-                    if tx.send(Ok(batch)).await.is_err() {
-                        return stats;
-                    }
-                }
-            }
         }
-    }
-
-    // Final drain
-    if let Some(batch) = builders.finish(&schema) {
-        let _ = tx.send(Ok(batch)).await;
     }
 
     stats
@@ -564,7 +478,6 @@ pub(crate) async fn brute_force_consumer(
     tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
 ) -> QueryStats {
     let mut stats = QueryStats::default();
-    let mut builders = ColumnBuilders::new(&schema);
 
     for file_path in &files {
         let pq_meta = match cache.get_parquet_metadata(file_path).await {
@@ -635,6 +548,7 @@ pub(crate) async fn brute_force_consumer(
                 let ti = Arc::clone(&agg_term_infos);
                 let scm = projection.select_col_map.clone();
                 let ibc = projection.indexed_batch_col;
+                let schema_clone = schema.clone();
 
                 let cpu_future = runtime.cpu(move || {
                     let ctx = VerifyContext {
@@ -648,17 +562,20 @@ pub(crate) async fn brute_force_consumer(
                         indexed_batch_col: ibc,
                         select_col_map: &scm,
                     };
-                    let mut batch_stats = QueryStats::default();
-                    brute_force_verify_batch(&input_batch, &ctx, &mut builders, &mut batch_stats);
-                    (builders, batch_stats)
+                    brute_force_verify_batch(&input_batch, &ctx, &schema_clone)
                 });
 
                 // Overlap: I/O fetches batch N+1 while CPU processes batch N
                 let (cpu_result, prefetched) = tokio::join!(cpu_future, pq_stream.try_next());
 
-                let (returned_builders, batch_stats) = cpu_result;
-                builders = returned_builders;
+                let (batch_opt, batch_stats) = cpu_result;
                 stats.merge(&batch_stats);
+
+                if let Some(batch) = batch_opt {
+                    if tx.send(Ok(batch)).await.is_err() {
+                        return stats;
+                    }
+                }
 
                 next_batch = match prefetched {
                     Ok(b) => b,
@@ -667,31 +584,15 @@ pub(crate) async fn brute_force_consumer(
                         return stats;
                     }
                 };
-
-                if builders.should_flush() {
-                    if let Some(batch) = builders.flush_batch(&schema) {
-                        if tx.send(Ok(batch)).await.is_err() {
-                            return stats;
-                        }
-                    }
-                }
             }
 
             // Early termination for unscored queries with limit
             if let Some(lim) = limit {
                 if stats.rows_matched >= lim {
-                    if let Some(batch) = builders.finish(&schema) {
-                        let _ = tx.send(Ok(batch)).await;
-                    }
                     return stats;
                 }
             }
         }
-    }
-
-    // Final drain
-    if let Some(batch) = builders.finish(&schema) {
-        let _ = tx.send(Ok(batch)).await;
     }
 
     stats
