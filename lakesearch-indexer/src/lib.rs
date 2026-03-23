@@ -339,6 +339,11 @@ fn index_batches(
     // the pointer when row_idx crosses the next page boundary. O(N)
     // instead of O(N log P) from binary search.
     let mut cur_page: usize = 0;
+    // Track which (term, doc_id) pairs have been recorded in this RG
+    // to avoid pushing duplicate doc_ids. Many rows share a page's
+    // doc_id, so without this a term in 1000 rows would push the
+    // same doc_id 1000 times.
+    let mut term_doc_seen: HashSet<(String, DocId)> = HashSet::new();
 
     for batch in batches {
         let col = batch.column(0);
@@ -361,10 +366,12 @@ fn index_batches(
 
             let doc_id = pages[cur_page].0;
 
-            let mut seen = HashSet::new();
+            let mut seen_in_row = HashSet::new();
             for token in &tokens {
-                term_doc_ids.entry(token.clone()).or_default().push(doc_id);
-                if seen.insert(token.as_str()) {
+                if term_doc_seen.insert((token.clone(), doc_id)) {
+                    term_doc_ids.entry(token.clone()).or_default().push(doc_id);
+                }
+                if seen_in_row.insert(token.as_str()) {
                     *term_doc_freq.entry(token.clone()).or_default() += 1;
                 }
             }
