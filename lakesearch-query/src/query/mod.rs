@@ -27,7 +27,7 @@ use tracing::info;
 use lakesearch_core::bm25;
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_core::segment::SegmentReader;
-use lakesearch_core::tokenizer::tokenize;
+use lakesearch_core::tokenizer::{parse_query, QueryTerm};
 use object_store::path::Path;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -140,7 +140,7 @@ async fn setup_query(
     cache: &Arc<ObjectCache>,
     base: &Path,
     column: &str,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     operator: Operator,
     select_columns: &[String],
     with_score: bool,
@@ -195,7 +195,7 @@ fn launch_pipeline(
     unindexed_files: Vec<String>,
     cache: Arc<ObjectCache>,
     column: String,
-    query_terms: Vec<String>,
+    query_terms: Vec<QueryTerm>,
     operator: Operator,
     score_mode: crate::ScoreMode,
     with_score: bool,
@@ -213,9 +213,10 @@ fn launch_pipeline(
     let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
         query_terms
             .iter()
-            .map(|t| {
+            .map(|qt| {
+                let t = qt.term();
                 let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                (t.clone(), df)
+                (t.to_owned(), df)
             })
             .collect(),
     );
@@ -292,7 +293,7 @@ pub async fn run_query(
     runtime: Arc<LakeRuntime>,
 ) -> Result<SendableRecordBatchStream> {
     let with_score = score_mode != crate::ScoreMode::None;
-    let query_terms = tokenize(query_text);
+    let query_terms = parse_query(query_text);
     if query_terms.is_empty() {
         let schema = build_empty_schema(&select_columns, &column, with_score);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -389,7 +390,7 @@ pub async fn run_query_collected(
     runtime: Arc<LakeRuntime>,
 ) -> Result<CollectedQueryResult> {
     let with_score = score_mode != crate::ScoreMode::None;
-    let query_terms = tokenize(query_text);
+    let query_terms = parse_query(query_text);
     if query_terms.is_empty() {
         return Ok(CollectedQueryResult {
             batches: vec![],

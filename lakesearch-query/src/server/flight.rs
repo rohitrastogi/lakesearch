@@ -218,9 +218,7 @@ impl FlightService for LakeSearchFlightService {
             }
         });
 
-        Ok(Response::new(
-            Box::pin(timed_stream) as Self::DoGetStream
-        ))
+        Ok(Response::new(Box::pin(timed_stream) as Self::DoGetStream))
     }
 
     async fn do_put(

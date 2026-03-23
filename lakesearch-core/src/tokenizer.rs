@@ -99,6 +99,74 @@ fn push_unicode_token(raw: &str, tokens: &mut Vec<String>) {
     }
 }
 
+/// A parsed query term with optional wildcard markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm {
+    /// Exact term match.
+    Exact(String),
+    /// Prefix match: `conn*` → `Prefix("conn")`.
+    Prefix(String),
+    /// Suffix match: `*tion` → `Suffix("tion")`.
+    Suffix(String),
+}
+
+/// Maximum number of terms a wildcard may expand to.
+pub const MAX_WILDCARD_EXPANSION: usize = 1024;
+
+/// Parses a query string into `QueryTerm`s.
+///
+/// Splits on whitespace, detects `*` wildcards at token boundaries,
+/// and lowercases + NFC-normalizes the non-wildcard portion.
+///
+/// - `conn*` → `Prefix("conn")`
+/// - `*tion` → `Suffix("tion")`
+/// - `timeout` → `Exact("timeout")`
+/// - `*` alone is ignored (matches everything, not useful)
+#[must_use]
+pub fn parse_query(text: &str) -> Vec<QueryTerm> {
+    let mut terms = Vec::new();
+    for raw in text.split_whitespace() {
+        let is_prefix = raw.ends_with('*');
+        let is_suffix = raw.starts_with('*');
+        let stripped = raw.trim_matches('*');
+        if stripped.is_empty() {
+            continue;
+        }
+        // Tokenize the stripped portion (lowercases + normalizes)
+        let tokens = tokenize(stripped);
+        if tokens.is_empty() {
+            continue;
+        }
+        // Use the first token (wildcard applies to a single term)
+        let token = tokens.into_iter().next().expect("tokens is non-empty");
+        let term = match (is_prefix, is_suffix) {
+            (true, true) => {
+                // *foo* — not supported, treat as prefix for now
+                QueryTerm::Prefix(token)
+            }
+            (true, false) => QueryTerm::Prefix(token),
+            (false, true) => QueryTerm::Suffix(token),
+            (false, false) => QueryTerm::Exact(token),
+        };
+        terms.push(term);
+    }
+    terms
+}
+
+impl QueryTerm {
+    /// Returns the inner term string regardless of variant.
+    pub fn term(&self) -> &str {
+        match self {
+            Self::Exact(t) | Self::Prefix(t) | Self::Suffix(t) => t,
+        }
+    }
+
+    /// Returns true if this is a wildcard (prefix or suffix) term.
+    pub fn is_wildcard(&self) -> bool {
+        !matches!(self, Self::Exact(_))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +243,67 @@ mod tests {
             assert!(!t.is_empty());
             assert_eq!(*t, t.to_lowercase());
         }
+    }
+
+    #[test]
+    fn parse_query_exact() {
+        assert_eq!(
+            parse_query("connection timeout"),
+            vec![
+                QueryTerm::Exact("connection".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_prefix() {
+        assert_eq!(
+            parse_query("conn*"),
+            vec![QueryTerm::Prefix("conn".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_query_suffix() {
+        assert_eq!(
+            parse_query("*tion"),
+            vec![QueryTerm::Suffix("tion".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_query_mixed() {
+        assert_eq!(
+            parse_query("conn* timeout *error"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+                QueryTerm::Suffix("error".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_lowercases() {
+        assert_eq!(
+            parse_query("CONN* *TION"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Suffix("tion".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_bare_star_ignored() {
+        assert_eq!(parse_query("*"), Vec::<QueryTerm>::new());
+        assert_eq!(
+            parse_query("hello * world"),
+            vec![
+                QueryTerm::Exact("hello".to_owned()),
+                QueryTerm::Exact("world".to_owned()),
+            ]
+        );
     }
 }

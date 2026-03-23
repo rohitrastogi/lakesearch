@@ -9,6 +9,8 @@ use futures::stream::{self, StreamExt, TryStreamExt};
 use lakesearch_core::metadata::{Manifest, ManifestList, TermStats};
 use lakesearch_core::segment::SegmentReader;
 
+use lakesearch_core::tokenizer::QueryTerm;
+
 use crate::object_cache::ObjectCache;
 use crate::Operator;
 use lakesearch_core::storage::{read_current, read_metadata};
@@ -28,7 +30,7 @@ pub(crate) async fn plan_query(
     cache: &Arc<ObjectCache>,
     base: &Path,
     column: &str,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     operator: Operator,
     io_concurrency: usize,
 ) -> Result<QueryPlan> {
@@ -111,15 +113,22 @@ pub(crate) async fn plan_query(
 }
 
 /// Returns true if the segment can be skipped based on term stats.
+/// Wildcard terms are never pruned (they could match any range).
 fn should_prune_segment(
     term_stats: &TermStats,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     operator: Operator,
 ) -> bool {
     if term_stats.min_term.is_empty() {
         return false;
     }
-    let in_range = |t: &str| t >= term_stats.min_term.as_str() && t <= term_stats.max_term.as_str();
+    let in_range = |qt: &QueryTerm| -> bool {
+        if qt.is_wildcard() {
+            return true; // Never prune wildcards
+        }
+        let t = qt.term();
+        t >= term_stats.min_term.as_str() && t <= term_stats.max_term.as_str()
+    };
     match operator {
         Operator::And => query_terms.iter().any(|t| !in_range(t)),
         Operator::Or => query_terms.iter().all(|t| !in_range(t)),
@@ -141,7 +150,8 @@ pub async fn resolve_schema_from_table(
     use super::{build_empty_schema, build_result_schema};
 
     let current = lakesearch_core::storage::read_current(cache.store().as_ref(), base).await?;
-    let metadata = lakesearch_core::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
+    let metadata =
+        lakesearch_core::storage::read_metadata(cache.store().as_ref(), &current.value).await?;
 
     // Try to find any data file from manifest lists to read its parquet schema.
     for ml_path in &metadata.snapshot.manifest_lists {
