@@ -1,12 +1,13 @@
 //! Async multi-segment query execution.
 //!
-//! The query pipeline has three phases:
-//! 1. **Setup** — plan query, evaluate segments, group candidates, collect stats
-//! 2. **Execute** — two concurrent consumers (indexed + brute-force) stream
-//!    RecordBatches through a shared channel
-//! 3. **Output** — forward stream directly (non-top-K) or accumulate + rank (top-K)
+//! The query pipeline has three stages connected by bounded channels:
+//! 1. **I/O Producers** — tokio tasks stream Parquet pages into a work queue
+//! 2. **CPU Dispatcher** — dispatches verification to the rayon pool via
+//!    `FuturesUnordered`, sends output batches forward
+//! 3. **Coalescer** — accumulates small batches, concatenates at 8192 rows
 
 mod evaluate;
+mod pipeline;
 mod plan;
 mod rank;
 pub mod types;
@@ -33,9 +34,10 @@ use crate::object_cache::ObjectCache;
 use crate::{Operator, QueryResultStream, SendableRecordBatchStream};
 
 use evaluate::{evaluate_segment, group_candidates};
+use pipeline::run_pipeline;
 use plan::{plan_query, resolve_schema};
 use rank::rank_batches;
-use verify::{brute_force_consumer, indexed_consumer};
+use types::SharedQueryContext;
 
 // ---------------------------------------------------------------------------
 // Schema construction
@@ -129,109 +131,54 @@ fn collect_aggregate_stats(segments: &[SegmentReader], query_terms: &[String]) -
 // Setup: shared between run_query and run_query_collected
 // ---------------------------------------------------------------------------
 
-/// Spawns indexed and brute-force consumers, returning their join handles.
-/// The caller must drop the original `tx` so the channel closes when both
-/// consumers finish.
-#[allow(clippy::too_many_arguments)]
-fn spawn_consumers(
-    work_items: Vec<types::IndexedWorkItem>,
-    unindexed_files: Vec<String>,
-    cache: Arc<ObjectCache>,
-    column: String,
+/// Common setup: plan, evaluate segments, group candidates, collect stats.
+/// Returns everything needed to start the pipeline.
+#[allow(clippy::type_complexity, clippy::too_many_arguments)]
+async fn setup_query(
+    cache: &Arc<ObjectCache>,
+    base: &Path,
+    column: &str,
     query_terms: &[String],
     operator: Operator,
-    score_mode: crate::ScoreMode,
-    with_score: bool,
-    limit: Option<usize>,
     select_columns: &[String],
-    agg: &AggregateStats,
-    schema: SchemaRef,
+    with_score: bool,
     io_concurrency: usize,
-    runtime: Arc<LakeRuntime>,
-    tx: tokio::sync::mpsc::Sender<Result<RecordBatch>>,
-) -> (
-    Option<tokio::task::JoinHandle<QueryStats>>,
-    Option<tokio::task::JoinHandle<QueryStats>>,
-) {
-    let qt = Arc::new(query_terms.to_vec());
-    let sc = Arc::new(select_columns.to_vec());
+) -> Result<(
+    Vec<types::IndexedWorkItem>,
+    Vec<String>,
+    SchemaRef,
+    AggregateStats,
+)> {
+    let plan = plan_query(cache, base, column, query_terms, operator, io_concurrency).await?;
+    let schema = resolve_schema(cache, &plan, column, select_columns, with_score).await?;
 
-    let indexed_handle = if !work_items.is_empty() {
-        let indexed_tx = tx.clone();
-        let cache = Arc::clone(&cache);
-        let qt = Arc::clone(&qt);
-        let sc = Arc::clone(&sc);
-        let schema = schema.clone();
-        let runtime = Arc::clone(&runtime);
-        let column = column.clone();
-        Some(tokio::spawn(async move {
-            indexed_consumer(
-                work_items,
-                cache,
-                column,
-                qt,
-                operator,
-                with_score,
-                sc,
-                schema,
-                io_concurrency,
-                runtime,
-                indexed_tx,
-            )
-            .await
-        }))
-    } else {
-        None
-    };
+    let readers: Vec<SegmentReader> = plan
+        .segments
+        .iter()
+        .filter_map(|bytes| SegmentReader::open(bytes.clone()).ok())
+        .collect();
 
-    let bf_handle = if !unindexed_files.is_empty() {
-        let bf_tx = tx.clone();
-        let cache = Arc::clone(&cache);
-        let qt = Arc::clone(&qt);
-        let sc = Arc::clone(&sc);
-        let schema = schema.clone();
-        let runtime = Arc::clone(&runtime);
-        let column = column.clone();
-        let bf_score = score_mode == crate::ScoreMode::All;
-        let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
-        let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-            query_terms
-                .iter()
-                .map(|t| {
-                    let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                    (t.clone(), df)
-                })
-                .collect(),
+    if !readers.is_empty() {
+        info!(segments = readers.len(), "loaded segments");
+    }
+    if !plan.unindexed_files.is_empty() {
+        info!(
+            unindexed_files = plan.unindexed_files.len(),
+            "brute-force scanning un-indexed files"
         );
-        let bf_limit = if !bf_score { limit } else { None };
-        let agg_total_rows = agg.total_rows;
-        Some(tokio::spawn(async move {
-            brute_force_consumer(
-                unindexed_files,
-                cache,
-                column,
-                qt,
-                operator,
-                bf_score,
-                sc,
-                agg_total_rows,
-                agg_avg_dl,
-                agg_term_infos,
-                bf_limit,
-                schema,
-                runtime,
-                bf_tx,
-            )
-            .await
-        }))
-    } else {
-        None
-    };
+    }
 
-    // Drop the original sender so the channel closes when consumer clones are dropped
-    drop(tx);
+    let agg = collect_aggregate_stats(&readers, query_terms);
 
-    (indexed_handle, bf_handle)
+    let mut all_work_items = Vec::new();
+    for reader in &readers {
+        let candidates = evaluate_segment(reader, query_terms, operator)?;
+        if !candidates.is_empty() {
+            all_work_items.extend(group_candidates(reader, &candidates, query_terms));
+        }
+    }
+
+    Ok((all_work_items, plan.unindexed_files, schema, agg))
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +187,8 @@ fn spawn_consumers(
 
 /// Queries a LakeSearch table, returning results as a `SendableRecordBatchStream`.
 ///
-/// Two concurrent consumers (indexed + brute-force) stream `RecordBatch`es
-/// through a shared channel. For top-K queries, an intermediate task
-/// accumulates, ranks, and re-emits.
+/// Launches a three-stage pipeline (I/O → CPU → Coalescer). For top-K
+/// queries, an intermediate task accumulates, ranks, and re-emits.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
     cache: Arc<ObjectCache>,
@@ -268,103 +214,95 @@ pub async fn run_query(
         ));
     }
 
-    let plan = plan_query(
+    let (work_items, unindexed_files, schema, agg) = setup_query(
         &cache,
         &base,
         &column,
         &query_terms,
         operator,
+        &select_columns,
+        with_score,
         io_concurrency,
     )
     .await?;
-    let schema = resolve_schema(&cache, &plan, &column, &select_columns, with_score).await?;
 
-    let readers: Vec<SegmentReader> = plan
-        .segments
-        .iter()
-        .filter_map(|bytes| SegmentReader::open(bytes.clone()).ok())
-        .collect();
-
-    let agg = collect_aggregate_stats(&readers, &query_terms);
     let needs_top_k = with_score && limit.is_some();
+    let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
+    let bf_score = score_mode == crate::ScoreMode::All;
+    let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
+    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
+        query_terms
+            .iter()
+            .map(|t| {
+                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
+                (t.clone(), df)
+            })
+            .collect(),
+    );
 
-    // Build work items from all segments
-    let mut all_work_items = Vec::new();
-    for reader in &readers {
-        let candidates = evaluate_segment(reader, &query_terms, operator)?;
-        if !candidates.is_empty() {
-            all_work_items.extend(group_candidates(reader, &candidates, &query_terms));
-        }
-    }
-
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(16);
-
-    let (indexed_handle, bf_handle) = spawn_consumers(
-        all_work_items,
-        plan.unindexed_files,
-        cache,
-        column,
-        &query_terms,
+    let shared_ctx = Arc::new(SharedQueryContext {
+        query_terms: Arc::new(query_terms),
         operator,
-        score_mode,
-        with_score,
-        limit,
-        &select_columns,
-        &agg,
-        schema.clone(),
-        io_concurrency,
+        with_score: bf_score || with_score,
+        schema: schema.clone(),
+    });
+
+    let early_limit = if !with_score { limit } else { None };
+
+    let (mut final_rx, stats_handle) = run_pipeline(
+        work_items,
+        unindexed_files,
+        cache,
+        shared_ctx,
+        agg.total_rows,
+        agg_avg_dl,
+        agg_term_infos,
+        column,
+        early_limit,
+        candidate_pages,
         runtime,
-        tx,
     );
 
     if needs_top_k {
-        // Accumulate, rank, re-emit
         let schema_clone = schema.clone();
-        let (final_tx, final_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
+        let (ranked_tx, ranked_rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(4);
         tokio::spawn(async move {
             let mut all_batches = Vec::new();
-            let mut rx = rx;
-            while let Some(batch_result) = rx.recv().await {
+            while let Some(batch_result) = final_rx.recv().await {
                 match batch_result {
                     Ok(batch) => all_batches.push(batch),
                     Err(e) => {
-                        let _ = final_tx.send(Err(e)).await;
+                        let _ = ranked_tx.send(Err(e)).await;
                         return;
                     }
                 }
             }
-            // Wait for consumer stats (not used in streaming path, but ensures cleanup)
-            if let Some(h) = indexed_handle {
-                let _ = h.await;
-            }
-            if let Some(h) = bf_handle {
-                let _ = h.await;
-            }
+            let _ = stats_handle.await;
             match rank_batches(all_batches, &schema_clone, true, limit) {
                 Ok(ranked) => {
                     for batch in ranked {
-                        if final_tx.send(Ok(batch)).await.is_err() {
+                        if ranked_tx.send(Ok(batch)).await.is_err() {
                             return;
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = final_tx.send(Err(e)).await;
+                    let _ = ranked_tx.send(Err(e)).await;
                 }
             }
         });
-        let result_stream = QueryResultStream::new(schema, final_rx);
+        let result_stream = QueryResultStream::new(schema, ranked_rx);
         Ok((Box::pin(result_stream), QueryStats::default()))
     } else {
-        let result_stream = QueryResultStream::new(schema, rx);
+        let result_stream = QueryResultStream::new(schema, final_rx);
         Ok((Box::pin(result_stream), QueryStats::default()))
     }
 }
 
 /// Collects all results and returns them with final stats.
 ///
-/// Spawns concurrent consumers, drains the shared channel, joins both
-/// tasks for stats, then ranks and limits.
+/// Launches the three-stage pipeline, drains the output, gets stats
+/// from the CPU dispatcher, then ranks and limits.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query_collected(
     cache: Arc<ObjectCache>,
@@ -387,78 +325,62 @@ pub async fn run_query_collected(
         });
     }
 
-    let plan = plan_query(
+    let (work_items, unindexed_files, schema, agg) = setup_query(
         &cache,
         &base,
         &column,
         &query_terms,
         operator,
+        &select_columns,
+        with_score,
         io_concurrency,
     )
     .await?;
-    let schema = resolve_schema(&cache, &plan, &column, &select_columns, with_score).await?;
 
-    let readers: Vec<SegmentReader> = plan
-        .segments
-        .iter()
-        .filter_map(|bytes| SegmentReader::open(bytes.clone()).ok())
-        .collect();
-
-    if !readers.is_empty() {
-        info!(segments = readers.len(), "loaded segments");
-    }
-    if !plan.unindexed_files.is_empty() {
-        info!(
-            unindexed_files = plan.unindexed_files.len(),
-            "brute-force scanning un-indexed files"
-        );
-    }
-
-    let agg = collect_aggregate_stats(&readers, &query_terms);
-
-    // Build work items from all segments
-    let mut all_work_items = Vec::new();
-    for reader in &readers {
-        let candidates = evaluate_segment(reader, &query_terms, operator)?;
-        if !candidates.is_empty() {
-            all_work_items.extend(group_candidates(reader, &candidates, &query_terms));
-        }
-    }
-
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<RecordBatch>>(16);
-
-    let (indexed_handle, bf_handle) = spawn_consumers(
-        all_work_items,
-        plan.unindexed_files,
-        cache,
-        column,
-        &query_terms,
-        operator,
-        score_mode,
-        with_score,
-        limit,
-        &select_columns,
-        &agg,
-        schema.clone(),
-        io_concurrency,
-        runtime,
-        tx,
+    let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
+    let bf_score = score_mode == crate::ScoreMode::All;
+    let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
+    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
+        query_terms
+            .iter()
+            .map(|t| {
+                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
+                (t.clone(), df)
+            })
+            .collect(),
     );
 
-    // Collect all batches from the merged stream
+    let shared_ctx = Arc::new(SharedQueryContext {
+        query_terms: Arc::new(query_terms),
+        operator,
+        with_score: bf_score || with_score,
+        schema: schema.clone(),
+    });
+
+    let early_limit = if !with_score { limit } else { None };
+
+    let (mut final_rx, stats_handle) = run_pipeline(
+        work_items,
+        unindexed_files,
+        cache,
+        shared_ctx,
+        agg.total_rows,
+        agg_avg_dl,
+        agg_term_infos,
+        column,
+        early_limit,
+        candidate_pages,
+        runtime,
+    );
+
+    // Collect all batches from the pipeline
     let mut all_batches = Vec::new();
-    while let Some(batch_result) = rx.recv().await {
+    while let Some(batch_result) = final_rx.recv().await {
         all_batches.push(batch_result?);
     }
 
-    // Merge stats from both consumers
-    let mut stats = QueryStats::default();
-    if let Some(h) = indexed_handle {
-        stats.merge(&h.await.unwrap_or_default());
-    }
-    if let Some(h) = bf_handle {
-        stats.merge(&h.await.unwrap_or_default());
-    }
+    // Get stats from the CPU dispatcher
+    let stats = stats_handle.await.unwrap_or_default();
 
     // Rank and limit
     all_batches = rank_batches(all_batches, &schema, with_score, limit)?;

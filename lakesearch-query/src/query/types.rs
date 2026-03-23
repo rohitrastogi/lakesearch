@@ -2,9 +2,12 @@
 
 use std::sync::Arc;
 
+use arrow::datatypes::SchemaRef;
 use arrow::record_batch::RecordBatch;
 use lakesearch_core::types::DocTableEntry;
 use serde::{Deserialize, Serialize};
+
+use crate::Operator;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct QueryStats {
@@ -42,4 +45,25 @@ pub(crate) struct IndexedWorkItem {
     pub total_rows: u64,
     /// Per-segment (term, doc_frequency) pairs for BM25 scoring.
     pub term_infos: Arc<Vec<(String, u32)>>,
+}
+
+/// A single RecordBatch ready for CPU verification.
+pub(crate) struct CpuWorkItem {
+    pub batch: RecordBatch,
+    /// True for brute-force batches (use ilike pre-filter).
+    pub use_ilike: bool,
+    pub indexed_batch_col: usize,
+    pub select_col_map: Vec<(usize, String)>,
+    pub is_large: bool,
+    pub avg_dl: f64,
+    pub total_rows: u64,
+    pub term_infos: Arc<Vec<(String, u32)>>,
+}
+
+/// Query-wide context shared across all batches via `Arc`.
+pub(crate) struct SharedQueryContext {
+    pub query_terms: Arc<Vec<String>>,
+    pub operator: Operator,
+    pub with_score: bool,
+    pub schema: SchemaRef,
 }
