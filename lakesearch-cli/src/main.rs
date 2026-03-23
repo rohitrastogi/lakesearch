@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
             let cache =
                 std::sync::Arc::new(lakesearch_query::object_cache::ObjectCache::new(store));
             let runtime = std::sync::Arc::new(LakeRuntime::default());
-            let result = lakesearch_query::query::run_query(
+            let result = lakesearch_query::query::run_query_collected(
                 cache,
                 base,
                 column,
@@ -192,8 +192,24 @@ async fn main() -> Result<()> {
                 runtime,
             )
             .await?;
-            let json = serde_json::to_string_pretty(&result)?;
-            println!("{json}");
+            let mut json_buf = Vec::new();
+            if !result.batches.is_empty() {
+                let mut writer = arrow_json::ArrayWriter::new(&mut json_buf);
+                let batch_refs: Vec<&arrow::record_batch::RecordBatch> =
+                    result.batches.iter().collect();
+                writer.write_batches(&batch_refs)?;
+                writer.finish()?;
+            }
+            let json_rows: Vec<serde_json::Value> = if json_buf.is_empty() {
+                vec![]
+            } else {
+                serde_json::from_slice(&json_buf)?
+            };
+            let output = serde_json::json!({
+                "rows": json_rows,
+                "stats": result.stats,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
         }
     }
     Ok(())

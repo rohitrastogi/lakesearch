@@ -136,10 +136,6 @@ async fn search_round_trip() {
     .await
     .unwrap();
 
-    // Force cache refresh (metadata changed after indexing)
-    // We need to wait or re-register. For tests, just re-query — run_query
-    // reads current.json directly so it picks up the new metadata.
-
     let client = reqwest::Client::new();
     let resp = client
         .post(format!("{base_url}/v1/tables/test/search"))
@@ -158,7 +154,9 @@ async fn search_round_trip() {
     // 2/5 descriptions have both "error" and "timeout" → 40 matches
     assert_eq!(body.stats.rows_matched, 40);
     assert_eq!(body.rows.len(), 3);
-    assert!(body.rows[0].score.is_some());
+    // Rows should have "text" and "score" fields
+    assert!(body.rows[0].contains_key("text"));
+    assert!(body.rows[0].contains_key("score"));
     assert!(body.stats.elapsed_ms > 0);
 
     handle.abort();

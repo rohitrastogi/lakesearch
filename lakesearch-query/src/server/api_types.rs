@@ -63,10 +63,10 @@ impl From<OperatorStr> for crate::Operator {
     }
 }
 
-/// Search response wraps QueryResult with elapsed_ms.
+/// Search response: rows are JSON maps produced from Arrow RecordBatches.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SearchResponse {
-    pub rows: Vec<crate::query::MatchedRow>,
+    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
     pub stats: SearchStats,
 }
 
