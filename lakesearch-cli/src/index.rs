@@ -17,12 +17,12 @@ use lakesearch_core::types::{CorpusStats, DocId};
 use object_store::path::Path;
 use object_store::ObjectStore;
 
-use crate::cas::{commit_metadata, is_batch_duplicate};
-use crate::parquet_util::{
+use lakesearch_query::cas::{commit_metadata, is_batch_duplicate};
+use lakesearch_query::parquet_util::{
     build_page_inventory, load_parquet_metadata_async, read_parquet_batches_async, string_value,
     validate_arrow_column, validate_column,
 };
-use crate::storage::{
+use lakesearch_query::storage::{
     compute_batch_id, read_current, read_metadata, write_manifest, write_manifest_list,
     write_segment,
 };

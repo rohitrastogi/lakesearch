@@ -13,11 +13,11 @@ use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
 use lakesearch_cli::index::run_index;
-use lakesearch_cli::query::run_query;
-use lakesearch_cli::storage::{read_current, read_metadata, write_json};
-use lakesearch_cli::Operator;
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_query::query::run_query;
+use lakesearch_query::storage::{read_current, read_metadata, write_json};
+use lakesearch_query::Operator;
 
 /// Creates a test Parquet file in memory and uploads it to the InMemory store.
 /// Returns the path where it was stored.

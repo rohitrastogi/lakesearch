@@ -1,0 +1,33 @@
+[package]
+name = "lakesearch-query"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "lakesearch-query"
+path = "src/server/main.rs"
+
+[dependencies]
+lakesearch-core = { path = "../lakesearch-core", features = ["runtime"] }
+parquet = { version = "54", features = ["arrow", "async", "object_store"] }
+arrow = "54"
+object_store = { version = "0.11", features = ["aws"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+bytes = "1"
+chrono = { version = "0.4", features = ["serde"] }
+futures = "0.3"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "time", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+axum = "0.8"
+tower-http = { version = "0.6", features = ["trace"] }
+
+[dev-dependencies]
+lakesearch-core = { path = "../lakesearch-core", features = ["test-utils"] }
+lakesearch-cli = { path = "../lakesearch-cli" }
+tempfile = "3"

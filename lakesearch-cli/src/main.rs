@@ -73,7 +73,7 @@ enum OperatorArg {
     Or,
 }
 
-impl From<OperatorArg> for lakesearch_cli::Operator {
+impl From<OperatorArg> for lakesearch_query::Operator {
     fn from(arg: OperatorArg) -> Self {
         match arg {
             OperatorArg::And => Self::And,
@@ -95,9 +95,9 @@ async fn main() -> Result<()> {
             table_name,
             column,
         } => {
-            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+            let (store, base) = lakesearch_query::storage::parse_location(&location)?;
 
-            if lakesearch_cli::storage::current_exists(store.as_ref(), &base).await? {
+            if lakesearch_query::storage::current_exists(store.as_ref(), &base).await? {
                 bail!("table already exists at {location}");
             }
 
@@ -124,13 +124,13 @@ async fn main() -> Result<()> {
             };
 
             let meta_path =
-                lakesearch_cli::storage::write_metadata(store.as_ref(), &base, &metadata).await?;
+                lakesearch_query::storage::write_metadata(store.as_ref(), &base, &metadata).await?;
 
             let pointer = lakesearch_core::metadata::CurrentPointer {
                 metadata_path: meta_path,
                 updated_at: chrono::Utc::now().to_rfc3339(),
             };
-            lakesearch_cli::storage::write_json(
+            lakesearch_query::storage::write_json(
                 store.as_ref(),
                 &base.child("metadata").child("current.json"),
                 &pointer,
@@ -144,7 +144,7 @@ async fn main() -> Result<()> {
             file,
             column,
         } => {
-            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+            let (store, base) = lakesearch_query::storage::parse_location(&location)?;
             let runtime = LakeRuntime::default();
             lakesearch_cli::index::run_index(&store, &base, &file, &column, &runtime).await?;
             println!("Indexing complete.");
@@ -158,9 +158,9 @@ async fn main() -> Result<()> {
             limit,
             select,
         } => {
-            let (store, base) = lakesearch_cli::storage::parse_location(&location)?;
+            let (store, base) = lakesearch_query::storage::parse_location(&location)?;
             let runtime = LakeRuntime::default();
-            let result = lakesearch_cli::query::run_query(
+            let result = lakesearch_query::query::run_query(
                 &store,
                 &base,
                 &column,
