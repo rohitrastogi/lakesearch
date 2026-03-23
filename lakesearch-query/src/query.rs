@@ -164,6 +164,14 @@ pub async fn run_query(
             })
             .collect();
 
+        // For unscored brute-force, we can stop early once limit is reached.
+        // Subtract matches already found by the indexed path.
+        let bf_limit = if !bf_score {
+            limit.map(|l| l.saturating_sub(all_matches.len()))
+        } else {
+            None // Scoring all — need every match for ranking
+        };
+
         let (mut matches, scan_stats) = brute_force_scan(
             &cache,
             &plan.unindexed_files,
@@ -175,6 +183,7 @@ pub async fn run_query(
             agg_total_rows,
             agg_avg_dl,
             &agg_term_infos,
+            bf_limit,
             &runtime,
         )
         .await?;
@@ -573,6 +582,7 @@ async fn brute_force_scan(
     agg_total_rows: u64,
     agg_avg_dl: f64,
     agg_term_infos: &[(String, u32)],
+    limit: Option<usize>,
     runtime: &Arc<LakeRuntime>,
 ) -> Result<(Vec<MatchedRow>, QueryStats)> {
     let mut all_matches = Vec::new();
@@ -645,6 +655,14 @@ async fn brute_force_scan(
             stats.rows_scanned += scan.rows_scanned;
             stats.rows_matched += scan.rows_matched;
             all_matches.append(&mut matches);
+
+            // Early termination: stop scanning once we have enough matches
+            if let Some(lim) = limit {
+                if all_matches.len() >= lim {
+                    all_matches.truncate(lim);
+                    return Ok((all_matches, stats));
+                }
+            }
         }
     }
 

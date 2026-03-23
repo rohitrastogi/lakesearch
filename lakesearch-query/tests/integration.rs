@@ -1094,3 +1094,107 @@ async fn brute_force_case_insensitive() {
         );
     }
 }
+
+#[tokio::test]
+async fn brute_force_early_termination_with_limit() {
+    // With a small limit on an unscored brute-force query, the scan should
+    // stop early — rows_scanned should be less than total rows.
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // Create with multiple small row groups so early termination can
+    // kick in between them. 4 row groups × 25 rows = 100 rows.
+    let file_path = {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("description", DataType::Utf8, true),
+        ]));
+        let ids: Vec<i32> = (0..100).collect();
+        let descs: Vec<Option<&str>> = (0..100).map(|_| Some("hello world")).collect();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int32Array::from(ids)) as ArrayRef,
+                Arc::new(StringArray::from(descs)) as ArrayRef,
+            ],
+        )
+        .unwrap();
+        let mut buf = Vec::new();
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(10)
+            .set_max_row_group_size(25)
+            .set_dictionary_enabled(false)
+            .build();
+        let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        store
+            .put(
+                &Path::from("data/early.parquet"),
+                PutPayload::from(Bytes::from(buf)),
+            )
+            .await
+            .unwrap();
+        "data/early.parquet".to_owned()
+    };
+
+    // Add as un-indexed
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let mut meta = read_metadata(store.as_ref(), &current.value).await.unwrap();
+    let ml = lakesearch_core::metadata::ManifestList {
+        job_kind: lakesearch_core::metadata::JobKind::Append,
+        batch_id: lakesearch_query::storage::compute_batch_id(&[&file_path]),
+        data_files: vec![lakesearch_core::metadata::DataFileEntry {
+            path: file_path.clone(),
+            file_size_bytes: 0,
+            row_count: 100,
+        }],
+        manifests: vec![],
+        replaces: None,
+        compacted_column: None,
+    };
+    let ml_path = lakesearch_query::storage::write_manifest_list(store.as_ref(), &base, &ml)
+        .await
+        .unwrap();
+    meta.snapshot.manifest_lists.push(ml_path);
+    let meta_path = lakesearch_query::storage::write_metadata(store.as_ref(), &base, &meta)
+        .await
+        .unwrap();
+    let pointer = lakesearch_core::metadata::CurrentPointer {
+        metadata_path: meta_path,
+        updated_at: "now".to_owned(),
+    };
+    lakesearch_query::storage::write_json(
+        store.as_ref(),
+        &base.child("metadata").child("current.json"),
+        &pointer,
+    )
+    .await
+    .unwrap();
+
+    // Query with limit=3 (unscored)
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "hello",
+        Operator::Or,
+        false,
+        Some(3),
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(result.matches.len(), 3, "should return exactly 3 matches");
+    // Early termination: should NOT have scanned all 100 rows
+    assert!(
+        result.stats.rows_scanned < 100,
+        "should stop early, scanned {} of 100",
+        result.stats.rows_scanned
+    );
+}
