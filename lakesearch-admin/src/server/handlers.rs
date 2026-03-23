@@ -6,6 +6,7 @@ use lakesearch_core::metadata::{
     ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot,
 };
 
+use crate::cas;
 use crate::storage;
 
 use super::api_types::*;
@@ -49,6 +50,7 @@ pub async fn create_table(
             name: c.name.clone(),
             tokenizer: c.tokenizer.clone(),
             status: ColumnStatus::Active,
+            backfill_manifest_lists: None,
         })
         .collect();
 
@@ -137,18 +139,7 @@ pub async fn get_table(
         .await
         .map_err(ApiError::Internal)?;
 
-    let columns = metadata
-        .indexed_columns
-        .iter()
-        .map(|c| ColumnInfo {
-            name: c.name.clone(),
-            tokenizer: c.tokenizer.clone(),
-            status: serde_json::to_value(&c.status)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| format!("{:?}", c.status)),
-        })
-        .collect();
+    let columns = columns_to_info(&metadata.indexed_columns);
 
     Ok(Json(TableInfoResponse {
         table_id: metadata.table_id,
@@ -174,4 +165,95 @@ pub async fn delete_table(
         table_id,
         message: "table unregistered (data not deleted)".to_owned(),
     }))
+}
+
+pub async fn update_columns(
+    State(state): State<AppState>,
+    Path(table_id): Path<String>,
+    Json(req): Json<UpdateColumnsRequest>,
+) -> Result<Json<UpdateColumnsResponse>, ApiError> {
+    if req.add.is_empty() && req.drop.is_empty() {
+        return Err(ApiError::BadRequest(
+            "at least one add or drop is required".to_owned(),
+        ));
+    }
+
+    let reg = state
+        .registry
+        .get(&table_id)
+        .await
+        .ok_or_else(|| ApiError::NotFound(format!("table '{table_id}' not found")))?;
+
+    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let metadata = storage::read_metadata(reg.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let add_defs = req.add;
+    let drop_names = req.drop;
+
+    cas::commit_metadata(
+        reg.store.as_ref(),
+        &reg.base,
+        current.e_tag,
+        &metadata,
+        |meta| {
+            let mut new = meta.clone();
+
+            // Drop columns (soft-delete)
+            for col in &mut new.indexed_columns {
+                if drop_names.contains(&col.name) && col.status != ColumnStatus::Dropped {
+                    col.status = ColumnStatus::Dropped;
+                    col.backfill_manifest_lists = None;
+                }
+            }
+
+            // Add new columns (skip if name already exists)
+            for def in &add_defs {
+                if new.indexed_columns.iter().any(|c| c.name == def.name) {
+                    continue;
+                }
+                new.indexed_columns.push(IndexedColumn {
+                    name: def.name.clone(),
+                    tokenizer: def.tokenizer.clone(),
+                    status: ColumnStatus::Active,
+                    backfill_manifest_lists: None,
+                });
+            }
+
+            new
+        },
+    )
+    .await
+    .map_err(ApiError::Internal)?;
+
+    // Re-read committed state for response
+    let current = storage::read_current(reg.store.as_ref(), &reg.base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let final_meta = storage::read_metadata(reg.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
+
+    let columns = columns_to_info(&final_meta.indexed_columns);
+
+    info!(table_id = %table_id, "updated columns");
+
+    Ok(Json(UpdateColumnsResponse { columns }))
+}
+
+fn columns_to_info(columns: &[IndexedColumn]) -> Vec<ColumnInfo> {
+    columns
+        .iter()
+        .map(|c| ColumnInfo {
+            name: c.name.clone(),
+            tokenizer: c.tokenizer.clone(),
+            status: serde_json::to_value(&c.status)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_else(|| format!("{:?}", c.status)),
+        })
+        .collect()
 }

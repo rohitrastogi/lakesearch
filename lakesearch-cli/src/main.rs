@@ -125,6 +125,7 @@ async fn main() -> Result<()> {
                     name: name.clone(),
                     tokenizer: DEFAULT_TOKENIZER.to_owned(),
                     status: ColumnStatus::Active,
+                    backfill_manifest_lists: None,
                 })
                 .collect();
 

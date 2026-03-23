@@ -65,3 +65,20 @@ pub struct DeleteTableResponse {
     pub table_id: String,
     pub message: String,
 }
+
+// --- Columns ---
+
+#[derive(Debug, Deserialize)]
+pub struct UpdateColumnsRequest {
+    /// Columns to add. Ignored if the column name already exists.
+    #[serde(default)]
+    pub add: Vec<ColumnDef>,
+    /// Column names to drop (soft-delete: sets status to `dropped`).
+    #[serde(default)]
+    pub drop: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UpdateColumnsResponse {
+    pub columns: Vec<ColumnInfo>,
+}
