@@ -1,4 +1,5 @@
 pub mod cas;
+pub mod object_cache;
 pub mod parquet_util;
 pub mod query;
 pub mod server;

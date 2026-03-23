@@ -10,16 +10,18 @@ use tracing::{debug, warn};
 
 use lakesearch_core::metadata::Metadata;
 
+use crate::object_cache::ObjectCache;
 use crate::storage::{parse_location, read_current, read_metadata};
 
 /// Cached state for a single table.
 struct TableState {
-    store: Arc<dyn ObjectStore>,
     base: Path,
     /// Latest known metadata_path from current.json.
     current_metadata_path: String,
     /// Parsed metadata (immutable once loaded, swapped atomically).
     metadata: Arc<Metadata>,
+    /// Shared object cache for this table (segments, manifests, parquet metadata).
+    object_cache: Arc<ObjectCache>,
 }
 
 /// Caches metadata for registered tables. Background task polls for updates.
@@ -39,18 +41,7 @@ impl MetadataCache {
     /// Registers a table by loading its metadata from object storage.
     pub async fn register(&self, name: &str, location: &str) -> Result<()> {
         let (store, base) = parse_location(location)?;
-        let current = read_current(store.as_ref(), &base).await?;
-        let metadata = read_metadata(store.as_ref(), &current.value).await?;
-
-        let state = TableState {
-            store,
-            base,
-            current_metadata_path: current.value.metadata_path.clone(),
-            metadata: Arc::new(metadata),
-        };
-
-        self.tables.write().await.insert(name.to_owned(), state);
-        Ok(())
+        self.register_with_store(name, store, base).await
     }
 
     /// Registers a table with an already-constructed object store and base path.
@@ -65,10 +56,10 @@ impl MetadataCache {
         let metadata = read_metadata(store.as_ref(), &current.value).await?;
 
         let state = TableState {
-            store,
             base,
             current_metadata_path: current.value.metadata_path.clone(),
             metadata: Arc::new(metadata),
+            object_cache: Arc::new(ObjectCache::new(store)),
         };
 
         self.tables.write().await.insert(name.to_owned(), state);
@@ -84,13 +75,13 @@ impl MetadataCache {
             .map(|s| Arc::clone(&s.metadata))
     }
 
-    /// Returns the object store and base path for a table.
-    pub async fn get_store(&self, name: &str) -> Option<(Arc<dyn ObjectStore>, Path)> {
+    /// Returns the shared object cache and base path for a table.
+    pub async fn get_cache(&self, name: &str) -> Option<(Arc<ObjectCache>, Path)> {
         self.tables
             .read()
             .await
             .get(name)
-            .map(|s| (Arc::clone(&s.store), s.base.clone()))
+            .map(|s| (Arc::clone(&s.object_cache), s.base.clone()))
     }
 
     /// Returns names of all registered tables.
@@ -126,7 +117,7 @@ impl MetadataCache {
                 .get(name)
                 .ok_or_else(|| anyhow::anyhow!("table '{name}' not registered"))?;
             (
-                Arc::clone(&state.store),
+                Arc::clone(state.object_cache.store()),
                 state.base.clone(),
                 state.current_metadata_path.clone(),
             )

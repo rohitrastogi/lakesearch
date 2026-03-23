@@ -14,16 +14,16 @@ use lakesearch_core::segment::SegmentReader;
 use lakesearch_core::tokenizer::tokenize;
 use lakesearch_core::types::DocId;
 use object_store::path::Path;
-use object_store::ObjectStore;
 use parquet::file::metadata::ParquetMetaData;
 
 use serde::Serialize;
 
+use crate::object_cache::ObjectCache;
 use crate::parquet_util::{
-    arrow_value_to_json, build_row_selection, load_parquet_metadata_async,
-    read_parquet_batches_async, string_value, validate_column,
+    arrow_value_to_json, build_row_selection, read_parquet_batches_async, string_value,
+    validate_column,
 };
-use crate::storage::{load_bytes, read_current, read_manifest, read_manifest_list, read_metadata};
+use crate::storage::{read_current, read_metadata};
 use crate::Operator;
 
 /// Max concurrent I/O operations for parallel loading.
@@ -56,7 +56,7 @@ pub struct QueryStats {
 /// Queries a LakeSearch table in object storage across all segments.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_query(
-    store: Arc<dyn ObjectStore>,
+    cache: Arc<ObjectCache>,
     base: Path,
     column: String,
     query_text: &str,
@@ -67,18 +67,19 @@ pub async fn run_query(
     runtime: Arc<LakeRuntime>,
 ) -> Result<QueryResult> {
     // 1. Load metadata chain
-    let current_result = read_current(store.as_ref(), &base).await?;
-    let metadata = read_metadata(store.as_ref(), &current_result.value).await?;
+    let current_result = read_current(cache.store().as_ref(), &base).await?;
+    let metadata = read_metadata(cache.store().as_ref(), &current_result.value).await?;
 
-    // 2. Load manifest lists in parallel, collect segment paths
-    let manifest_lists: Vec<_> = stream::iter(metadata.snapshot.manifest_lists.into_iter())
-        .map(|ml_path| {
-            let store = Arc::clone(&store);
-            async move { read_manifest_list(store.as_ref(), &ml_path).await }
-        })
-        .buffered(IO_CONCURRENCY)
-        .try_collect::<Vec<_>>()
-        .await?;
+    // 2. Load manifest lists (cached), collect segment paths
+    let manifest_lists: Vec<lakesearch_core::metadata::ManifestList> =
+        stream::iter(metadata.snapshot.manifest_lists.into_iter())
+            .map(|ml_path| {
+                let cache = Arc::clone(&cache);
+                async move { cache.get_json(&ml_path).await }
+            })
+            .buffered(IO_CONCURRENCY)
+            .try_collect::<Vec<_>>()
+            .await?;
 
     let mut segment_paths: Vec<String> = Vec::new();
     for ml in &manifest_lists {
@@ -86,18 +87,19 @@ pub async fn run_query(
             if me.indexed_column != column {
                 continue;
             }
-            let manifest = read_manifest(store.as_ref(), &me.manifest_path).await?;
+            let manifest: lakesearch_core::metadata::Manifest =
+                cache.get_json(&me.manifest_path).await?;
             for seg_info in &manifest.segments {
                 segment_paths.push(seg_info.segment_path.clone());
             }
         }
     }
 
-    // Load segment bytes in parallel
+    // Load segment bytes (cached)
     let segment_bytes_list: Vec<Vec<u8>> = stream::iter(segment_paths.into_iter())
         .map(|path| {
-            let store = Arc::clone(&store);
-            async move { load_bytes(store.as_ref(), &path).await.map(|b| b.to_vec()) }
+            let cache = Arc::clone(&cache);
+            async move { cache.get_bytes(&path).await.map(|b| b.to_vec()) }
         })
         .buffered(IO_CONCURRENCY)
         .try_collect()
@@ -194,21 +196,17 @@ pub async fn run_query(
             .into_iter()
             .collect();
 
-        let pq_metas: Vec<(u32, ParquetMetaData)> = stream::iter(unique_file_ords.into_iter())
+        let pq_metas: Vec<(u32, Arc<ParquetMetaData>)> = stream::iter(unique_file_ords.into_iter())
             .map(|fo| {
-                let store = Arc::clone(&store);
+                let cache = Arc::clone(&cache);
                 let fp = file_table[fo as usize].path.clone();
-                async move {
-                    load_parquet_metadata_async(&store, &fp)
-                        .await
-                        .map(|meta| (fo, meta))
-                }
+                async move { cache.get_parquet_metadata(&fp).await.map(|meta| (fo, meta)) }
             })
             .buffered(IO_CONCURRENCY)
             .try_collect()
             .await?;
 
-        let pq_meta_cache: HashMap<u32, ParquetMetaData> = pq_metas.into_iter().collect();
+        let pq_meta_map: HashMap<u32, Arc<ParquetMetaData>> = pq_metas.into_iter().collect();
 
         // Read and verify rows per group
         for ((file_ordinal, rg_idx), doc_ids) in &groups {
@@ -222,7 +220,7 @@ pub async fn run_query(
             entries.dedup_by_key(|e| e.first_row_index);
             stats.candidate_pages += entries.len();
 
-            let pq_meta = &pq_meta_cache[file_ordinal];
+            let pq_meta = &pq_meta_map[file_ordinal];
             let rg_total_rows = pq_meta.row_group(*rg_idx as usize).num_rows();
 
             let selection = build_row_selection(&entries, rg_total_rows);
@@ -262,7 +260,7 @@ pub async fn run_query(
                 .collect();
 
             let batches = read_parquet_batches_async(
-                &store,
+                cache.store(),
                 file_path,
                 *rg_idx as usize,
                 &leaf_indices,

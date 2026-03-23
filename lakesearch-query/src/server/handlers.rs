@@ -64,10 +64,10 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, ApiError> {
     let start = std::time::Instant::now();
 
-    // Look up table
-    let (store, base) = state
+    // Look up table — get the shared object cache (persists across queries)
+    let (object_cache, base) = state
         .cache
-        .get_store(&table_name)
+        .get_cache(&table_name)
         .await
         .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
 
@@ -94,7 +94,7 @@ pub async fn search(
     let result = tokio::time::timeout(
         state.config.query_timeout,
         crate::query::run_query(
-            store,
+            object_cache,
             base,
             req.search.column.clone(),
             &req.search.match_text,

@@ -15,6 +15,7 @@ use parquet::file::properties::WriterProperties;
 use lakesearch_cli::index::run_index;
 use lakesearch_core::metadata::{ColumnStatus, CurrentPointer, IndexedColumn, Metadata, Snapshot};
 use lakesearch_core::runtime::LakeRuntime;
+use lakesearch_query::object_cache::ObjectCache;
 use lakesearch_query::query::{self, QueryResult};
 use lakesearch_query::storage::{read_current, read_metadata, write_json};
 use lakesearch_query::Operator;
@@ -32,8 +33,9 @@ async fn run_query(
     select_columns: &[String],
     _runtime: &LakeRuntime,
 ) -> anyhow::Result<QueryResult> {
+    let cache = Arc::new(ObjectCache::new(Arc::clone(store)));
     query::run_query(
-        Arc::clone(store),
+        cache,
         base.clone(),
         column.to_owned(),
         query_text,
