@@ -91,6 +91,38 @@ historical analysis.
 
 ## 2. Architecture
 
+### Table Resolution Model
+
+LakeSearch does not assume that every backend uses the same number of
+name components. Instead, it separates:
+
+- a **LakeSearch catalog alias** (owned by LakeSearch)
+- a **backend-owned table path** (interpreted by the catalog backend)
+
+For server / REST / Flight requests, `table` is a dotted string:
+
+```text
+catalog_alias.path.to.table
+```
+
+Examples:
+
+- `prod.events`
+- `prod.analytics.events`
+- `prod.a.b.c`
+
+LakeSearch parses the first segment as the catalog alias. The remaining
+segments are passed to the backend implementation, which decides how to
+interpret them. For example:
+
+- Iceberg may treat `analytics.events` as namespace `analytics`, table `events`
+- Iceberg may treat `a.b.c` as namespace `a.b`, table `c`
+- DuckLake may treat `events` as a flat table name
+- DuckLake may treat `main.events` as schema `main`, table `events`
+
+For the CLI, the user supplies `--catalog-uri` out of band, so `--table`
+is backend-relative and does not need the LakeSearch catalog alias.
+
 ### Library-First Deployment Model
 
 The `LakeSearch` struct is the primary API surface. It wraps all
@@ -100,27 +132,36 @@ methods — no direct interaction with SlateDB, catalogs, or object
 store internals.
 
 ```rust
-// Read-only handle (query, vacuum) — safe for concurrent use, no fencing
-let ls = LakeSearch::open("ducklake:./events.ducklake", "events").await?;
+// CLI / embedded single-catalog usage: convenience constructor
+// resolves a backend-relative table path from a catalog URI.
+let ls = LakeSearch::open_from_uri("ducklake:./events.ducklake", &["events"]).await?;
 ls.query(query_request).await?;
 ls.vacuum(VacuumRequest { grace_period: None }).await?;
 
 // Read-write handle (all operations) — takes writer lock, fences other writers
-let ls = LakeSearch::open_mut("ducklake:./events.ducklake", "events").await?;
-ls.add_index("description", "default").await?;
+let ls = LakeSearch::open_mut_from_uri("ducklake:./events.ducklake", &["events"]).await?;
+ls.add_index("description", "whitespace_lowercase").await?;
 ls.drop_index("description").await?;
-ls.index(IndexRequest { target_snapshot: None }).await?;
-ls.compact(CompactRequest {}).await?;
+ls.index(IndexRequest { target_snapshot: None, target_segment_size: None }).await?;
+ls.compact(CompactRequest { target_segment_size: None }).await?;
 ls.query(query_request).await?;
 ls.vacuum(VacuumRequest { grace_period: None }).await?;
+
+// Query server / multi-catalog usage: resolve lazily from an alias + path
+let catalog = server_catalogs.get("prod")?;
+let table = catalog.resolve_table(&["analytics".into(), "events".into()]).await?;
+let ls = LakeSearch::open(table).await?;
 ```
 
-`open` parses the catalog URI, constructs the appropriate
-`DataLakeCatalog` implementation, resolves the table's storage path,
-and opens SlateDB in read-only mode (`DbReader`). `open_mut` does the
-same but opens SlateDB in writer mode (`Db`), which fences out any
-other writer on the same table. Calling `index()` or `compact()` on
-a read-only handle returns a clear error.
+`open(table)` and `open_mut(table)` take `Arc<dyn ResolvedTable>` and
+open SlateDB in read-only (`DbReader`) or writer (`Db`) mode
+respectively. The convenience constructors `open_from_uri` and
+`open_mut_from_uri` exist for single-catalog callers such as the CLI:
+they construct a backend-specific `Catalog`, resolve the backend-owned
+`--table` path, and then call the lower-level `open` / `open_mut`.
+
+Calling `index()` or `compact()` on a read-only handle returns a clear
+error.
 
 Internally, `LakeSearch` holds an enum over the two handle types:
 
@@ -135,49 +176,65 @@ enum MetadataHandle {
 `Reader`. `query()` and `vacuum()` work with either — `Db` supports
 reads too.
 
-The query server uses `open` (read-only, multiple instances). The CLI
-uses `open_mut` for index/compact and `open` for query/vacuum.
+The query server uses lazy `Catalog::resolve_table(...)` + `open`
+(read-only) and caches the resulting handles by the full external table
+reference. The CLI uses `open_mut_from_uri` for mutating operations and
+`open_from_uri` for read-only operations.
 
 ### CLI
 
 Thin wrapper around the library:
 
 ```
-lakesearch init         --table events --column description --catalog ducklake:./events.ducklake
-lakesearch add-index   --table events --column description [--tokenizer default]
-lakesearch drop-index  --table events --column description
-lakesearch index        --table events [--snapshot 5]
-lakesearch compact      --table events
-lakesearch vacuum       --table events [--grace-period 1h]
-lakesearch query        --table events --column description --query "error timeout" [--limit 100]
+lakesearch add-index   --catalog-uri ducklake:./events.ducklake --table events --column description [--tokenizer whitespace_lowercase]
+lakesearch drop-index  --catalog-uri ducklake:./events.ducklake --table events --column description
+lakesearch index        --catalog-uri ducklake:./events.ducklake --table events [--snapshot 5]
+lakesearch compact      --catalog-uri ducklake:./events.ducklake --table events
+lakesearch vacuum       --catalog-uri ducklake:./events.ducklake --table events [--grace-period 1h]
+lakesearch query        --catalog-uri ducklake:./events.ducklake --table events (--json '{...}' | --json-file query.json)
 ```
 
-`init` connects to the catalog, verifies the table exists, resolves
-the table's storage path (e.g., DuckLake's `DATA_PATH`, Iceberg's
-`table.location`), and creates the SlateDB instance at
-`{table_path}/lakesearch/slatedb/`. The `table_id` is the user-provided
-`--table` name (e.g., "events") — it's a human-readable identifier used
-as a key prefix in SlateDB, not a UUID. Writes `meta|{table_id}|config`
-with the indexed columns, tokenizer settings, and catalog connection
-info. No snapshot pointers or corpus stats yet — those are created by
-the first `index` call. Idempotent — re-running with the same config
-is a no-op.
+For the CLI, `--catalog-uri` selects a single backend catalog for the
+entire invocation and `--table` is interpreted relative to that catalog.
+The CLI accepts canonical JSON only for the nested query payload; it
+does not define a second flag-based query language.
+
+There is no separate `init` command. `add-index` is the initializer:
+it resolves the table, creates SlateDB metadata if missing, and writes
+the initial `TableConfig`. Later `drop-index`, `index`, `query`,
+`compact`, and `vacuum` operate against that initialized metadata. If any non-
+initializing verb is called for a resolvable table that does not yet
+have LakeSearch metadata, the command returns a clear "run add-index
+first" error.
 
 ### Server (Optional)
 
-The query service is the only server component. Its config is a list
-of table paths — everything else (columns, catalog URI, segment
-metadata) is already in each table's SlateDB:
+The query service is the only server component. Its config is a catalog
+meta file keyed by LakeSearch catalog alias:
 
 ```yaml
-tables:
-  - s3://bucket/warehouse/events/
-  - s3://bucket/warehouse/logs/
+catalogs:
+  prod:
+    kind: ducklake
+    uri: ducklake:./prod.ducklake
+  analytics:
+    kind: iceberg
+    uri: https://catalog.example.com
 ```
 
-On startup, the server opens `LakeSearch::open()` (read-only) for each
-table path and serves queries against them. No column config, no
-catalog URIs in the server config — those are in SlateDB.
+The server does **not** pre-open tables at startup. Instead, for each
+query:
+
+1. Parse the `table` string into `catalog_alias + backend path`
+2. Select the configured `Catalog` for that alias
+3. Call `resolve_table(...)` on the backend-owned path
+4. Open or reuse a cached read-only `LakeSearch` handle for that
+   resolved table
+
+This keeps startup light, avoids a static table list, and still allows
+hot tables to benefit from caching. The server stays on the read path:
+`query` plus optional future read-only metadata endpoints. Mutating
+operations remain CLI-only by default.
 
 A long-running server caches:
 - SlateDB reads (segment index entries) — avoids repeated object store reads.
@@ -363,15 +420,20 @@ Each segment indexes a single column.
 #### Dense doc_id space (not inline PageRef tuples)
 
 Each page indexed by a segment is assigned a dense, segment-local `doc_id`
-(0, 1, 2, ..., N-1). Posting lists contain sorted `doc_id` arrays. A separate
+(0, 1, 2, ..., N-1). Posting lists contain sorted entries keyed by `doc_id`.
+Each posting entry also carries `row_hit_count: u32` = the number of rows in
+that page containing the term at least once. By construction,
+`0 < row_hit_count <= row_count` for the referenced page. A separate
 **doc table** maps each `doc_id` back to its Parquet location.
 
 We chose this over embedding `(file_id, row_group, page)` tuples directly in
 posting lists for several reasons:
 
-- **Compact posting lists.** Each entry is a single `u32` (4 bytes) instead of
-  an 8-byte tuple. Posting lists are the largest section of a segment and are
-  read on every query, so this matters.
+- **Compact posting lists.** Each entry stores a dense `doc_id` plus a
+  bit-packed `row_hit_count`, which is still substantially more compact and
+  compressible than repeating `(file_id, row_group, page)` tuples per hit.
+  Posting lists are the largest section of a segment and are read on every
+  query, so this matters.
 - **Better delta encoding.** Dense doc_ids produce small, regular deltas (often
   just 1), which compress extremely well with varint or bit-packing.
 - **Faster intersection.** Intersecting sorted `u32` arrays is a well-studied
@@ -380,6 +442,10 @@ posting lists for several reasons:
 - **Natural place for page metadata.** The doc table stores `first_row_index`
   and `row_count` per page, which are needed for cross-column intersection.
   Without a doc table, this metadata would need a separate structure anyway.
+- **Exact compaction statistics.** `row_hit_count` lives in the posting entry
+  because it is term-specific. Compact can sum surviving `row_hit_count`
+  values after stale filtering to recompute row-level `doc_frequency`
+  exactly, without rereading Parquet.
 
 The tradeoff is one level of indirection: after boolean evaluation produces a
 set of `doc_id`s, we look them up in the doc table to get Parquet locations.
@@ -528,7 +594,9 @@ everything needed for query planning without knowing section sizes in advance.
 4. For a query term, look up the forward FST to get `term_ordinal`.
    For a suffix query, reverse the suffix and prefix-search the reverse FST.
 5. Read `term_info_table[term_ordinal]` to get posting offset and `doc_frequency`
-6. Seek to posting data, decompress and decode the `doc_id` list
+6. Seek to posting data, decompress and decode the posting entries
+   (`doc_id`, `row_hit_count`). Queries usually use only `doc_id`;
+   compaction also consumes `row_hit_count`.
 7. Resolve `doc_id`s through the doc table to get Parquet page locations
 8. Read corpus stats for BM25 parameters (`total_rows`, `total_tokens`)
 
@@ -567,43 +635,56 @@ format. We optimize segment I/O in two ways:
 
 ### Posting List Compression
 
-Each posting list is encoded as a sequence of **blocks** of up to 128 `doc_id`s:
+Each posting list is encoded as a sequence of **blocks** of up to 128 posting
+entries:
 
 ```
-+--------------------------------------+
-| Block Header (15 bytes)              |
-|   num_docs: u16                      |
-|   min_doc_id: u32     <- skip-ahead  |
-|   bit_width: u8       <- bits/delta  |
-|   flags: u8           <- bit 0: LZ4  |
-|   compressed_size: u32               |
-|   uncompressed_size: u16             |
-+--------------------------------------+
-| Compressed Data                      |
-|   delta-encoded doc_ids, bit-packed  |
-|   (optionally LZ4-compressed)        |
-+--------------------------------------+
++------------------------------------------+
+| Block Header (16 bytes)                  |
+|   num_entries: u16                       |
+|   min_doc_id: u32     <- skip-ahead      |
+|   doc_id_bit_width: u8                   |
+|   row_hit_bit_width: u8                  |
+|   flags: u8            <- bit 0: LZ4     |
+|   reserved: u8                           |
+|   compressed_size: u32                   |
+|   uncompressed_size: u16                 |
++------------------------------------------+
+| Compressed Data                          |
+|   delta-encoded doc_id stream            |
+|   bit-packed row_hit_count stream        |
+|   (optionally LZ4-compressed together)   |
++------------------------------------------+
 ```
 
 Encoding within a block:
-1. Delta-encode the sorted `doc_id` array (dense IDs -> small deltas, often 1)
-2. Determine `bit_width`: minimum bits needed to represent the largest delta
-3. Bit-pack the deltas into `ceil(num_docs * bit_width / 8)` bytes
-4. If `flags & 0x01`: apply LZ4 block compression on the bit-packed data.
+1. Sort posting entries by `doc_id`
+2. Delta-encode the `doc_id` array (dense IDs -> small deltas, often 1)
+3. Determine `doc_id_bit_width` and `row_hit_bit_width`
+4. Bit-pack the delta-encoded `doc_id` stream
+5. Bit-pack the `row_hit_count` stream (`u32` logical values)
+6. Concatenate the two streams
+7. If `flags & 0x01`: apply LZ4 block compression on the concatenated payload.
    `compressed_size` is the LZ4 output size; `uncompressed_size` is needed
    for LZ4 decompression. If LZ4 is not applied, `compressed_size` equals
-   the bit-packed size and `uncompressed_size` is ignored.
+   the concatenated payload size and `uncompressed_size` is ignored.
 
-The `bit_width` field is always stored in the header so the decoder knows
-how to unpack deltas regardless of whether LZ4 is applied.
+The bit-width fields are always stored in the header so the decoder knows
+how to unpack both streams regardless of whether LZ4 is applied.
 
 The block structure enables skip-ahead during intersection: read `min_doc_id`
 from each block header to decide whether to decompress it.
 
+Queries use `row_hit_count` only indirectly (through the precomputed
+`doc_frequency` in the term info table). Compact reads and preserves it
+explicitly so stale filtering can rebuild exact row-level `doc_frequency`
+without rereading Parquet.
+
 Because `doc_id`s are dense and sorted, delta encoding is highly effective:
 most deltas are 1 (consecutive pages) or small integers (sparse hits). This
-compresses significantly better than delta-encoding three separate fields from
-an 8-byte `(file_id, row_group, page)` tuple.
+keeps the location stream compact. `row_hit_count` adds a second small
+bit-packed stream, but the posting format is still substantially more
+compressible than repeating `(file_id, row_group, page)` tuples per hit.
 
 ---
 
@@ -616,7 +697,9 @@ MVP tokenizer: `whitespace_lowercase`
 3. Normalize to NFC
 4. Filter tokens shorter than 1 character or longer than 256 bytes
 5. Each surviving token becomes a term in the posting list
-6. Count occurrences per row for BM25 `doc_frequency` aggregation at index time
+6. Track term presence per row, then aggregate it into:
+   - row-level `doc_frequency` for the term info table
+   - per-page `row_hit_count` for each posting entry
 
 Future tokenizers (not MVP): stemming, n-grams, language-specific.
 
@@ -636,11 +719,22 @@ fetch; scoring must happen after decoding individual rows.
 
 ### Scoring Flow
 
-1. **From the segment file**: read `doc_frequency(t)` (per term, from term info
-   table) and corpus stats (`total_rows`, `total_tokens` -> `avg_dl`)
-2. **Fetch matching pages** from Parquet files using `RowSelection`
-3. **For each row** in a fetched page: tokenize the field value, compute per-row
-   term frequency (`tf`), and score using BM25
+1. **Indexed contribution**: read indexed `doc_frequency(t)` (per term,
+   from segment term info tables) and indexed corpus stats
+   (`total_rows`, `total_tokens`) from SlateDB.
+2. **Unindexed contribution** (only when `score: true` and some searched
+   column is behind the current snapshot): brute-force pass 1 over the
+   union of unindexed files accumulates exact per-column deltas for the
+   columns whose coverage does not yet include each file:
+   - `delta_rows`
+   - `delta_tokens`
+   - `delta_df[t]` = number of rows in the unindexed tail containing
+     query term `t`
+3. **Finalize BM25 parameters** per searched column from the indexed
+   corpus plus any brute-force deltas.
+4. **Fetch / verify matching rows** from indexed and brute-force paths.
+5. **For each verified row**: compute per-row term frequency (`tf`) and
+   score using BM25.
 
 ### BM25 Formula
 
@@ -652,36 +746,69 @@ Where:
 - `tf(t, row)` = term frequency of term `t` in this row (computed at query time
   by tokenizing the row's field value)
 - `dl` = document length = total token count of this row's field value
-- `avg_dl` = `total_tokens / total_rows` (from corpus stats in segment)
+- `avg_dl` = `global_total_tokens / global_N` for this searched column
 - `IDF(t) = ln(1 + (N - df(t) + 0.5) / (df(t) + 0.5))`
-- `N` = `total_rows` from global corpus stats (SlateDB)
-- `df(t)` = sum of `doc_frequency` across all segments containing the term (see Cross-Segment Scoring)
+- `N` = `global_N` = total rows in the full queried corpus for this
+  searched column (indexed rows plus any unindexed tail)
+- `df(t)` = row-level document frequency for term `t` over that same
+  full corpus (see Cross-Segment and Mixed-Coverage Scoring)
 - `k1 = 1.2`, `b = 0.75` (standard defaults)
 
-### Cross-Segment Scoring
+BM25 parameters are computed per searched column. For a row matching
+multiple columns, LakeSearch computes one BM25 contribution per column
+and sums them.
 
-When a query spans multiple segments, BM25 uses **global statistics**
-aggregated across all segments. There is no segment-local scoring
-approximation — the correct version costs the same as the approximate
-one.
+### Cross-Segment and Mixed-Coverage Scoring
 
-**Why global stats are free**: By the time we score, we've already
-loaded all candidate segments (for posting list evaluation). Each
-segment's term info table — loaded in the speculative tail read —
-contains `doc_frequency` for each term. Global corpus stats (`N`,
-`total_tokens`) are already read from SlateDB at query start.
+When a query spans multiple segments, or mixes indexed files with an
+unindexed tail, BM25 uses **global statistics over the full queried
+corpus** for each searched column. There is no segment-local scoring
+approximation.
 
-**Aggregation**:
+**Indexed contribution**: By the time we score, we've already loaded the
+candidate segments needed for posting list evaluation. Each segment's
+term info table — loaded in the speculative tail read — contains
+row-level `doc_frequency` for each term. Indexed corpus stats
+(`total_rows`, `total_tokens`) are already read from SlateDB at query
+start.
+
 ```
-global_N = corpus_stats.total_rows           (from SlateDB)
-global_avg_dl = if global_N > 0 { corpus_stats.total_tokens / global_N } else { 0.0 }
+indexed_rows = corpus_stats.total_rows           (from SlateDB)
+indexed_tokens = corpus_stats.total_tokens       (from SlateDB)
 For each query term t:
-  global_df[t] = sum(segment.term_info(t).doc_frequency
-                     for segment in loaded_segments
-                     if segment.fst.contains(t))
+  indexed_df[t] = sum(segment.term_info(t).doc_frequency
+                      for segment in loaded_segments
+                      if segment.fst.contains(t))
 ```
 
-This is just an addition across values already in memory. No extra I/O.
+**Unindexed tail contribution**: If a searched column has unindexed
+files and the query requests ranking (`score: true`), brute-force pass 1
+tokenizes every row in that column once for the files not yet covered by
+that column's snapshot pointer and accumulates:
+
+```
+delta_rows += 1 per row in unindexed files
+delta_tokens += dl(row)
+For each query term t:
+  delta_df[t] += 1 if row contains term t at least once
+```
+
+After brute-force pass 1 finishes for that column:
+
+```
+global_N = indexed_rows + delta_rows
+global_total_tokens = indexed_tokens + delta_tokens
+global_avg_dl = if global_N > 0 {
+  global_total_tokens / global_N
+} else {
+  0.0
+}
+For each query term t:
+  global_df[t] = indexed_df[t] + delta_df[t]
+```
+
+If there is no unindexed tail, then `delta_* = 0` and scoring reduces
+to the indexed-only case.
 
 **Zero edge case**: If `global_N == 0` (all segments for a column were
 stale-deleted by compact, or column was just added and never indexed),
@@ -689,13 +816,22 @@ stale-deleted by compact, or column was just added and never indexed),
 results — only brute-force results if unindexed files exist. No
 divide-by-zero.
 
-**Correctness**: Summing df(t) across segments is safe because no
-Parquet file appears in two live segments simultaneously. Each index
+**Execution consequence**: Exact mixed-coverage scoring means ranked
+queries cannot finalize BM25 for indexed matches until brute-force pass 1
+has contributed `delta_rows`, `delta_tokens`, and `delta_df`. In that
+case, indexed matches buffer their projected row plus per-row TF / `dl`
+until the final BM25 parameters are known. Filter queries (`score:
+false`) remain fully streaming.
+
+**Correctness**: Summing indexed `df(t)` across segments is safe because
+no Parquet file appears in two live segments simultaneously. Each index
 call creates segments for a specific batch of new files. Compaction
 atomically replaces old segments with new merged ones in a single
 SlateDB transaction. Term-range split segments cover the same files
 but partition the term space — a given term appears in exactly one
-sibling, so df(t) is never counted twice.
+sibling, so indexed `df(t)` is never counted twice. Adding `delta_df`
+from the unindexed tail is also safe because those files are, by
+definition, disjoint from the indexed set.
 
 ---
 
@@ -867,15 +1003,14 @@ produce the same canonical form.
 ```
 User-facing (public):          Internal (private):         Evaluator:
   match_text() ──────┐
-  multi_match() ─────┼──→  QueryPlan (canonical) ──→  plan / evaluate / verify
-  multi_column() ────┘
+  multi_column() ────┼──→  QueryPlan (canonical) ──→  plan / evaluate / verify
   REST JSON ─────────┘ (parsed by handler)
-  CLI flags ─────────┘ (parsed by clap)
+  CLI JSON  ─────────┘ (parsed by clap)
 ```
 
 #### Library Builders (Rust)
 
-Three entry points cover all query patterns:
+Two entry points cover all query patterns:
 
 ```rust
 // 90% case: search one column for text (wildcards supported: conn*, *tion)
@@ -885,16 +1020,20 @@ let req = QueryRequest::match_text("description", "error timeout")
     .score(true)
     .limit(10);
 
-// Search box: same text across multiple columns
-let req = QueryRequest::multi_match("connection refused", &["description", "error_message"])
-    .limit(50);
-
-// Cross-column predicates: different text per column
+// Cross-column predicates: same or different text per column
 let req = QueryRequest::multi_column(BoolOp::And)
-    .column("description", "error")
-    .column("status_code", "500")
+    .column("description", "error timeout")
+    .column("error_message", "timeout reset")
     .limit(10);
 ```
+
+There is no dedicated `multi_match()` public API. Searching the same
+text across multiple columns is expressed explicitly by composing
+multiple column clauses with `multi_column()`.
+
+This does not require a separate internal node either. Repeating the
+same text across columns compiles to ordinary `ColumnPlan` leaves inside
+the canonical query tree.
 
 Builders construct the internal `QueryPlan`. The user never imports
 enum variants or constructs AST nodes. Wildcards (`*`) are embedded in
@@ -904,26 +1043,87 @@ switches on.
 
 #### CLI
 
-Flags map to builder calls:
+`query` is the subcommand. It accepts the table identity out of band and
+the nested query body as canonical JSON via `--json` or `--json-file`
+only. This keeps the CLI aligned with the REST / Flight query shape
+without inventing a second flag language for nested boolean clauses.
 
 ```bash
-# match_text
-lakesearch query --table events --column description --match "error timeout" --operator and --limit 10
+# single-column match via canonical JSON body
+lakesearch query \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --json '{
+  "search": {
+    "column": "description",
+    "match": "error timeout",
+    "operator": "and"
+  },
+  "limit": 10
+}'
 
-# multi_match
-lakesearch query --table events --columns description,error_message --match "connection refused" --limit 50
+# same text across multiple columns via canonical JSON body
+lakesearch query \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --json '{
+  "search": {
+    "or": [
+      { "column": "description", "match": "connection refused", "operator": "and" },
+      { "column": "error_message", "match": "connection refused", "operator": "and" }
+    ]
+  },
+  "limit": 50
+}'
 
-# multi_column
-lakesearch query --table events \
-  --search "description:error" \
-  --search "status_code:500" \
-  --combine and --limit 10
+# cross-column bool query via canonical JSON body
+lakesearch query \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --json '{
+  "search": {
+    "and": [
+      { "column": "description", "match": "error" },
+      { "column": "error_message", "match": "timeout" }
+    ]
+  },
+  "limit": 10
+}'
+
+# same text across multiple columns
+lakesearch query \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --json '{
+  "search": {
+    "or": [
+      { "column": "description", "match": "connection refused", "operator": "and" },
+      { "column": "error_message", "match": "connection refused", "operator": "and" }
+    ]
+  },
+  "limit": 10
+}'
+
+# same, but from a file
+lakesearch query \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --json-file ./query.json
 ```
 
 #### REST / Flight
 
-JSON maps to the same builders. The REST shapes are intentionally
-close to Elasticsearch's `match` / `multi_match` / `bool` patterns.
+The canonical nested query body is the same `QueryBody` used by the CLI
+JSON input and embedded callers. The REST / Flight envelope adds `table`
+around that body because the server may be serving multiple catalogs at
+once. The REST shapes are intentionally close to Elasticsearch's
+`match` / `bool` patterns, but without a separate `multi_match`
+surface. Repeating the same `match` clause across columns uses the same
+explicit boolean form as any other cross-column query.
+
+For REST / Flight, `table` is the server-side table reference. The
+first segment is the LakeSearch catalog alias; the remaining segments
+are interpreted by the backend catalog implementation.
 
 #### Internal Canonical Representation (QueryPlan)
 
@@ -936,18 +1136,23 @@ text or user-facing types.
 enum BoolOp { And, Or }   // used for both within-column and cross-column
 
 struct QueryPlan {
-    searches: Vec<ColumnPlan>,
-    combine: BoolOp,                 // cross-column And | Or (irrelevant for single column)
+    search: QueryExpr,
     select: Vec<String>,
     limit: Option<usize>,
     score: bool,
     selectivity_threshold: f64,      // default 0.0 (always use index)
 }
 
+enum QueryExpr {
+    Column(ColumnPlan),
+    And(Vec<QueryExpr>),
+    Or(Vec<QueryExpr>),
+}
+
 struct ColumnPlan {
     column: String,
     terms: Vec<QueryTerm>,           // from parse_query()
-    operator: BoolOp,                // within-column And | Or
+    operator: BoolOp,                // within one `match` clause
 }
 
 // From tokenizer module (currently lakesearch-core/src/tokenizer.rs;
@@ -959,37 +1164,85 @@ enum QueryTerm {
 }
 ```
 
-NOT is not expressible through the builder API. For queries requiring
-NOT clauses, use the cross-column JSON syntax in REST/Flight. NOT
-support in builders may be added later if demand warrants it.
+Builders produce this canonical positive-only tree directly. REST /
+Flight / CLI parse into the same internal representation.
 
 `QueryTerm` is the atomic unit the evaluator dispatches on:
 - `Exact` → single FST lookup → one posting list
 - `Prefix` → forward FST prefix iterator → union of posting lists
   (bounded by `MAX_WILDCARD_EXPANSION`)
 - `Suffix` → reverse FST prefix iterator → union of posting lists
+  within each loaded segment
+
+Wildcard grammar is intentionally small for the MVP:
+- `prefix*` → `QueryTerm::Prefix("prefix")`
+- `*suffix` → `QueryTerm::Suffix("suffix")`
+- `exact` → `QueryTerm::Exact("exact")`
+
+Any raw query atom containing `*` is valid **only** if it has exactly one
+`*` and that `*` is the first or last character of the atom. Middle
+wildcards, multiple `*` characters, and bare `*` are errors. The wildcard
+body must normalize to exactly one token body after lowercase + NFC + token
+boundary handling.
 
 If a wildcard expands to more than `MAX_WILDCARD_EXPANSION` (1024)
 terms, return an error: "prefix '{prefix}*' expands to N terms,
 exceeding limit of 1024." No silent truncation, no brute-force
 fallback. The user narrows their query.
 
+Suffix queries are asymmetric in one important way in the MVP:
+reverse-FST lookup works naturally **inside** a segment, but segment
+entries are keyed only by forward `min_term` / `max_term`. So exact and
+prefix queries can prune candidate segments by term range, while suffix
+queries load all segments for the referenced column and rely on reverse-FST
+expansion plus normal page/Parquet pruning after that. Reverse-range
+segment pruning is future work.
+
 `ColumnPlan.operator` determines how term-level posting lists are
-combined (AND intersection / OR union). `QueryPlan.combine` determines
-how column-level results are joined (AND: row must match all columns,
-OR: row matches any column). Both AND and OR sum per-column BM25
-scores. OR rows matching more columns rank higher. Ties broken by
+combined within a single `match` clause. `QueryExpr::And` means all
+children must match. `QueryExpr::Or` means any child may match. BM25
+scores from matching `ColumnPlan` leaves are summed. Ties are broken by
 `(file_path, row_index)` for deterministic ordering.
 
 ### Query Language
 
 Queries can search across **multiple indexed columns** with boolean operators.
-Searches on different columns can be combined with AND/OR at the top level.
+Queries are recursive boolean expressions over `match` clauses. A
+`match` clause always targets exactly one indexed column. `and` / `or`
+compose clauses recursively.
 
 The query language provides wildcard support (`conn*` for prefix,
 `*tion` for suffix) and a `match` shorthand that mirrors Elasticsearch's
 most common query pattern. Wildcards are parsed by `parse_query()` into
 typed `QueryTerm` values.
+
+`parse_query()` operates on whitespace-delimited raw atoms first so the
+wildcard marker is validated before normal tokenization removes punctuation.
+Only single-edge wildcards are supported in the MVP.
+
+The public JSON grammar is:
+
+```text
+SearchClause :=
+  MatchClause
+  | { "and": [ SearchClause, ... ] }
+  | { "or":  [ SearchClause, ... ] }
+
+MatchClause :=
+  { "column": string, "match": string, "operator"?: "and" | "or" }
+```
+
+Validation rules:
+- `and` and `or` arrays must be non-empty
+- there is no public `term` node; raw text appears only in `match`
+- within one whitespace-delimited query atom, `*` is allowed only as a single
+  leading or trailing character
+- atoms like `con*ion`, `*conn*`, `co*n*`, `*`, or `conn*:refused` are rejected
+- wildcard atoms must normalize to exactly one token body; there is no
+  escaping, contains-wildcard, regex, or general glob support in the MVP
+
+Negation (`not`) is out of scope for the MVP and reserved for future
+work. The current query model is intentionally positive-only.
 
 #### Match (High-Level Shorthand)
 
@@ -999,7 +1252,7 @@ operator (default: `or`, like Elasticsearch).
 
 ```json
 {
-  "table": "events",
+  "table": "prod.events",
   "select": ["timestamp", "user_id", "description"],
   "search": {
     "column": "description",
@@ -1013,9 +1266,10 @@ operator (default: `or`, like Elasticsearch).
 
 When `operator` is `"or"` (or omitted), any token matching is sufficient.
 When `operator` is `"and"`, all tokens must match. Wildcards are
-supported in the text: `conn*` for prefix, `*tion` for suffix. This
-covers the vast majority of real-world text search queries with minimal
-ceremony.
+supported in the text only as `conn*` (prefix) or `*tion` (suffix).
+There is no middle-wildcard, contains, glob, or regex syntax in the
+MVP. Unsupported wildcard shapes are rejected rather than silently
+reinterpreted.
 
 #### Cross-Column Search
 
@@ -1023,42 +1277,51 @@ For different queries per column, use the `and` / `or` wrapper:
 
 ```json
 {
-  "table": "events",
+  "table": "prod.events",
   "search": {
     "and": [
       { "column": "description", "match": "error" },
-      { "column": "status_code", "match": "500" }
+      { "column": "error_message", "match": "timeout" }
     ]
   },
   "limit": 10
 }
 ```
 
-#### Multi-Column Match Shorthand
-
-For the common case of searching the same text across multiple columns:
+The same shape also handles "same text across multiple columns" by
+repeating the same `match` clause explicitly:
 
 ```json
 {
-  "table": "events",
+  "table": "prod.events",
   "select": ["timestamp", "description", "error_message"],
   "search": {
-    "multi_match": "connection refused",
-    "columns": ["description", "error_message"],
-    "operator": "and"
+    "or": [
+      { "column": "description", "match": "connection refused", "operator": "and" },
+      { "column": "error_message", "match": "connection refused", "operator": "and" }
+    ]
   },
   "limit": 50
 }
 ```
 
-This expands to an OR across columns (any column matching is sufficient),
-with AND within each column (all tokens must appear). Per-column BM25 scores
-are summed for rows that match in multiple columns.
+There is no dedicated `multi_match` shorthand. Same-text searches across
+multiple columns use the same explicit composition model as all other
+cross-column queries. Per-column BM25 scores are summed for rows that
+match in multiple columns.
 
 ### Query Response
 
 Responses include query statistics for debugging and understanding index
 effectiveness:
+
+The MVP `QueryStats` schema is fixed to these fields:
+- `segments_touched`
+- `candidate_pages`
+- `rows_scanned`
+- `rows_matched`
+- `unindexed_files_scanned`
+- `elapsed_ms`
 
 ```json
 {
@@ -1068,6 +1331,7 @@ effectiveness:
     "candidate_pages": 12,
     "rows_scanned": 360,
     "rows_matched": 4,
+    "unindexed_files_scanned": 0,
     "elapsed_ms": 42
   }
 }
@@ -1075,18 +1339,24 @@ effectiveness:
 
 ### Term Resolution
 
-Within a single column, `parse_query()` produces `QueryTerm` values
+Within one `match` clause, `parse_query()` produces `QueryTerm` values
 that the evaluator dispatches on:
 
 - **Exact** (`timeout`): FST exact lookup → one posting list
 - **Prefix** (`conn*`): forward FST prefix iteration → union of
   posting lists (bounded by `MAX_WILDCARD_EXPANSION = 1024`)
 - **Suffix** (`*tion`): reverse FST prefix iteration → union of
-  posting lists (bounded)
+  posting lists inside each loaded segment (bounded)
 
-The `operator` (AND/OR) determines how term-level posting lists are
-combined: AND uses sorted-array intersection, OR uses sorted-array
-union on `u32` doc_id values.
+Segment-level pruning behavior differs by term kind:
+- **Exact / Prefix**: use SlateDB `min_term` / `max_term` to find only
+  candidate segments for that term
+- **Suffix**: no segment-level pruning in the MVP; load all segments
+  for the column, then use the reverse FST inside each segment
+
+The clause-local `operator` (AND/OR) determines how term-level posting
+lists are combined: AND uses sorted-array intersection, OR uses
+sorted-array union on `u32` doc_id values.
 
 **Important:** all page-level boolean operations are **approximate**. They
 identify candidate pages that *may* contain matching rows, but a page-level
@@ -1096,31 +1366,12 @@ row-level verification step (see execution pipeline) uses an ILIKE pre-filter
 tokenizes only survivors to evaluate the complete boolean query and eliminate
 false positives.
 
-#### NOT Semantics
+#### Negation (Future Work)
 
-`not` must appear as a child of `and`:
-
-```json
-{ "and": [{ "term": "error" }, { "not": { "term": "heartbeat" } }] }
-```
-
-A bare `not` at the top level is rejected — negation without a positive
-constraint would require scanning the entire corpus.
-
-**NOT is not applied during page-level boolean evaluation.** Subtracting
-pages containing "heartbeat" from pages containing "error" is unsound: a page
-can contain rows with "error" (but not "heartbeat") alongside rows with both
-terms. Page-level set difference would incorrectly drop the entire page,
-losing valid matches.
-
-Instead, during page-level evaluation, NOT clauses are ignored — only the
-positive clauses (AND/OR of terms) determine candidate pages. The NOT is then
-enforced during row-level verification: after fetching and tokenizing each
-candidate row, the full boolean AST (including NOT) is evaluated to confirm
-the row truly matches.
-
-`not` clauses do not contribute to BM25 scoring (like Elasticsearch's
-`must_not`). They only filter.
+Negation (`not`) is intentionally excluded from the MVP query language.
+Supporting complement-style predicates correctly and efficiently needs a
+separate planner/runtime design, so it is deferred until after the
+positive-only query path is stable.
 
 ### Multi-Column Intersection
 
@@ -1141,6 +1392,10 @@ resolve page-level row ranges:
 5. Read matching rows using `ParquetRecordBatchReaderBuilder` with the
    `RowSelection` and a `ProjectionMask` for requested columns
 
+The important staging rule is: resolve to row ranges first, then read
+Parquet once for the combined `RowSelection`. Cross-column execution
+does not read Parquet separately per segment or per clause.
+
 For columns where `first_row_index` is already in the doc table (populated
 at index time from the Parquet `offset_index`), cross-column intersection
 proceeds **without any additional Parquet metadata reads**.
@@ -1158,11 +1413,13 @@ matching columns for each row.
 ### Query Execution Pipeline
 
 1. **Plan**: Parse query, load segment entries from SlateDB and catalog state,
-   identify relevant segments per column.
-   Expand `match` and `multi_match` nodes into boolean trees of `term` nodes.
-2. **Selectivity Estimation**: For each term node, look up `doc_frequency`
-   from the term info table (one read per term, no posting list decoding
-   needed). Compute estimated selectivity:
+   identify relevant segments per column. Parse the public JSON / builder
+   input into the private `QueryPlan`. Each `match` clause becomes a
+   `ColumnPlan` whose `terms` come from `parse_query()`.
+2. **Selectivity Estimation**: Estimate selectivity from the query's
+   `ColumnPlan` leaves. For each such leaf,
+   look up `doc_frequency` from the term info table (one read per term,
+   no posting list decoding needed). Compute estimated selectivity:
    - Single term: `df / total_rows`
    - AND: `min(df_a, df_b, ...) / total_rows` (intersection can't exceed
      the smallest posting list)
@@ -1174,48 +1431,52 @@ matching columns for each row.
      when most pages match. `selectivity_threshold` is an optional
      per-query parameter (default 0.0 — always use the index). Increase
      once benchmarks show where brute force wins for common terms.
-3. **Term Resolution**: For each term/prefix/suffix node per column:
-   - Term: forward FST lookup -> single posting list
+   - For suffix clauses, segment-level selectivity is unknown before the
+     relevant segments are loaded, because suffix routing does not use
+     forward term ranges. In the MVP, suffix clauses do not benefit from
+     segment-pruning selectivity checks.
+3. **Term Resolution**: Resolve each term/prefix/suffix node in every
+   `ColumnPlan` leaf:
+   - Term: forward FST lookup -> one posting list per matching segment
    - Prefix: forward FST prefix iterator -> multiple posting lists -> union
-   - Suffix: reverse FST prefix iterator (on reversed suffix) -> term_ordinals -> posting lists -> union
-4. **Page-Level Candidate Selection** (approximate):
-   Doc_ids are segment-local — they cannot be intersected across
-   segments (see § 7, Term-Range Splitting). The approach depends on
-   whether query terms land in the same or different segments:
+   - Suffix: load all segments for the column, then reverse FST prefix
+     iterator (on reversed suffix) -> term_ordinals -> posting lists -> union
+4. **Within-Column Candidate Reduction** (approximate): Reduce each
+   `ColumnPlan` leaf to candidate row ranges, still without reading
+   Parquet data.
 
-   **Same segment** (all terms in one segment's term range):
-   - AND: intersect `doc_id` lists directly (sorted u32 merge — fast)
-   - OR: union `doc_id` lists directly
-   - Resolve surviving doc_ids via that segment's doc table
+   **Fast path** (all terms for the leaf are satisfied inside one
+   segment):
+   - AND: intersect that segment's `doc_id` lists directly
+   - OR: union that segment's `doc_id` lists directly
+   - Resolve surviving `doc_id`s through that segment's doc table
 
-   **Different segments** (terms span split siblings):
-   - For each term, resolve its posting list's doc_ids through the
-     owning segment's doc table → set of `(file, row_group, page)`
-     page-location tuples
-   - AND: intersect page-location sets (HashSet intersection)
+   **General path** (the leaf spans multiple segments, including
+   term-range split siblings):
+   - Resolve each term's hits through the owning segments' doc tables
+     to page locations `(file, row_group, page)`
+   - AND: intersect page-location sets
    - OR: union page-location sets
-   - No doc_id compatibility needed — intersection happens on
-     resolved locations
+   - Convert surviving page locations to row ranges via
+     `first_row_index` + `row_count`
 
-   NOT: **skipped** at this stage (see NOT semantics above).
-   Result: candidate page locations per column (may contain false
-   positives).
-
-5. **File Grouping**: Group candidate page locations by
-   `(file, row_group)`, deduplicate, and sort by `first_row_index`
-   within each group. This produces one work item per
-   (file, row_group) pair, each containing the sorted row ranges to
-   read. Grouping enables coalesced reads per file instead of
-   scattered per-page reads.
-6. **Cross-Column Intersection** (if multi-column query):
-   - Intersect/union row ranges across columns using `first_row_index`
-     and `row_count` to find overlapping intervals
-7. **RowSelection Construction**: For each (file, row_group) work item,
+   Output: candidate row ranges per `ColumnPlan` leaf. No Parquet pages
+   are read yet.
+5. **Cross-Clause Row-Range Reduction**: Combine leaf row ranges
+   according to the enclosing `QueryExpr` tree. Cross-column AND/OR and
+   same-column AND/OR across split siblings both operate here on row
+   identity / overlapping row ranges, before any Parquet fetch.
+6. **File Grouping**: Group candidate row ranges by `(file, row_group)`,
+   deduplicate, and sort by `first_row_index` within each group. This
+   produces one work item per `(file, row_group)` pair. Grouping enables
+   coalesced reads per file instead of scattered per-page reads.
+7. **RowSelection Construction**: For each `(file, row_group)` work item,
    build a `RowSelection` from its sorted row ranges. Adjacent or
    overlapping ranges are merged. The `RowSelection` tells the Parquet
    reader exactly which rows to decode and which to skip.
-8. **Page Fetch**: read candidate rows using `ParquetRecordBatchReaderBuilder`
-   with `RowSelection` + `ProjectionMask` (include all searched columns)
+8. **Page Fetch**: read candidate rows once per work item using
+   `ParquetRecordBatchReaderBuilder` with `RowSelection` +
+   `ProjectionMask` (include all searched columns)
 9. **Row-Level Verification** (ILIKE pre-filter + tokenization):
    Page-level posting lists are approximate — a candidate page with 8192
    rows may contain only a few actual matches. To avoid tokenizing every
@@ -1229,53 +1490,81 @@ matching columns for each row.
       non-matching rows (SIMD scan, no Unicode normalization, no
       allocation per token).
    b. **Tokenize survivors only**: For rows passing the ILIKE filter,
-      tokenize and evaluate the full boolean AST (including NOT
-      clauses). Discard rows that don't match. ILIKE is a superset
-      filter (substring, not token-boundary), so a few false positives
+      tokenize and evaluate the compiled `QueryPlan`. Discard rows that
+      don't match. ILIKE is a superset filter (substring, not
+      token-boundary), so a few false positives
       reach this stage, but the count is small.
 
    This is the same ILIKE pre-filter used in the brute-force path,
    applied to the indexed path's verification step. For a page where 3
    out of 8192 rows match, tokenization runs on ~5-10 rows (ILIKE
    survivors) instead of 8192.
-
-10. **Scoring / Output** (depends on query mode):
-    - **Filter mode** (`score: false` or omitted): emit verified rows
-      immediately. No TF computation, no IDF lookup, no BM25 math. If `limit`
-      is specified, stop after N verified rows (no ranking — first-N, not
-      top-N). Fully streamable in all cases.
-    - **Search mode** (`score: true`): for verified rows, compute per-row TF
-      and score with BM25 using precomputed DF and corpus stats. If `limit`
-      is specified, maintain a top-K heap and emit the top-K by score after
-      all candidates are evaluated (requires buffering). Without `limit`,
-      stream scored rows in arbitrary order.
-11. **Projection**: return only the requested `select` columns (with scores
-    if search mode)
+10. **Unindexed Tail + BM25 Finalization**:
+    - **Filter mode** (`score: false` or omitted): brute-force the
+      unindexed tail with the ILIKE pre-filter + tokenize-survivors
+      path, then emit verified rows immediately. No TF computation, no
+      IDF lookup, no BM25 math. If `limit` is specified, stop after N
+      verified rows (no ranking — first-N, not top-N). Fully streamable.
+    - **Search mode** (`score: true`): if every referenced column is
+      fully indexed, score indexed rows immediately after verification
+      using indexed global `df` + corpus stats.
+    - If any referenced column has unindexed files, brute-force pass 1
+      tokenizes every row in the unindexed tail for those columns once,
+      accumulates exact `delta_rows`, `delta_tokens`, and `delta_df`
+      for the query terms on a per-column basis, and records matching
+      rows plus per-row TF / `dl`. Indexed matches buffer the same
+      per-row information until those deltas are known. Then finalize
+      BM25 parameters from the indexed corpus plus deltas, and score
+      both indexed and brute-force matches with the same full-corpus
+      statistics.
+11. **Projection / Output**: return only the requested `select` columns
+    (with scores in search mode). If `limit` is specified in search
+    mode, maintain a top-K heap and emit the top-K by score after all
+    candidates are evaluated. Without `limit`, scored rows may stream in
+    arbitrary order once BM25 parameters are finalized.
 
 ### Brute Force Fallback
 
 Used when indices are unavailable (column has not been fully indexed yet or
 some files are not covered). The query path identifies unindexed files by comparing
-the column's `last_indexed_snapshot` against the current catalog snapshot via
-`catalog.files_added_between(last_indexed, current_snapshot)`.
+the column's `last_indexed_snapshot` against the current table snapshot via
+`table.files_added_between(last_indexed, current_snapshot)`.
 
 For indexed files: use the indexed path (page-level candidates -> row
 verification).
 
-For un-indexed files, the brute-force path uses two-pass projection:
+For un-indexed files, the brute-force path uses two-pass projection. In
+multi-column queries, the brute-force file set is the union across the
+referenced columns' `unindexed_files`; BM25 deltas are still tracked per
+column, and only columns that do not yet cover a given file contribute
+`delta_rows`, `delta_tokens`, or `delta_df` for that file.
 
-1. **Pass 1 — stream only the searched column**: Read full row groups sequentially
-   (large I/O, not page-random). ILIKE pre-filter (SIMD substring check) to cheaply
-   discard non-candidate rows. Tokenize survivors, evaluate query terms. Record
-   matching row indices.
-2. **Pass 2 — read remaining projected columns for matches only**: Build
+1. **Pass 1 — stream only the searched columns**: Read full row groups
+   sequentially (large I/O, not page-random).
+   - **Filter queries** (`score: false`): use the ILIKE pre-filter
+     (SIMD substring check) to cheaply discard non-candidate rows, then
+     tokenize survivors and evaluate the compiled `QueryPlan`. Record
+     matching row indices.
+   - **Ranked queries** (`score: true`): tokenize every row in the
+     searched columns once. This pass simultaneously:
+     - evaluates the compiled `QueryPlan`
+     - records matching row indices
+     - records per-match TF / `dl`
+     - accumulates exact per-column `delta_rows`, `delta_tokens`, and
+       `delta_df` for the query terms
+2. **Finalize BM25 parameters** (ranked queries only): combine indexed
+   corpus stats / `df` with the brute-force deltas from pass 1.
+3. **Pass 2 — read remaining projected columns for matches only**: Build
    `RowSelection` from matching row indices. Read other columns with
-   `ProjectionMask` + `RowSelection`. Score matches with BM25.
+   `ProjectionMask` + `RowSelection`. Score matches with the finalized
+   BM25 parameters.
 
 Two-pass avoids reading non-searched columns for the ~99% of rows
 that don't match. Sequential column streaming is also cheaper on
 object stores than many small page reads (fewer requests, better
-throughput).
+throughput). Ranked mixed-coverage queries are slower than fully
+indexed queries because pass 1 must compute exact BM25 corpus deltas
+for the unindexed tail, but the resulting scores are exact.
 
 Merge and deduplicate results from both indexed and brute-force paths.
 
@@ -1331,21 +1620,26 @@ the REST `SearchRequest` in `api_types.rs`. Normative field names:
 | `search.column` | string | yes (match) | — |
 | `search.match` | string | yes (match) | — |
 | `search.operator` | string | no | `"or"` |
-| `search.and` / `search.or` | object[] | yes (cross-column) | — |
-| `search.multi_match` | string | yes (multi-match) | — |
-| `search.columns` | string[] | yes (multi-match) | — |
+| `search.and` / `search.or` | object[] | yes (bool composition) | — |
 | `select` | string[] | no | all columns |
 | `limit` | integer | no | unlimited |
 | `score` | boolean | no | false |
 | `selectivity_threshold` | float | no | 0.0 |
 
+`table` is the server-side external table reference. It is encoded as a
+dotted string where the first segment is the LakeSearch catalog alias
+and the remaining segments are interpreted by that backend. Examples:
+`prod.events`, `prod.analytics.events`, `warehouse.a.b.c`.
+
 Example:
 ```
-b'{"table":"events","search":{"column":"description","match":"error timeout","operator":"and"},"select":["timestamp","service"],"limit":10,"score":true}'
+b'{"table":"prod.events","search":{"column":"description","match":"error timeout","operator":"and"},"select":["timestamp","service"],"limit":10,"score":true}'
 ```
 
 Agents implementing Flight client/server MUST use these exact field
 names. The REST handler and Flight handler parse the same JSON shape.
+The CLI supplies `--catalog-uri` and `--table` separately, then builds
+the same internal `QueryBody` before calling the library.
 
 #### DuckDB Integration via RecordBatchReader
 
@@ -1363,7 +1657,7 @@ conn = duckdb.connect()
 # Text search + aggregation: LakeSearch streams matching rows,
 # DuckDB consumes them incrementally for GROUP BY.
 reader = client.do_get(flight.Ticket(
-    b'{"table":"events","search":{"column":"description","match":"connection timeout"}}'
+    b'{"table":"prod.events","search":{"column":"description","match":"connection timeout"}}'
 ))
 conn.sql("""
     SELECT service, count(*) as cnt, avg(response_time_ms) as avg_rt
@@ -1376,13 +1670,13 @@ conn.sql("""
 # Early termination: DuckDB stops pulling from the Flight stream
 # after 20 rows. LakeSearch stops fetching Parquet pages.
 reader = client.do_get(flight.Ticket(
-    b'{"table":"events","search":{"column":"description","match":"ECONNREFUSED"}}'
+    b'{"table":"prod.events","search":{"column":"description","match":"ECONNREFUSED"}}'
 ))
 conn.sql("SELECT timestamp, service, description FROM reader LIMIT 20").show()
 
 # Join text search results with a local dimension table
 reader = client.do_get(flight.Ticket(
-    b'{"table":"events","search":{"column":"description","match":"disk space low"}}'
+    b'{"table":"prod.events","search":{"column":"description","match":"disk space low"}}'
 ))
 conn.sql("""
     SELECT t.team, count(*) as errors
@@ -1420,8 +1714,10 @@ determine the global top-K by BM25 score before streaming. This means:
 
 If the client wants incremental results with scores (e.g., for a live UI),
 it can request `score: true` without `limit`. The server streams scored rows
-as they are produced, in arbitrary order. The client is responsible for
-sorting/truncating.
+as they are produced, in arbitrary order, **when all referenced columns are
+fully indexed**. If a ranked query includes an unindexed tail, LakeSearch must
+first finish brute-force pass 1 for that tail so BM25 can finalize `N`,
+`avg_dl`, and `df`. The client is responsible for sorting/truncating.
 
 #### Query Cancellation
 
@@ -1458,7 +1754,7 @@ conn.sql("""
 
 # Query 2: Full-text search + OLAP — LakeSearch streams via Flight
 reader = client.do_get(flight.Ticket(
-    b'{"table":"events","search":{"column":"description","match":"connection timeout"}}'
+    b'{"table":"prod.events","search":{"column":"description","match":"connection timeout"}}'
 ))
 conn.sql("""
     SELECT service, count(*) as timeout_errors, avg(response_time_ms) as avg_rt
@@ -1478,10 +1774,40 @@ LakeSearch query service.
 
 ---
 
-## 10. Data Lake Catalog Client
+## 10. Catalog Resolution and Table Metadata
 
-LakeSearch delegates file inventory to the data lake's own catalog. A
-trait defines the interface:
+LakeSearch delegates file inventory to the data lake's own catalog. It
+never discovers tables or Parquet files by listing object storage. The
+catalog resolves a backend-relative table path into a table-bound handle,
+and that handle exposes the snapshot/file primitives LakeSearch needs.
+
+### Table References
+
+At the API boundary, a server-side table reference is:
+
+```rust
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TableRef {
+    pub catalog_alias: String,
+    pub object_path: Vec<String>,
+}
+```
+
+`catalog_alias` belongs to LakeSearch. It selects one configured backend
+catalog from the server's catalog meta file. `object_path` belongs to the
+backend implementation. LakeSearch does not assume a universal 3-part or
+4-part identifier:
+
+- Iceberg may interpret `["analytics", "events"]` as namespace
+  `analytics`, table `events`
+- Iceberg may interpret `["a", "b", "c"]` as namespace `a.b`, table `c`
+- DuckLake may interpret `["events"]` as a flat table name
+- DuckLake may interpret `["main", "events"]` as schema `main`, table `events`
+
+For CLI usage, `--catalog-uri` already pins the catalog, so `--table`
+only needs to provide the backend-relative `object_path`.
+
+### Catalog and Resolved Table Interfaces
 
 ```rust
 /// A snapshot identifier in the data lake.
@@ -1498,55 +1824,37 @@ pub struct DataFile {
     pub row_count: u64,
 }
 
-/// Read-only interface to a data lake's catalog metadata.
+/// Backend-specific catalog, already selected by LakeSearch catalog alias.
 ///
-/// One instance per table. The table identity is provided at
-/// construction time (e.g., `DuckLakeCatalog::new(path, table_name)`).
-///
-/// Implementations query the data lake's own metadata (DuckLake catalog
-/// tables, Iceberg manifests, Delta log, etc.). LakeSearch never lists
-/// object storage for file discovery.
-///
-/// The trait is intentionally minimal — only operations that all major
-/// lake formats (DuckLake, Iceberg, Delta Lake) can implement natively.
-/// LakeSearch handles diff logic and liveness analysis itself using
-/// these primitives.
+/// Each implementation owns the interpretation of `object_path`.
 #[async_trait]
-pub trait DataLakeCatalog: Send + Sync {
-    /// Return the current (latest) snapshot ID.
+pub trait Catalog: Send + Sync {
+    async fn resolve_table(
+        &self,
+        object_path: &[String],
+    ) -> Result<Arc<dyn ResolvedTable>>;
+}
+
+/// Table-bound metadata handle returned by `Catalog::resolve_table(...)`.
+///
+/// This is the object LakeSearch keeps around after lazy resolution.
+#[async_trait]
+pub trait ResolvedTable: Send + Sync {
+    fn table_location(&self) -> &str;
+
     async fn current_snapshot(&self) -> Result<SnapshotId>;
 
-    /// Return all data files active at the given snapshot.
     async fn files_at_snapshot(
         &self,
         snapshot: &SnapshotId,
     ) -> Result<Vec<DataFile>>;
 
-    /// Return data files added in the range (from, to].
-    /// "Added" means the file first became active after `from` and
-    /// at or before `to`.
-    ///
-    /// All methods that accept a SnapshotId must return a clear error
-    /// if the snapshot does not exist (expired, invalid, etc.).
-    /// No separate validation method — callers rely on these methods
-    /// to fail fast with a descriptive error.
     async fn files_added_between(
         &self,
         from: &SnapshotId,
         to: &SnapshotId,
     ) -> Result<Vec<DataFile>>;
 
-    /// Check which of the given paths are active at the current snapshot.
-    /// Returns the subset of `paths` that exist as live files.
-    ///
-    /// Used by the query path for stale filtering — only the files
-    /// referenced by candidate segments need to be checked, not the
-    /// entire file inventory. This avoids materializing the full file
-    /// list on the query hot path.
-    ///
-    /// DuckLake: targeted SQL WHERE path IN (...) — fast.
-    /// Iceberg/Delta: streams manifests/log but only O(paths.len())
-    /// memory instead of O(all_files).
     async fn check_files_live(
         &self,
         paths: &[String],
@@ -1554,88 +1862,90 @@ pub trait DataLakeCatalog: Send + Sync {
 }
 ```
 
+There is no separate `CatalogRegistry` trait. The server can simply load
+its catalog meta file into a `HashMap<String, Arc<dyn Catalog>>` keyed by
+catalog alias. The CLI's `open_from_uri` / `open_mut_from_uri` helpers
+construct one backend-specific `Catalog` directly from `--catalog-uri` and
+resolve `--table` against it.
+
+There is also no need for an internal `ResolvedTableBackend` enum.
+Backend-specific resolved table types implement the `ResolvedTable`
+trait directly:
+
+- `DuckLakeCatalog::resolve_table(...)` returns `Arc<DuckLakeResolvedTable>`
+- `IcebergCatalog::resolve_table(...)` returns `Arc<IcebergResolvedTable>`
+- `DeltaCatalog::resolve_table(...)` returns `Arc<DeltaResolvedTable>`
+
+Because LakeSearch stores one SlateDB instance per resolved table, the
+metadata keyspace is table-local. The resolved table handle supplies the
+runtime table location, snapshot, and file inventory primitives; it does
+not need to expose a separate public table identifier for keying.
+
 ### Cross-Format Compatibility
 
-The trait is designed around operations that all major lake formats
-support natively. No format-specific concepts (DuckLake's
-`begin_snapshot`/`end_snapshot` columns, Iceberg's manifest entry
-status, Delta's Add/Remove actions) leak into the interface.
+The resolved-table interface is intentionally minimal. No format-specific
+concepts (DuckLake's `begin_snapshot` / `end_snapshot`, Iceberg manifest
+entry status, Delta Add / Remove actions) leak into the rest of LakeSearch.
 
 | Operation | DuckLake | Iceberg | Delta Lake |
 |-----------|----------|---------|------------|
-| `current_snapshot()` | `SELECT MAX(snapshot_id) FROM ducklake_snapshot` | `table_metadata.current_snapshot_id` | `DeltaTable::get_latest_version()` |
-| `files_at_snapshot(S)` | `WHERE begin_snapshot <= S AND (end_snapshot > S OR IS NULL)` | Read manifest list + manifests at snapshot S, filter `status != DELETED` | `load_version(S)` + `get_file_uris()` |
-| `files_added_between(A, B)` | `WHERE begin_snapshot > A AND begin_snapshot <= B` | Walk snapshot chain A->B, collect manifest entries with `status = ADDED` | Read commit entries A+1..B from `_delta_log/`, collect Add actions |
-| `check_files_live(paths)` | `WHERE path IN (...) AND active` — targeted SQL | Stream manifests, check against input set — same I/O, O(paths) memory | Stream log, check against input set |
+| `resolve_table(path)` | Lookup table metadata in DuckLake catalog tables, return `Arc<DuckLakeResolvedTable>` | Resolve namespace + table through Iceberg catalog, return `Arc<IcebergResolvedTable>` | Resolve table from `_delta_log` root / catalog metadata, return `Arc<DeltaResolvedTable>` |
+| `current_snapshot()` | `SELECT snapshot_id FROM ducklake_snapshots(...) ORDER BY snapshot_id DESC LIMIT 1` | `table_metadata.current_snapshot_id` | latest table version |
+| `files_at_snapshot(S)` | `WHERE begin_snapshot <= S AND (end_snapshot > S OR IS NULL)` | Read manifest list + manifests at snapshot S, filter live data files | load version S + enumerate active data files |
+| `files_added_between(A, B)` | `WHERE begin_snapshot > A AND begin_snapshot <= B` | Walk snapshot chain A->B, collect `ADDED` manifest entries | Read commit entries A+1..B, collect Add actions |
+| `check_files_live(paths)` | `WHERE path IN (...) AND active` — targeted SQL | Stream manifests, check against input set — same I/O, O(paths) memory | Stream log/checkpoints, check against input set |
 
-**Stale file detection**: Compact uses `files_at_snapshot(current)` to
+**Stale file detection**: compact uses `files_at_snapshot(current)` to
 build the full live set (batch operation, memory is acceptable). Query
 uses `check_files_live(candidate_paths)` to check only the files from
-candidate segments — avoids materializing the full file list on the
-hot path.
+candidate segments, avoiding a full catalog materialization on the hot
+path.
 
-**Why no `files_removed_between()`**: While all three formats *can*
-provide this (DuckLake: `end_snapshot` column; Iceberg: `DELETED`
-manifest entries; Delta: Remove actions), the semantics vary. Iceberg's
-`DELETED` entries may reference delete files (position/equality deletes),
-not just compaction. Delta's Remove actions have a `data_change` flag
-that distinguishes real deletes from OPTIMIZE. Rather than papering over
-these differences in the trait, LakeSearch uses `files_at_snapshot` for
-liveness checks — simpler, correct across all formats, and avoids
-misinterpreting format-specific remove semantics.
+**Why no `files_removed_between()`**: all major formats can expose
+removals, but the semantics differ. Iceberg `DELETED` entries can refer
+to delete files, not only compaction. Delta Remove actions carry a
+`data_change` flag. Rather than overfitting the interface to those
+differences, LakeSearch derives liveness from `files_at_snapshot` and
+`check_files_live`, which are portable and sufficient.
 
 ### LakeSearch's Diff Logic (Not the Catalog's Job)
 
-The catalog provides file listing primitives. LakeSearch is responsible
-for the business logic:
+The catalog resolves tables and exposes file listing primitives.
+LakeSearch owns the business logic:
 
 - **New files to index**: `files_added_between(last_indexed, target)`
-- **Stale files to clean up (compaction)**: files referenced by existing
-  segments whose path is NOT in `files_at_snapshot(current_snapshot)`.
+- **Stale files to clean up**: files referenced by existing segments
+  whose paths are not in `files_at_snapshot(current_snapshot)`
 
-This separation keeps the catalog trait portable across formats and the
-business logic in LakeSearch where it can be tested independently.
+This keeps backend integrations thin and lets LakeSearch test diff and
+cleanup behavior independently of any specific catalog format.
 
 ### Implementation Notes Per Format
 
-**DuckLake** (via `duckdb` crate): All operations are single SQL queries
-against `__ducklake_metadata_{catalog}.ducklake_data_file`. Simplest
-implementation. Best for local development and CLI usage.
+**DuckLake** (via the `duckdb` crate): all methods are local SQL queries
+over DuckLake metadata tables. This is the simplest implementation and
+the best fit for local development and CLI usage.
 
-**Iceberg** (via `iceberg-rust` crate or REST catalog): Requires reading
-Avro manifest files from object storage. More I/O than DuckLake but no
-external database. `files_added_between` walks the snapshot chain via
-`parent_snapshot_id` and collects `ADDED` entries from manifests written
-at each intermediate snapshot.
+**Iceberg** (via `iceberg-rust` crate or REST catalog): resolving the
+table is cheap, but file inventory comes from Avro manifests. Caching is
+important:
 
-Iceberg catalog latency can be mitigated with **manifest caching**.
-Manifest files are immutable once written (same property as our segment
-files). The caching strategy:
+1. Cache manifests by path (immutable once written)
+2. Cache the current manifest list until the snapshot changes
+3. On snapshot advance, diff manifest lists and read only new manifests
 
-1. **Cache manifest files by path** — LRU keyed by manifest path.
-   Once read, never invalidated.
-2. **Cache the current manifest list** — re-read only when the
-   snapshot advances. Track the current snapshot ID; if unchanged,
-   reuse the cached manifest list.
-3. **Incremental updates** — when the snapshot advances, read the new
-   manifest list (small), diff against the old one, read only the
-   new/changed manifests. Iceberg appends typically add 1-2 new
-   manifests per snapshot.
+With this, steady-state `check_files_live` and `files_added_between`
+become in-memory scans over cached manifests.
 
-With this caching, steady-state `check_files_live` and
-`files_added_between` calls are in-memory scans over cached manifests —
-no S3 reads. The cost model becomes comparable to DuckLake's local SQL
-after the initial cold load.
-
-**Delta Lake** (via `deltalake` / delta-rs crate): Reads JSON commit
-entries from `_delta_log/`. `files_added_between` reads commit files
-in the version range and collects Add actions. Native Rust crate with
-good `object_store` integration.
+**Delta Lake** (via `deltalake` / delta-rs): resolve the table from the
+transaction-log root, then read JSON commits and checkpoints from
+`_delta_log/`.
 
 ### DuckLake Implementation (First Target)
 
 DuckLake stores file metadata in `ducklake_data_file` with
-`begin_snapshot` / `end_snapshot` columns — exactly what we need.
+`begin_snapshot` / `end_snapshot` columns, which map directly to what
+LakeSearch needs.
 
 ```rust
 pub struct DuckLakeCatalog {
@@ -1644,29 +1954,37 @@ pub struct DuckLakeCatalog {
 }
 ```
 
-**Thread safety**: `duckdb::Connection` is `!Send`. The `Mutex`
-serializes catalog calls across threads. This is fine because DuckLake
-catalog calls are local SQL queries that return in microseconds — the
-mutex is held only for the duration of one SQL query, not during
-segment loading or Parquet reads. Contention is negligible relative
-to actual query work. Iceberg and Delta catalogs use async
-`object_store` APIs and don't have this constraint.
+`duckdb::Connection` is `!Send`, so the connection is guarded by a
+`Mutex`. This is acceptable because catalog calls are tiny local SQL
+queries; the lock is held only for the duration of each metadata lookup,
+not during Parquet reads or segment processing.
+
+`DuckLakeCatalog::resolve_table(...)` is responsible for:
+
+1. interpreting the backend-relative path (`events`, `main.events`, etc.)
+2. looking up the DuckLake `table_id`
+3. discovering the table's object-storage location
+4. returning a `DuckLakeResolvedTable` implementing the `ResolvedTable` trait
 
 **Setup**:
+
+For LakeSearch, the DuckLake catalog URI is the DuckLake metadata
+storage location (for example `ducklake:./events.ducklake`). This
+design assumes LakeSearch is connecting to an **existing** DuckLake.
+In that case DuckLake loads the data storage location from the catalog
+database, so LakeSearch does not need a separate user-facing
+`DATA_PATH` parameter.
+
+`DATA_PATH` is only required when creating a new DuckLake outside
+LakeSearch. A necessary precondition for LakeSearch is that the
+warehouse / lake already exists.
+
 ```rust
 impl DuckLakeCatalog {
-    pub fn new(ducklake_path: &str, data_path: &str) -> Result<Self> {
+    pub fn new(ducklake_path: &str) -> Result<Self> {
         let conn = duckdb::Connection::open_in_memory()?;
-        // Load extension
         conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-        // Attach the DuckLake catalog
-        conn.execute_batch(&format!(
-            "ATTACH 'ducklake:{}' AS lake (DATA_PATH '{}');",
-            ducklake_path, data_path
-        ))?;
-        // CRITICAL: Disable inlined data. DuckLake can inline small
-        // writes into the metadata DB instead of writing Parquet files.
-        // We need ALL data in Parquet so we can index it.
+        conn.execute_batch(&format!("ATTACH 'ducklake:{}' AS lake;", ducklake_path))?;
         conn.execute_batch(
             "CALL lake.ducklake_set_option('lake', 'inline_data', false);"
         )?;
@@ -1675,7 +1993,7 @@ impl DuckLakeCatalog {
 }
 ```
 
-**Query implementations**:
+**Resolved-table query implementations**:
 
 ```sql
 -- current_snapshot():
@@ -1683,8 +2001,6 @@ SELECT snapshot_id FROM ducklake_snapshots('lake')
 ORDER BY snapshot_id DESC LIMIT 1;
 
 -- files_at_snapshot(snapshot_id):
--- Files active at a given snapshot: begin_snapshot <= snap
--- AND (end_snapshot > snap OR end_snapshot IS NULL)
 SELECT path, file_size_bytes, record_count
 FROM __ducklake_metadata_lake.ducklake_data_file
 WHERE table_id = ?
@@ -1708,42 +2024,28 @@ WHERE table_id = ?
 
 ### DuckLake Deployment Caveat
 
-DuckLake's metadata catalog is a single DuckDB file (e.g.,
-`./events.ducklake`). This works well for **local/CLI usage** — you run
-LakeSearch next to your application that reads and writes the data lake,
-and they share the same DuckDB file on the local filesystem.
+DuckLake's metadata catalog is a single DuckDB file (for example
+`./events.ducklake`). This is excellent for local and CLI-oriented
+workflows where LakeSearch is co-located with the writer process.
 
-It does **not** work well for **distributed/server deployments**. A remote
-query service would need access to the same DuckDB file as the writer
-process. DuckDB files cannot be shared across machines via object storage
-(they're mutable, and object stores don't support in-place mutation). You
-would need the query service co-located with the writer, or a shared
-filesystem.
-
-This is a known limitation of the DuckLake implementation specifically,
-not of LakeSearch's architecture. Iceberg (REST catalog) and Delta Lake
-(transaction log on object storage) don't have this constraint — their
-metadata is either served via HTTP or stored as immutable files in object
-storage, accessible from anywhere.
-
-**DuckLake is for prototyping and local development.** For production
-server deployments, use an Iceberg or Delta Lake catalog implementation.
+It is a poor fit for distributed query-service deployments because the
+query server would need access to that same mutable DuckDB file. DuckDB
+files cannot be safely shared via object storage. For production server
+deployments, prefer Iceberg or Delta Lake backends whose metadata is
+already accessible remotely.
 
 ### DuckDB-RS Usage
 
-The `duckdb` Rust crate with `bundled` feature compiles DuckDB from
-source. Extensions are loaded at runtime:
+The `duckdb` Rust crate with the `bundled` feature compiles DuckDB from
+source. All LakeSearch needs is the ability to submit SQL:
 
 ```rust
 use duckdb::{params, Connection};
 
 let conn = Connection::open_in_memory()?;
 conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-conn.execute_batch(
-    "ATTACH 'ducklake:./catalog.ducklake' AS lake (DATA_PATH './data/');"
-)?;
+conn.execute_batch("ATTACH 'ducklake:./catalog.ducklake' AS lake;")?;
 
-// Query metadata
 let mut stmt = conn.prepare(
     "SELECT path, file_size_bytes, record_count
      FROM __ducklake_metadata_lake.ducklake_data_file
@@ -1758,29 +2060,15 @@ let files: Vec<DataFile> = stmt.query_map(params![table_id, from, to], |row| {
 })?.collect::<Result<_, _>>()?;
 ```
 
-All we do is submit SQL queries. No special Rust API needed for DuckLake.
-
-**Fallback**: If DuckDB-RS extension loading proves problematic, shell out
-to the DuckDB CLI:
-```rust
-let output = Command::new("duckdb")
-    .args([":memory:", "-json", "-c", &query])
-    .output()?;
-```
-
-
 ### Disabling Inlined Data
 
-DuckLake can store small writes directly in the metadata database instead
-of writing Parquet files. This breaks LakeSearch because we need all data
-in Parquet files we can index. Disable on catalog setup:
+DuckLake can inline small writes into the metadata database instead of
+writing Parquet files. LakeSearch cannot index data that never lands in
+Parquet, so this must be disabled on catalog setup:
 
 ```sql
 CALL ducklake_set_option('lake', 'inline_data', false);
 ```
-
-This must be set before any data is written, or existing inlined data
-will not be in Parquet files. Document this as a hard requirement.
 
 ### Querying File Metadata
 
@@ -1797,24 +2085,27 @@ The key table is `ducklake_data_file`:
 | `record_count` | BIGINT | Row count |
 | `file_size_bytes` | BIGINT | File size |
 
-This gives us everything we need:
+This is enough to answer all LakeSearch metadata questions:
+
 - **Files active now**: `end_snapshot IS NULL` (or `> current_snap`)
 - **Files added since X**: `begin_snapshot > X`
-- **Files removed since X**: `end_snapshot IS NOT NULL AND end_snapshot > X`
+- **Files live among a candidate set**: `path IN (...) AND end_snapshot IS NULL`
 
 ### What Compaction Looks Like in DuckLake
 
 When a user calls `ducklake_merge_adjacent_files('lake')`:
-1. Old small files get `end_snapshot` set to the new snapshot.
-2. A new merged file gets `begin_snapshot` set to the new snapshot.
-3. The merged file has `partial_max` set (it contains data from
-   multiple original snapshots).
+
+1. old small files get `end_snapshot` set to the new snapshot
+2. new merged files get `begin_snapshot` set to the new snapshot
+3. merged files may span multiple prior snapshots
 
 From LakeSearch's perspective:
-- **Index** sees the new merged file as a new file (begin_snapshot > last_indexed).
-- **Compact** sees the old files as stale (end_snapshot set, not in current snapshot).
 
-This is exactly the append-and-compact pattern we designed for.
+- **index** sees the merged files as newly added files
+- **compact** sees the retired input files as stale files that should be
+  removed from segment references
+
+This is exactly the append-and-rewrite pattern the design assumes.
 
 ---
 
@@ -1850,14 +2141,12 @@ bincode-encoded structs.
 
 ```
 GLOBAL STATE
-  meta|{table_id}|config              -> TableConfig
+  meta|config                         -> TableConfig
     Contains:
       indexed_columns: Vec<ColumnConfig>
         Each: { name: String, tokenizer: String, status: active|dropped }
-      table_location: String               (data lake table path)
-      catalog_uri: String                  (catalog connection string)
 
-  meta|{table_id}|snapshot|{column}   -> ColumnSnapshotState
+  meta|snapshot|{column}              -> ColumnSnapshotState
     Contains:
       last_indexed_snapshot: SnapshotId
     Per-column tracking. Each column advances independently.
@@ -1865,7 +2154,7 @@ GLOBAL STATE
     In the happy path (all columns in sync), all entries have the same
     snapshot value and advance in lockstep.
 
-  meta|{table_id}|corpus|{column}     -> CorpusStats
+  meta|corpus|{column}                -> CorpusStats
     Contains:
       total_rows: u64
       total_tokens: u64
@@ -1873,7 +2162,7 @@ GLOBAL STATE
     and compact.
 
 SEGMENT INDEX
-  seg|{table_id}|{column}|{max_term}|{segment_id}  -> SegmentEntry
+  seg|{column}|{max_term}|{segment_id} -> SegmentEntry
     Contains:
       segment_path: String
       min_term: String
@@ -1885,13 +2174,13 @@ SEGMENT INDEX
       parquet_files: Vec<ParquetFileRef>
         Each: { path: String, row_group_count: u32 }
 
-    Sorted by (table, column, max_term). A range scan starting at
-    seg|{table}|{col}|{query_term} finds all segments whose term
+    Sorted by (column, max_term). A range scan starting at
+    seg|{col}|{query_term} finds all segments whose term
     range may contain the query term.
 ```
 
 **Why this works for queries**: To find segments for term T, scan from
-`seg|{table}|{col}|{T}` forward. The first key with `max_term >= T`
+`seg|{col}|{T}` forward. The first key with `max_term >= T`
 is the first candidate. Keep scanning until `min_term > T`. This is
 O(matching segments), not O(all segments).
 
@@ -2018,8 +2307,25 @@ that a concurrent index/compact has written but not yet committed.
 
 ## 12. API Specifications
 
+**Table resolution**:
+- CLI commands take `--catalog-uri` and a backend-relative `--table`.
+- REST / Flight / server requests carry `table` as
+  `catalog_alias + backend path`.
+- The pseudocode below assumes `table` is a resolved `ResolvedTable`
+  handle and reads or writes table-local SlateDB keys inside that
+  table's own SlateDB instance.
+
+**Initialization**:
+- `add-index` is the initializer. It creates SlateDB metadata if missing
+  and records the initial `TableConfig`.
+- `index`, `query`, `compact`, `vacuum`, and `drop-index` require that
+  metadata to already exist. If it does not, they return a clear
+  "run add-index first" error.
+
 **Snapshot handling**: Index accepts an optional `target_snapshot` for
-incremental backfill. All other APIs — query, compact,
+incremental backfill. Per-column snapshot pointers are monotonic: an
+index call may advance a lagging column to the requested target, but it
+never moves any column backward. All other APIs — query, compact,
 vacuum — always operate on the current snapshot. There is no time-travel
 query support. LakeSearch indexes only work on recent data; for
 historical queries, use your query engine's native time-travel.
@@ -2043,79 +2349,91 @@ pub struct IndexRequest {
 pub struct IndexResult {
     pub segments_created: usize,
     pub files_indexed_per_column: HashMap<String, usize>,
-    pub snapshot_advanced_to: SnapshotId,
+    pub target_snapshot: SnapshotId,
 }
 ```
 
 **Algorithm**:
 
 ```
-INDEX(table_id, target_snapshot?):
+INDEX(table, target_snapshot?):
 
 1. RESOLVE target snapshot:
-     target = target_snapshot.unwrap_or(catalog.current_snapshot())
+     target = target_snapshot.unwrap_or(table.current_snapshot())
 
 2. READ table config from SlateDB for indexed columns.
      Filter to columns with status = active.
 
 3. For each active column, READ its snapshot pointer:
-     key: meta|{table_id}|snapshot|{column}
+     key: meta|snapshot|{column}
      If not found -> last_indexed = None (first index or new column).
 
-4. COMPUTE per-column file sets:
-     Group columns by their last_indexed value (most will be the same).
+4. CLASSIFY columns relative to target:
+     behind_or_uninitialized = columns where last_indexed is None or < target
+     at_target               = columns where last_indexed == target
+     ahead_of_target         = columns where last_indexed > target
+
+     If behind_or_uninitialized is empty AND ahead_of_target is non-empty:
+       ERROR: target snapshot is older than every active column pointer.
+       Index never rewinds a column to an older snapshot.
+
+5. COMPUTE per-column file sets for behind_or_uninitialized columns:
+     Group those columns by their last_indexed value (most will be the same).
      For each distinct last_indexed value:
        If last_indexed is None:
-         files = catalog.files_at_snapshot(target)
-       Else if last_indexed == target:
-         files = []   (column is up to date)
+         files = table.files_at_snapshot(target)
        Else:
-         files = catalog.files_added_between(last_indexed, target)
+         files = table.files_added_between(last_indexed, target)
 
      This avoids redundant catalog calls — columns that are in sync
-     share one call.
+     share one call. Columns at_target do no work. Columns ahead_of_target
+     are left unchanged.
 
-5. For each column that has new files:
+6. For each column that has new files:
      a. BUILD segment(s) from that column's file set:
         - Read each Parquet file's column pages via offset_index
-        - Tokenize every row, build posting lists (page-level doc_ids)
+        - Tokenize every row, build posting lists
+          (`doc_id`, `row_hit_count`)
         - Build doc table: doc_id -> (file, row_group, page, first_row, count)
         - Compute per-segment corpus stats (total_rows, total_tokens)
         - Build FST term dictionary
         - If segment > target_segment_size: split by term range
 
      b. WRITE segment file(s) to object storage:
-        {table_path}/lakesearch/segments/{column}/{segment_id}.seg
+        {table.table_location()}/lakesearch/segments/{column}/{segment_id}.seg
 
-6. COMMIT atomically (single SlateDB transaction):
+7. COMMIT atomically (single SlateDB transaction):
      txn = db.begin(Snapshot)
      For each column with new segments:
        For each segment:
-         txn.put(seg_key(table, col, seg.max_term, seg.id), encode(seg))
+         txn.put(seg_key(col, seg.max_term, seg.id), encode(seg))
        // Update corpus stats
-       old_stats = txn.get(corpus_key(table, col))
-       txn.put(corpus_key(table, col), old_stats + seg_stats)
-     // Advance all active columns' snapshot pointers to target
+       old_stats = txn.get(corpus_key(col))
+       txn.put(corpus_key(col), old_stats + seg_stats)
+     // Advance only columns that were behind target or uninitialized.
+     // Columns already at or ahead of target keep their existing pointer.
      For each active column:
-       txn.put(snapshot_key(table, col), target)
+       If old_snapshot is None or old_snapshot < target:
+         txn.put(snapshot_key(col), target)
      txn.commit()
      db.flush()   // ensure durable before returning
 
-7. Return IndexResult { ... }
+8. Return IndexResult { ... }
 ```
 
-**Why all columns advance to target, not just the ones with work**: A
-column with no new files (last_indexed == target, or files list empty)
-still gets its pointer advanced. This keeps columns in lockstep after
-the initial catch-up. If we only advanced columns that did work, a
-column with no matches in the new files would fall behind for no reason.
+**Pointers are monotonic.** Index never rewrites a column to an older
+snapshot. If `target` is older than every active column pointer, fail.
+If some columns lag and others are already ahead, index backfills only
+the lagging columns to `target` and leaves the ahead columns unchanged.
+In the common case where all columns start aligned and `target` is
+newer, they advance together.
 
 **Backfill is not a separate operation.** When a new column is added
 (see Column Lifecycle), its snapshot pointer doesn't exist. The next `index` call sees
 `last_indexed = None` for that column, fetches all files via
 `files_at_snapshot(target)`, and indexes them. Existing columns that
-are already at target do nothing. After the call, all columns are in
-sync.
+are already at or ahead of target do nothing. If the existing columns
+were already at `target`, then after the call all columns are in sync.
 
 **Missing columns**: If a Parquet file does not contain the indexed
 column (e.g., the column was added to the schema after the file was
@@ -2130,9 +2448,11 @@ snapshot 5, then 10, then 15. The `target_snapshot` parameter already
 exists for this — no additional API needed. Orchestrating the cadence
 is the caller's responsibility.
 
-**Idempotency**: Calling with the same or older target_snapshot produces
-empty diffs at step 4. Snapshot pointers are re-written to the same
-value. Safe to retry.
+**Idempotency**: Calling with the same target snapshot is a no-op.
+Calling with an older target is allowed only when at least one active
+column is behind or uninitialized; in that case, the call backfills only
+those lagging columns and never rewinds ahead columns. Calling with a
+target older than every active column pointer fails.
 
 **Failure modes**:
 - Segment write fails before commit -> no metadata change. Orphan files
@@ -2179,17 +2499,17 @@ doc_ids, and writes final segments once. No intermediate segment files,
 no double I/O.
 
 ```
-COMPACT(table_id):
+COMPACT(table):
 
 --- Plan -----------------------------------------------------------
 
-1. QUERY catalog for current liveness state:
-     current_snap = catalog.current_snapshot()
-     live_files = catalog.files_at_snapshot(current_snap)
+1. QUERY table for current liveness state:
+     current_snap = table.current_snapshot()
+     live_files = table.files_at_snapshot(current_snap)
      live_paths = { f.path for f in live_files }
 
 2. SCAN all segments for this table from SlateDB:
-     scan_prefix(seg|{table_id}|)
+     scan_prefix(seg|)
 
 3. ANNOTATE each segment with staleness:
      For each segment:
@@ -2224,12 +2544,14 @@ COMPACT(table_id):
 
      b. MERGE with stale filtering:
         Merge-sort all segments by term. For each term:
-          - Union posting lists across segments.
-          - For each doc_id in the unioned list, look up the doc table.
-            If the doc table entry points to a stale Parquet file ->
-            discard. Otherwise -> remap to a new dense doc_id.
+          - Union posting entries across segments.
+          - For each `(doc_id, row_hit_count)` in the unioned list,
+            look up the doc table. If the doc table entry points to a
+            stale Parquet file -> discard. Otherwise -> remap to a new
+            dense doc_id and carry `row_hit_count` forward.
           - If posting list is empty after filtering -> drop the term.
-          - Recompute doc_frequency from surviving entries.
+          - Recompute `doc_frequency` as the sum of surviving
+            `row_hit_count` values.
         Concatenate surviving doc table entries (renumbered densely).
         Compute corpus stats from surviving entries.
 
@@ -2243,17 +2565,17 @@ COMPACT(table_id):
      txn = db.begin(Snapshot)
      // Delete fully_stale segments
      For each fully_stale segment:
-       txn.delete(seg_key(table, col, old_max_term, old_seg_id))
+       txn.delete(seg_key(col, old_max_term, old_seg_id))
      // Replace merged segments with new ones
      For each merge group:
        For each consumed segment: txn.delete(old_key)
        For each new output segment: txn.put(new_key, entry)
      // Update global corpus stats per column
      For each affected column:
-       old_corpus = txn.get(corpus_key(table, col))
+       old_corpus = txn.get(corpus_key(col))
        new_corpus = old_corpus - sum(consumed_segment_stats)
                                + sum(new_segment_stats)
-       txn.put(corpus_key(table, col), new_corpus)
+       txn.put(corpus_key(col), new_corpus)
      txn.commit()
      db.flush()
 
@@ -2276,11 +2598,14 @@ of whether index was called first.
 **Merge primitive with stale filtering**: The existing merge primitive is
 extended with a `stale_paths` parameter. Stale filtering is just an
 additional predicate during the merge: "skip doc table entries for stale
-Parquet files." This naturally handles terms that disappear (posting list
-becomes empty), doc_id renumbering, corpus stats recomputation, and FST
-rebuild — all of which the merge already does. A single-segment merge
-group (a stale segment alone in its tier) is a degenerate case: same
-code path, no special case.
+Parquet files." Because each posting entry also carries `row_hit_count`,
+the merge can recompute exact row-level `doc_frequency` as
+`sum(row_hit_count)` over surviving entries for each term. This
+naturally handles terms that disappear (posting list becomes empty),
+doc_id renumbering, exact `doc_frequency` recomputation, corpus stats
+recomputation, and FST rebuild — all of which the merge already does.
+A single-segment merge group (a stale segment alone in its tier) is a
+degenerate case: same code path, no special case.
 
 ```rust
 /// Merge N segments into one (or more, if splitting by term range).
@@ -2300,112 +2625,140 @@ have been indexed for this column."
 
 ### 12c. Query Path
 
-The query API, query language (match, multi_match, full boolean trees),
+The query API, query language (match and explicit boolean composition),
 cross-column semantics, BM25 scoring, and execution pipeline are
 defined in the Query Model section. The changes below describe how the query
 *path* determines which files are indexed, which are unindexed, and which
 are stale:
 
 - **Per-column snapshot pointer**: Read from
-  `meta|{table_id}|snapshot|{column}` in SlateDB. Each column may be
+  `meta|snapshot|{column}` in SlateDB. Each column may be
   at a different snapshot (e.g., during backfill).
-- **Unindexed file detection**: Uses `catalog.files_added_between(
+- **Unindexed file detection**: Uses `table.files_added_between(
   last_indexed, current_snapshot)` to identify files not yet indexed.
-- **Stale page filtering**: Uses `catalog.check_files_live(paths)`
+- **Stale page filtering**: Uses `table.check_files_live(paths)`
   with only the candidate segments' file paths. Avoids materializing
   the full file list on the query hot path.
 
 **Algorithm**:
 
 ```
-QUERY(table_id, column, query_text, limit):
+QUERY(table, query):
 
 --- Step 1: Determine indexed vs unindexed files -------------------
 
 1. GET current snapshot:
-     snap = catalog.current_snapshot()
+     snap = table.current_snapshot()
 
-2. READ this column's snapshot pointer from SlateDB:
-     key: meta|{table_id}|snapshot|{column}
+2. For each referenced column, READ that column's snapshot pointer from SlateDB:
+     key: meta|snapshot|{column}
      If not found -> last_indexed = None (column never indexed).
 
-3. Determine unindexed files:
+3. Determine unindexed files per referenced column:
      If last_indexed == snap:
        unindexed_files = []            // fast path
      Else if last_indexed is None:
-       unindexed_files = catalog.files_at_snapshot(snap)  // everything
+       unindexed_files = table.files_at_snapshot(snap)  // everything
      Else:
-       unindexed_files = catalog.files_added_between(last_indexed, snap)
+       unindexed_files = table.files_added_between(last_indexed, snap)
 
-4. Stale filtering is deferred to after segment evaluation (step 7d).
+4. Stale filtering is deferred to after segment discovery (step 7).
      When last_indexed == snap, skip entirely (fast path).
      Otherwise, collect parquet file paths from candidate segments
-     after step 6, then call catalog.check_files_live(paths) to get
+     after step 6, then call table.check_files_live(paths) to get
      the live subset. This avoids materializing the full file list —
      only the files from candidate segments are checked.
 
---- Step 2: Indexed path (segment lookup) --------------------------
+--- Step 2: Indexed path (candidate generation; no Parquet reads) ---
 
-5. TOKENIZE query_text -> query_terms[]
+5. PARSE the request into `QueryPlan`.
 
-6. For each query_term:
-     SCAN SlateDB for candidate segments:
-       Start: seg|{table_id}|{column}|{term}
-       End:   seg|{table_id}|{column}|~
-       Keep segments where min_term <= term <= max_term.
+6. For each query term / column pair in the `QueryPlan`:
+     If term is Exact or Prefix:
+       SCAN SlateDB for candidate segments:
+         Start: seg|{column}|{term}
+         End:   seg|{column}|~
+         Keep segments where min_term <= term <= max_term.
+     If term is Suffix:
+       use all segments for that column
+       (MVP: no reverse-range segment pruning metadata)
 
-7. For each candidate segment:
-     a. LOAD segment file (from cache or object storage).
-     b. For each query_term:
-        FST lookup -> term ordinal -> posting list offset -> decode doc_ids
-     c. INTERSECT posting lists (AND) or UNION (OR).
-     d. For each candidate doc_id:
-        Look up doc table -> (parquet_file, row_group, page, first_row, count)
-        FILTER: skip if parquet_file.path NOT IN live_paths
-          (file was compacted away since last index)
-        live_paths comes from catalog.check_files_live() called once
-        after segment evaluation with all candidate segments' file paths.
-     e. For surviving candidates:
-        READ Parquet page.
-        ILIKE pre-filter: SIMD substring check per query term to
-          cheaply discard non-matching rows (no tokenization).
-        Tokenize only ILIKE survivors, evaluate full boolean AST.
-        Compute BM25 using global df (summed across segments) +
-          global corpus stats from SlateDB.
+7. LOAD the candidate segments (from cache or object storage).
+     If stale filtering is needed:
+       call table.check_files_live(candidate_segment_paths) once
+       to get live_paths.
 
-8. Collect scored results from indexed path.
+8. For each `ColumnPlan` leaf:
+     a. Resolve each referenced term in each matching segment:
+          FST lookup -> term ordinal -> posting list offset -> decode postings
+     b. If all terms for the leaf can be satisfied inside one segment:
+          INTERSECT / UNION that segment's `doc_id` lists directly.
+          Resolve surviving `doc_id`s through that segment's doc table.
+     c. Otherwise:
+          Resolve each term's postings through the owning segments'
+          doc tables to page locations `(file, row_group, page)`.
+          INTERSECT / UNION those page-location sets.
+     d. FILTER out any page whose Parquet file path is not in
+          live_paths.
+     e. Convert surviving page hits to row ranges via
+          `(first_row_index, row_count)`.
+
+9. Combine the per-leaf row ranges according to the enclosing
+     `QueryExpr` tree. Cross-column AND/OR and same-column AND/OR
+     across split siblings both happen here on row identity /
+     overlapping row ranges. No Parquet data has been read yet.
+
+10. Group the resulting row ranges by `(file, row_group)` and build
+      one `RowSelection` work item per group.
+
+11. For each indexed work item:
+      READ candidate rows once with `RowSelection + ProjectionMask`.
+      ILIKE pre-filter: SIMD substring check per query term to cheaply
+        discard non-matching rows.
+      Tokenize only ILIKE survivors, evaluate the compiled `QueryPlan`.
+      If `score: true` and every referenced column is fully indexed:
+        score immediately with indexed global df + corpus stats.
+      Else if `score: true`:
+        buffer the verified indexed rows plus per-row TF / `dl` for
+        final scoring after the unindexed tail contributes its deltas.
 
 --- Step 3: Unindexed path (brute-force) ---------------------------
 
-9. For each file in unindexed_files (two-pass projection):
-     Pass 1 — stream only the searched column:
-       Read full row groups sequentially (large I/O, not page-random).
-       ILIKE pre-filter (SIMD substring check) to cheaply discard
-       non-candidate rows. Tokenize survivors, evaluate query terms.
-       Record matching row indices.
-     Pass 2 — read remaining projected columns for matches only:
-       Build RowSelection from matching row indices.
-       Read other columns with ProjectionMask + RowSelection.
-       Score matches with BM25.
+12. For each file in the union of `unindexed_files` across referenced
+      columns (two-pass projection):
+      Pass 1 — stream only the searched columns:
+        If `score: false`:
+          ILIKE pre-filter, tokenize survivors, evaluate `QueryPlan`,
+          record matching row indices.
+        Else (`score: true`):
+          tokenize every row once, evaluate `QueryPlan`, record
+          matching row indices + per-row TF / `dl`, and accumulate
+          exact per-column `delta_rows`, `delta_tokens`, and
+          `delta_df` for the query terms only for columns whose
+          snapshot pointer does not yet cover that file.
+      Pass 2 — read remaining projected columns for matches only:
+        Build `RowSelection` from matching row indices.
+        Read other columns with `ProjectionMask + RowSelection`.
 
-   Two-pass avoids reading non-searched columns for the ~99% of rows
-   that don't match. Sequential column streaming is also cheaper on
-   object stores than many small page reads (fewer requests, better
-   throughput).
-
-10. Collect results from brute-force.
+13. If `score: true` and any unindexed files were scanned:
+      finalize per-column BM25 parameters from indexed corpus stats +
+      brute-force deltas, then score buffered indexed matches and
+      brute-force matches with those finalized parameters.
 
 --- Step 4: Merge and return ---------------------------------------
 
-11. MERGE indexed results + brute-force results.
-12. SORT by BM25 descending. Apply limit.
-13. Return results with stats.
+14. MERGE indexed results + brute-force results.
+15. If `score: true`, SORT by BM25 descending and apply `limit`.
+    If `score: false`, preserve streaming/encounter order and apply
+    `limit` without a global sort.
+16. Return results with stats.
 ```
 
 For cross-column queries (designed in § 8, not yet implemented in the
-query crate), the library runs steps 1-11 per clause, then joins
-results by row identity `(file_path, row_index)`, applies the combine
-strategy, sorts, and returns.
+query crate), the implementation should follow this same staged plan:
+reduce each `ColumnPlan` leaf to row ranges first, combine row ranges
+according to the enclosing `QueryExpr` tree, then read Parquet once for
+the combined `RowSelection` work items.
 
 **Query during backfill**: If a column is mid-backfill (its
 `last_indexed` is behind other columns), queries on that column
@@ -2413,9 +2766,9 @@ brute-force scan more files. This is correct — results are complete,
 just slower until the backfill catches up. `unindexed_files_scanned`
 in QueryStats tells the caller how much brute-force work was needed.
 
-**Stale page filtering (step 7d)**: Between index and compact, some
+**Stale page filtering (step 8d)**: Between index and compact, some
 segments reference Parquet files the data lake has already compacted.
-Step 7d filters these at query time. Running compact promptly reduces
+Step 8d filters these at query time. Running compact promptly reduces
 this overhead by rewriting the segments themselves.
 
 **Performance tiers**:
@@ -2450,15 +2803,15 @@ pub struct VacuumResult {
 **Algorithm**:
 
 ```
-VACUUM(table_id, grace_period = 1h):
+VACUUM(table, grace_period = 1h):
 
 1. LIST all segment files in object storage:
-     {table_path}/lakesearch/segments/
+     {table.table_location()}/lakesearch/segments/
    This is the only API that uses object storage LIST.
    Run sparingly (daily or weekly).
 
 2. SCAN SlateDB for all live segment paths:
-     scan_prefix(seg|{table_id}|)
+     scan_prefix(seg|)
      live_paths = { entry.segment_path for each entry }
 
 3. orphans = listed_paths - live_paths
@@ -2478,7 +2831,7 @@ VACUUM(table_id, grace_period = 1h):
 
 **Vacuum only handles LakeSearch segment files.** SlateDB manages its
 own garbage collection internally — old SSTables in
-`{table_path}/lakesearch/slatedb/compacted/` are cleaned up by
+`{table.table_location()}/lakesearch/slatedb/compacted/` are cleaned up by
 SlateDB's built-in compactor. Vacuum does not touch the `slatedb/`
 directory.
 
@@ -2488,13 +2841,19 @@ directory.
 
 ### Adding an Index
 
-```
-lakesearch add-index --table events --column description [--tokenizer default]
+```bash
+lakesearch add-index \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --column description \
+  [--tokenizer whitespace_lowercase]
 ```
 
-Writes an updated `TableConfig` to SlateDB with the new column added
-(status = active). Does NOT create a snapshot pointer for the column —
-the absence of a pointer means `last_indexed = None`.
+If the table has not been initialized yet, `add-index` first creates the
+SlateDB metadata for the resolved table and writes the initial
+`TableConfig`. It then adds the column (status = active). It does NOT
+create a snapshot pointer for the column — the absence of a pointer means
+`last_indexed = None`.
 
 The next `index` call sees the new column with no snapshot pointer,
 fetches all files via `files_at_snapshot(target)`, and indexes them.
@@ -2504,16 +2863,19 @@ per-column snapshot tracking.
 
 ### Dropping an Index
 
-```
-lakesearch drop-index --table events --column description
+```bash
+lakesearch drop-index \
+  --catalog-uri ducklake:./events.ducklake \
+  --table events \
+  --column description
 ```
 
 Single atomic SlateDB transaction:
 1. Update `TableConfig`: set column status to `dropped`
 2. Delete all segment keys for that column:
-   `scan_prefix(seg|{table_id}|{column}|)` -> delete each
-3. Delete corpus stats: `delete(meta|{table_id}|corpus|{column})`
-4. Delete snapshot pointer: `delete(meta|{table_id}|snapshot|{column})`
+   `scan_prefix(seg|{column}|)` -> delete each
+3. Delete corpus stats: `delete(meta|corpus|{column})`
+4. Delete snapshot pointer: `delete(meta|snapshot|{column})`
 
 Segment files for the dropped column become orphans, cleaned up by the
 next `vacuum` run. The index API ignores columns with status = dropped.
@@ -2606,7 +2968,7 @@ impl SegmentBuilder {
     pub fn add_file(&mut self, path: &str, row_group_count: u16) -> FileOrdinal;
     pub fn add_page(&mut self, file: FileOrdinal, row_group: u16,
                      page: u16, first_row_index: u64, row_count: u32) -> DocId;
-    pub fn add_posting(&mut self, term: &str, doc_id: DocId);
+    pub fn add_posting(&mut self, term: &str, doc_id: DocId, row_hit_count: u32);
     pub fn set_doc_frequency(&mut self, term: &str, df: u32);
     pub fn set_corpus_stats(&mut self, total_rows: u64, total_tokens: u64);
     pub fn build(self) -> Vec<u8>;  // serialized segment file bytes
@@ -2646,7 +3008,7 @@ pub fn bm25_score(tf: f32, df: u32, dl: u32, avg_dl: f32, n: u64) -> f32;
 
 // -- Metadata types (SlateDB key-value model) --
 
-pub struct TableConfig { .. }           // indexed_columns, table_location, catalog_uri
+pub struct TableConfig { .. }           // indexed_columns
 pub struct ColumnSnapshotState { .. }   // last_indexed_snapshot
 pub struct CorpusStats { .. }           // total_rows, total_tokens
 pub struct SegmentEntry { .. }          // segment_path, min_term, max_term, size_bytes, doc_count, parquet_files, ...
@@ -2714,7 +3076,7 @@ lakesearch             -- the library. One crate, two layers:
                             tokenizer, BM25, merge logic.
                           Operations layer (async):
                             LakeSearch struct, index, compact, vacuum,
-                            query, DataLakeCatalog trait + DuckLake impl,
+                            query, Catalog trait + ResolvedTable trait,
                             SlateDB metadata client, query builders.
                           Feature flags:
                             "ducklake" — DuckLake catalog (duckdb dep)
@@ -2727,8 +3089,10 @@ lakesearch-server      -- query server binary. Thin wrapper:
 
 lakesearch-cli         -- CLI binary. Thin wrapper:
                           clap argument parsing.
-                          Commands: init, add-index, drop-index, index,
+                          Commands: add-index, drop-index, index,
                                    compact, vacuum, query.
+                          Query takes `--catalog-uri`, `--table`,
+                          and `--json` / `--json-file`.
 ```
 
 Two binaries, one library. The library is the product.
@@ -2776,6 +3140,7 @@ import time
 conn = duckdb.connect()
 client = flight.connect("grpc://localhost:8081")
 PARQUET_GLOB = "s3://bucket/data/events/*.parquet"
+FLIGHT_TABLE = "prod.events"   # server alias `prod` points at the benchmark catalog
 
 def bench(name, indexed_fn, bruteforce_fn, runs=5):
     """Run both paths, compare wall time and rows scanned."""
@@ -2793,7 +3158,7 @@ def bench(name, indexed_fn, bruteforce_fn, runs=5):
 # Index should win big — prunes almost all files.
 def indexed_rare():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","match":"ECONNREFUSED"}}'
+        f'{{"table":"{FLIGHT_TABLE}","search":{{"column":"description","match":"ECONNREFUSED"}}}}'.encode()
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
@@ -2816,7 +3181,7 @@ bench("rare_term", indexed_rare, bruteforce_rare)
 # Index may not help much — most pages match anyway.
 def indexed_common():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","match":"error"}}'
+        f'{{"table":"{FLIGHT_TABLE}","search":{{"column":"description","match":"error"}}}}'.encode()
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
@@ -2832,7 +3197,7 @@ bench("common_term", indexed_common, bruteforce_common)
 # Index intersects posting lists — should prune heavily.
 def indexed_multi():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","match":"connection timeout upstream","operator":"and"}}'
+        f'{{"table":"{FLIGHT_TABLE}","search":{{"column":"description","match":"connection timeout upstream","operator":"and"}}}}'.encode()
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
@@ -2849,7 +3214,7 @@ bench("multi_term_and", indexed_multi, bruteforce_multi)
 # -- Benchmark 4: Prefix search --
 def indexed_prefix():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","match":"conn*"}}'
+        f'{{"table":"{FLIGHT_TABLE}","search":{{"column":"description","match":"conn*"}}}}'.encode()
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
@@ -2864,7 +3229,7 @@ bench("prefix_search", indexed_prefix, bruteforce_prefix)
 # -- Benchmark 5: Text search + aggregation (end-to-end) --
 def indexed_agg():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","match":"timeout"}}'
+        f'{{"table":"{FLIGHT_TABLE}","search":{{"column":"description","match":"timeout"}}}}'.encode()
     ))
     return conn.sql("""
         SELECT service, count(*), avg(response_time_ms)
@@ -2888,7 +3253,8 @@ bench("search_plus_agg", indexed_agg, bruteforce_agg)
 |--------|-----|-----|
 | Wall-clock time | `time.perf_counter()` around each query | Primary metric — is indexed faster? |
 | Rows scanned | LakeSearch stats response (`rows_scanned`) vs DuckDB `EXPLAIN ANALYZE` | Validates that the index actually pruned data |
-| Files touched | LakeSearch stats (`files_pruned / files_total`) | Shows file-level pruning ratio |
+| Segments touched | LakeSearch stats (`segments_touched`) | Shows how much indexed metadata/query work the planner had to consult |
+| Unindexed files scanned | LakeSearch stats (`unindexed_files_scanned`) | Makes degraded-path / backfill cost visible |
 | Bytes read from storage | Object store metrics or `strace` | Confirms I/O reduction, not just CPU |
 
 ### Test Matrix
@@ -2920,7 +3286,7 @@ Vary along these axes to find where indexed search wins and where it doesn't:
 ### Regression Gate
 
 The benchmark suite should run in CI on representative data. A query where
-indexed is slower than brute force by more than 20% is a regression signal —
+indexed is slower than brute force by more than 10% is a regression signal —
 either the index overhead is too high, or the test case should fall back to
 brute force automatically (the query planner could use `doc_frequency` to
 estimate selectivity and skip the index for very common terms).
@@ -2975,20 +3341,23 @@ LakeSearch: SlateDB at s3://lake/events/lakesearch/slatedb/
 User inserts 100K rows across 100 Parquet files. DuckLake snapshot = 1.
 
 ```
-index(table_id="events", target_snapshot=Some(1))
+add-index(table="events", column="description")
+  -> Creates LakeSearch metadata and records the indexed column.
+
+index(table="events", target_snapshot=Some(1))
 
 1. target = snapshot 1
 2. Config: one column "description"
-3. message: no snapshot pointer -> last_indexed = None
-4. catalog.files_at_snapshot(1) -> 100 files
+3. description: no snapshot pointer -> last_indexed = None
+4. table.files_at_snapshot(1) -> 100 files
 5. Build segments for "description" column
    -> 10 segments of ~5MB each
 6. Write to s3://lake/events/lakesearch/segments/description/*.seg
 7. SlateDB txn:
-   - PUT seg|events|description|{max_term_1}|{seg_1} -> ...
+   - PUT seg|description|{max_term_1}|{seg_1} -> ...
    - ... (10 entries)
-   - PUT meta|events|corpus|description -> { total_rows: 100000, ... }
-   - PUT meta|events|snapshot|description -> { last_indexed: 1 }
+   - PUT meta|corpus|description -> { total_rows: 100000, ... }
+   - PUT meta|snapshot|description -> { last_indexed: 1 }
    - COMMIT + flush
 ```
 
@@ -2997,16 +3366,16 @@ index(table_id="events", target_snapshot=Some(1))
 User inserts 5K rows in 5 new files. Snapshot = 2.
 
 ```
-index(table_id="events")    // no snapshot -> uses current = 2
+index(table="events")    // no snapshot -> uses current = 2
 
 1. target = 2
-2. message: last_indexed = 1
-3. catalog.files_added_between(1, 2) -> 5 new files
+2. description: last_indexed = 1
+3. table.files_added_between(1, 2) -> 5 new files
 4. Build 1 small segment (~500KB)
 5. SlateDB txn:
-   - PUT seg|events|description|{max_term}|{seg_11} -> ...
+   - PUT seg|description|{max_term}|{seg_11} -> ...
    - UPDATE corpus stats
-   - PUT meta|events|snapshot|description -> { last_indexed: 2 }
+   - PUT meta|snapshot|description -> { last_indexed: 2 }
    - COMMIT + flush
 ```
 
@@ -3017,19 +3386,19 @@ User runs `ducklake_merge_adjacent_files('lake')`. DuckLake merges the
 are untouched.
 
 ```
-Step 1: index(table_id="events")    // indexes new compacted files
+Step 1: index(table="events")    // indexes new compacted files
 
 1. target = 3
-2. message: last_indexed = 2
-3. catalog.files_added_between(2, 3) -> 10 new merged files
+2. description: last_indexed = 2
+3. table.files_added_between(2, 3) -> 10 new merged files
 4. Build segments for the 10 new files
-5. Commit: new segments + message snapshot -> 3
+5. Commit: new segments + description snapshot -> 3
 
-Step 2: compact(table_id="events")  // clean up stale references
+Step 2: compact(table="events")  // clean up stale references
 
 Plan:
 1. current_snap = 3
-   live_files = catalog.files_at_snapshot(3) -> 10 merged + 5 day-2 files
+   live_files = table.files_at_snapshot(3) -> 10 merged + 5 day-2 files
 2. Scan segments -> 10 original + 1 day-2 + new from step 1
 3. 10 original segments reference the 100 pre-compaction files
    -> all stale (fully_stale)
@@ -3042,28 +3411,27 @@ Execute:
 
 ### Day 4: Add a New Column (Backfill)
 
-User wants to index the `description` column too.
+User wants to index the `error_message` column too.
 
 ```
-add-index(table_id="events", column="description")
-  -> Updates config in SlateDB. No snapshot pointer for description.
+add-index(table="events", column="error_message")
+  -> Updates config in SlateDB. No snapshot pointer for error_message.
 
-index(table_id="events")
+index(table="events")
 
 1. target = 3 (current snapshot, unchanged since day 3)
-2. Config: message (active), description (active)
+2. Config: description (active), error_message (active)
 3. Snapshot pointers:
-   - message: last_indexed = 3 -> up to date, no work
-   - description: no pointer -> last_indexed = None
+   - description: last_indexed = 3 -> up to date, no work
+   - error_message: no pointer -> last_indexed = None
 4. Catalog calls:
-   - message: files_added_between(3, 3) -> empty (or skip entirely)
-   - description: files_at_snapshot(3) -> 15 files (10 merged + 5 day-2)
-5. Build segments for description from all 15 files
+   - description: files_added_between(3, 3) -> empty (or skip entirely)
+   - error_message: files_at_snapshot(3) -> 15 files (10 merged + 5 day-2)
+5. Build segments for error_message from all 15 files
 6. SlateDB txn:
-   - PUT seg|events|description|{max_term}|{seg} -> ... (new segments)
-   - PUT meta|events|corpus|description -> { total_rows: ..., ... }
-   - PUT meta|events|snapshot|description -> { last_indexed: 3 }  // unchanged
-   - PUT meta|events|snapshot|description -> { last_indexed: 3 }
+   - PUT seg|error_message|{max_term}|{seg} -> ... (new segments)
+   - PUT meta|corpus|error_message -> { total_rows: ..., ... }
+   - PUT meta|snapshot|error_message -> { last_indexed: 3 }
    - COMMIT + flush
 
 Both columns now in sync at snapshot 3.
@@ -3071,8 +3439,8 @@ Both columns now in sync at snapshot 3.
 
 ### Query During Backfill
 
-If a user queries `description` before the backfill index runs:
-- description has no snapshot pointer -> last_indexed = None
+If a user queries `error_message` before the backfill index runs:
+- error_message has no snapshot pointer -> last_indexed = None
 - ALL files are unindexed -> full brute-force scan
 - Results are correct, just slow
 - After backfill completes, queries use the index
@@ -3102,6 +3470,10 @@ Merge completed work from feature branches and restructure crates.
   tokenizer module.
 - Updated evaluate, verify, and plan modules for wildcard dispatch.
 - Integration tests for prefix and suffix queries.
+- Tighten parser validation for the MVP grammar:
+  - allow only `prefix*` and `*suffix`
+  - reject middle-wildcard, multi-`*`, bare-`*`, and punctuation-splitting
+    cases instead of degrading them into surprising exact-term parses
 - **This gives us the `QueryTerm` canonical representation** that the
   builder API and QueryPlan depend on.
 
@@ -3109,14 +3481,26 @@ Merge completed work from feature branches and restructure crates.
 - Segment merge primitive (`merge.rs`). Needed for Phase 4.
 
 **Query API builders and LakeSearch struct**:
-- Implement `LakeSearch` struct with `open` (read-only, `DbReader`)
-  and `open_mut` (read-write, `Db`). Parses catalog URI, resolves
-  table path, opens SlateDB. User never sees internals.
-- Implement `QueryRequest::match_text()`, `multi_match()`,
-  `multi_column()` builders that produce the internal `QueryPlan`.
+- Define request boundary types:
+  - `QueryBody`: canonical nested query body used by the CLI JSON input
+    and embedded callers
+  - `SearchRequest`: server/REST/Flight envelope = `{ table, ..QueryBody }`
+- Implement centralized table-path parsers:
+  - server parser for `catalog_alias.path.to.table`
+  - CLI parser for backend-relative `--table`
+  - tests for empty input, missing alias, and one-segment backend paths
+- Implement `LakeSearch` struct with low-level
+  `open(table: Arc<dyn ResolvedTable>)` /
+  `open_mut(table: Arc<dyn ResolvedTable>)` and convenience `open_from_uri(...)` /
+  `open_mut_from_uri(...)`. The convenience constructors parse the
+  catalog URI, resolve the backend-relative table path, and then call
+  the lower-level constructors. User never sees internals.
+- Implement `QueryRequest::match_text()` and `multi_column()`
+  builders that produce the internal `QueryPlan`.
 - `QueryPlan` and `ColumnPlan` structs (private to the library).
 - Wire builders into REST handler (parse JSON → builder → QueryPlan),
-  CLI (parse flags → builder → QueryPlan), and Flight ticket parsing.
+  CLI (parse JSON query body + `--table` → builder → QueryPlan), and
+  Flight ticket parsing.
 - Score is a boolean (true/false), not a three-mode enum.
 - Optional `selectivity_threshold` per query (default 0.0 — always
   use index).
@@ -3130,17 +3514,19 @@ Merge completed work from feature branches and restructure crates.
   `tracing::warn!` for degraded paths (brute-force fallback, stale
   filtering), `tracing::error!` for failures. Add as each code path
   is written, not retrofitted.
-- Define response stat structs upfront: `QueryStats` (segments
-  consulted/pruned, pages scanned, rows verified, unindexed files
-  scanned, stale pages filtered), `CompactResult` (merged, stale
+- Define response stat structs upfront: `QueryStats`
+  (`segments_touched`, `candidate_pages`, `rows_scanned`,
+  `rows_matched`, `unindexed_files_scanned`, `elapsed_ms`),
+  `CompactResult` (merged, stale
   cleaned, created), `IndexResult` (segments created, files indexed
   per column), `VacuumResult` (files deleted). Wire into responses
   as operations are built.
 
-**Milestone**: Single `lakesearch` crate with wildcard support, query
-builder API, `LakeSearch` struct, canonical `QueryPlan`, segment
-caching, structured tracing, and response stats. All existing tests
-pass. Merge primitive available for Phase 4.
+**Milestone**: Single `lakesearch` crate with strict MVP wildcard
+support (`prefix*` / `*suffix` only), query builder API, `LakeSearch`
+struct, canonical `QueryPlan`, segment caching, structured tracing,
+and response stats. All existing tests pass. Merge primitive available
+for Phase 4.
 
 ### Phase 1: Core Infrastructure
 
@@ -3153,47 +3539,62 @@ Foundation libraries inside the `lakesearch` crate.
   values.
 - Methods: `get_config`, `get_column_snapshot`, `put_column_snapshot`,
   `get_corpus_stats`, `put_corpus_stats`, `put_segment`,
-  `delete_segment`, `scan_segments(table, column)`,
-  `scan_all_segments(table)`.
+  `delete_segment`, `scan_segments(column)`,
+  `scan_all_segments()`.
 - Transaction wrapper: `begin_txn()` → `MetadataTxn` with buffered
   puts/deletes, `commit()`, `flush()`.
 - Internal to `LakeSearch` — users never interact with it directly.
 - Tests: round-trip each key type, transaction atomicity, scan range.
 
-**DataLakeCatalog trait**:
-- `DataLakeCatalog` trait: `current_snapshot`, `files_at_snapshot`,
-  `files_added_between`, `check_files_live`. Types: `SnapshotId`,
-  `DataFile`.
+**Catalog resolution + resolved tables**:
+- Internal catalog-construction helpers:
+  - build one backend-specific `Catalog` from a CLI `--catalog-uri`
+  - build the server's alias -> `Catalog` map from the catalog meta file
+- `Catalog` trait: `resolve_table(object_path) -> Arc<dyn ResolvedTable>`.
+- `ResolvedTable` trait: `table_location()`, `current_snapshot`,
+  `files_at_snapshot`, `files_added_between`,
+  `check_files_live`.
 - `DuckLakeCatalog` (behind `ducklake` feature flag):
   - Opens `duckdb::Connection`, installs/loads ducklake extension,
     attaches catalog, disables inline data.
-  - Each trait method maps to one SQL query against
+  - LakeSearch assumes it is connecting to an existing DuckLake.
+    `DATA_PATH` is not part of the read/query contract here; it is
+    only required when creating a new DuckLake outside LakeSearch.
+  - `resolve_table` interprets the backend-relative path, resolves
+    DuckLake metadata for that table, and returns
+    `Arc<DuckLakeResolvedTable>`.
+  - `DuckLakeResolvedTable` implements `ResolvedTable`; its methods map
+    to SQL queries against
     `__ducklake_metadata_{catalog}.ducklake_data_file`.
-  - `table_id` resolution from table name.
   - Clear errors for invalid snapshots, missing tables.
 - `MockCatalog` for unit tests (no DuckDB dependency).
-- Tests: mock catalog exercises all four methods. DuckLake integration
-  test (`#[ignore]`).
+- Tests:
+  - table-ref parsing and error cases
+  - mock resolved-table implementation exercises the resolved-table interface
+  - catalog meta file loads alias config correctly
+  - DuckLake integration test (`#[ignore]`)
 
-**LakeSearch operations — init, add_index, drop_index**:
-- `LakeSearch::init(catalog_uri, table_name, columns)`:
-  - Parses catalog URI, constructs catalog, resolves table path.
-  - Creates SlateDB at `{table_path}/lakesearch/slatedb/`.
-  - Writes `meta|{table_id}|config`. Idempotent.
+**LakeSearch operations — add_index, drop_index**:
 - `ls.add_index(column, tokenizer)` (requires `open_mut`):
+  - If metadata does not exist yet: create SlateDB at
+    `{table.table_location()}/lakesearch/slatedb/` and write
+    `meta|config`.
   - Reads config, appends column (status=active), writes back.
   - No snapshot pointer created (backfill happens on next `index`).
 - `ls.drop_index(column)` (requires `open_mut`):
   - Single transaction: update config (status=dropped), delete all
     segment keys, corpus stats, and snapshot pointer for that column.
-- CLI wrappers: `lakesearch init`, `lakesearch add-index`,
-  `lakesearch drop-index` call through `LakeSearch` struct.
-- Tests: init → verify config, add-index → verify config, drop-index
-  → verify segments/stats/pointer deleted.
+- CLI wrappers: `lakesearch add-index` and `lakesearch drop-index`
+  call through `LakeSearch` with `--catalog-uri` + backend-relative
+  `--table`.
+- Tests: add-index on a new table → verify config created, add-index
+  on an existing table → verify column appended, drop-index → verify
+  segments/stats/pointer deleted, uninitialized `drop-index` returns
+  the "run add-index first" error.
 
-**Milestone**: `LakeSearch::init()` → `add_index()` → `drop_index()`
-works against DuckLake, backed by SlateDB. All metadata operations
-tested with mock catalog.
+**Milestone**: `add_index()` initializes metadata, `drop_index()`
+removes a column cleanly, and both work against DuckLake + SlateDB.
+All metadata operations tested with mock catalog.
 
 ### Phase 2: Query Path Improvements
 
@@ -3213,25 +3614,74 @@ phase are independent — can be done in any order or in parallel.
 - After loading candidate segments, sum `doc_frequency` across all
   segments per query term. Read global `total_rows` and `total_tokens`
   from SlateDB corpus stats.
+- For ranked queries with an unindexed tail, brute-force pass 1 also
+  accumulates per-column `delta_rows`, `delta_tokens`, and `delta_df`
+  so final BM25 uses the full queried corpus, not just the indexed
+  subset.
 - Thread `global_df` and `global_corpus_stats` through
   `SharedQueryContext` to scoring.
 - Tests: two segments with overlapping terms → verify scores use
-  summed df. Golden test with known inputs.
+  summed df. Mixed indexed/unindexed query → verify scores match the
+  same corpus after full indexing. Golden test with known inputs.
+
+**Selectivity threshold / brute-force cutoff**:
+- Implement `selectivity_threshold` estimation from per-term
+  `doc_frequency` and corpus stats before posting-list decoding.
+- If estimated selectivity exceeds the threshold, skip indexed
+  candidate generation for that scope and use brute force instead.
+- Tests: rare term stays indexed, common term flips to brute force at
+  the configured threshold, threshold `0.0` preserves the always-index
+  behavior.
+
+**Staged row-range reduction for cross-segment / cross-column queries**:
+- Reduce each `ColumnPlan` leaf to row ranges before any Parquet read.
+- Same-segment terms use the fast `doc_id` intersection/union path.
+- Split-sibling or cross-segment terms resolve to page locations first,
+  then to row ranges.
+- Suffix queries do not get segment-file pruning in the MVP: they load
+  all segments for the column, then use the reverse FST inside each
+  segment and still benefit from normal page/Parquet pruning.
+- Cross-column `AND` / `OR` combines row ranges according to the
+  enclosing `QueryExpr` tree, then the reader performs one Parquet pass
+  for the combined `RowSelection`.
+- Tests: same-segment AND, split-sibling AND, suffix query, cross-column
+  AND, and cross-column OR all return the same rows as brute force.
+
+**Stale filtering on the query path**:
+- When a column's snapshot pointer lags the current lake snapshot,
+  collect Parquet file paths from candidate segments and call
+  `ResolvedTable::check_files_live(...)` once.
+- Filter stale page hits before row-range reduction / Parquet reads.
+- Keep the fast path when `last_indexed == current_snapshot` so there
+  is no liveness call in steady state.
+- Tests: query with stale segments before compact returns the same rows
+  as after compact; stale candidates never leak into results.
 
 **Two-pass brute-force projection**:
-- Pass 1: stream only the searched column. ILIKE + tokenize. Collect
+- Pass 1: stream only the searched columns. ILIKE + tokenize. Collect
   matching row indices.
+- Ranked mixed-coverage queries (`score: true` with unindexed files)
+  use a heavier pass 1: tokenize every row once so BM25 can accumulate
+  exact `delta_rows`, `delta_tokens`, and `delta_df`.
 - Pass 2: build RowSelection from matches, read other projected
   columns for matches only.
 - I/O reduction: ~1% of reads for non-searched columns vs 100%.
 - Tests: projected columns correct for matches, absent for non-matches.
 
 **Query server on SlateDB**:
-- `LakeSearch::open()` (read-only) replaces `MetadataCache`.
+- The server loads its catalog meta file once, parses incoming
+  `table` strings into `catalog_alias + backend path`, resolves tables
+  lazily through the configured `Catalog` implementations, and caches
+  read-only `LakeSearch::open(table)` handles for hot tables.
+- REST / Flight stay strictly on the read path:
+  - accept `SearchRequest`
+  - resolve the table lazily
+  - return "run add-index first" if metadata is missing
+  - do not expose mutating operations on the server
 - Query planning reads segment entries from SlateDB via
-  `scan_segments(table, column)` instead of walking manifest lists.
-- Stale filtering: `catalog.check_files_live(candidate_paths)`.
-- Unindexed detection: `catalog.files_added_between(last_indexed,
+  `scan_segments(column)` instead of walking manifest lists.
+- Stale filtering: `ResolvedTable::check_files_live(candidate_paths)`.
+- Unindexed detection: `ResolvedTable::files_added_between(last_indexed,
   current)`.
 - Remove: `read_current`, `read_metadata`, manifest list loading.
 
@@ -3241,9 +3691,12 @@ phase are independent — can be done in any order or in parallel.
 - Snapshot `DbReader` at query start for consistent segment metadata.
 - Parquet metadata caching unchanged.
 
-**Milestone**: Query path reads from SlateDB + catalog. BM25 uses
-global df. ILIKE pre-filter on indexed path. Two-pass brute-force.
-All existing query tests pass with new backend.
+**Milestone**: Query path reads from SlateDB + catalog. Indexed
+candidate generation reduces to row ranges before any Parquet read.
+BM25 uses full-corpus stats (including ranked mixed-coverage tails).
+ILIKE pre-filter on indexed path. Two-pass brute-force. Server
+resolves tables lazily from the catalog meta file and stays strictly
+read-only. All existing query tests pass with new backend.
 
 ### Phase 3: Indexer Update
 
@@ -3251,12 +3704,13 @@ Port the indexer to v3 architecture and pipeline it.
 
 **Port to SlateDB + catalog**:
 - `ls.index(IndexRequest)` internally:
-  - Resolves target snapshot from catalog (or uses provided).
+  - Resolves target snapshot from the resolved table handle
+    (or uses provided).
   - Reads config and per-column snapshot pointers from SlateDB.
   - Groups columns by `last_indexed`, one catalog call per distinct
     value.
   - Builds segments per column (core logic unchanged).
-  - Writes segments to `{table_path}/lakesearch/segments/`.
+  - Writes segments to `{table.table_location()}/lakesearch/segments/`.
   - Single SlateDB transaction: put segment entries, update corpus
     stats, advance all column snapshot pointers. Flush.
 - Remove: CAS commit, JSON metadata/manifest writing, batch_id dedup.
@@ -3271,6 +3725,35 @@ Port the indexer to v3 architecture and pipeline it.
   - After all pages: finalize segment (FST, posting lists, doc table).
 - Overlaps I/O and CPU.
 
+**Per-page row-hit accounting**:
+- While tokenizing rows, track term presence per row and aggregate it
+  into per-page `row_hit_count` values stored alongside posting
+  `doc_id`s.
+- Preserve row-level `doc_frequency` in the term info table and
+  `token_count` in the doc table.
+- Tests: page with repeated term occurrences in one row vs many rows →
+  verify `row_hit_count`, row-level `doc_frequency`, and corpus stats
+  all match expectations.
+
+**Populate doc-table row ranges from Parquet `offset_index`**:
+- Validate that every indexed Parquet file has `offset_index`
+  available for the indexed column.
+- Populate `first_row_index` and `row_count` in the doc table directly
+  from `offset_index` at index time so query-time cross-column
+  intersection does not need extra Parquet metadata reads.
+- Reject files missing `offset_index` with a clear ingest-time error.
+- Tests: doc table row ranges match Parquet metadata exactly; missing
+  `offset_index` is rejected deterministically.
+
+**Monotonic target-snapshot semantics**:
+- `index(target_snapshot)` may backfill lagging or uninitialized
+  columns up to `target_snapshot`.
+- Columns already ahead of `target_snapshot` remain unchanged.
+- If every active column is already ahead of `target_snapshot`, fail
+  instead of rewinding any snapshot pointer.
+- Tests: mixed lagging/ahead columns backfill correctly; ahead columns
+  never move backward; pure rewind fails.
+
 **Missing column handling**:
 - Skip files missing the indexed column (log debug). Snapshot pointer
   still advances. No terms contributed.
@@ -3281,9 +3764,9 @@ Port the indexer to v3 architecture and pipeline it.
   all files. Both pointers at target.
 - Test incremental backfill: index to snapshot 5, then 10.
 
-**Milestone**: `init` → `add_index` → `index` → `query` works
-end-to-end with DuckLake + SlateDB. Indexer pipelined. Backfill
-tested.
+**Milestone**: `add_index` → `index` → `query` works end-to-end with
+DuckLake + SlateDB. Indexer pipelined. Backfill tested. Uninitialized
+tables fail cleanly until `add-index` is run.
 
 ### Phase 4: Compaction + Term-Range Splitting
 
@@ -3292,11 +3775,16 @@ This is the most complex phase.
 **Port and extend merge primitive**:
 - Merge primitive from `docs/v2-design`: merge-sort by term, union
   posting lists, concatenate doc tables, renumber doc_ids, rebuild FST.
+- Posting entries carry `row_hit_count` (`# rows in that page
+  containing the term`), so compact can recompute row-level
+  `doc_frequency` exactly after stale filtering.
 - Add `stale_paths: &HashSet<String>` parameter. Skip stale doc table
-  entries and their posting list doc_ids. Recompute doc_frequency and
-  corpus stats from survivors. Omit dead terms from output FST.
+  entries and their posting list doc_ids. Recompute `doc_frequency`
+  as `sum(row_hit_count)` over survivors, and recompute corpus stats
+  from surviving doc-table entries. Omit dead terms from output FST.
 - Tests: merge two segments, merge with stale paths, merge where all
-  entries stale, single-segment rewrite.
+  entries stale, single-segment rewrite, partial-stale segment where
+  surviving pages have mixed `row_hit_count` values.
 
 **Unified plan-then-execute compact algorithm**:
 - `ls.compact(CompactRequest)` internally:
@@ -3308,8 +3796,13 @@ This is the most complex phase.
   - Commit: single SlateDB transaction — delete stale/consumed
     segments, put new segments, update corpus stats per column.
     Flush.
+- Compact always queries the **current** lake snapshot for liveness and
+  never advances `last_indexed_snapshot`; only `index()` moves those
+  per-column pointers.
 - Tests: no-op compact, fully stale deletion, partial stale rewrite,
-  size-tiered merge, full lifecycle with data lake compaction.
+  size-tiered merge, full lifecycle with data lake compaction,
+  compact-on-stale-data without a preceding index, and snapshot
+  pointers unchanged after compact.
 
 **Term-range splitting**:
 - When merge output exceeds `target_segment_size`, split by term
@@ -3328,10 +3821,11 @@ This is the most complex phase.
   intersect tuple sets. Fast u32 path when terms are in same segment.
 - Tests: split siblings, AND across both → correct. Unsplit → same.
 
-**CLI**: `lakesearch compact --table {name}`.
+**CLI**: `lakesearch compact --catalog-uri {uri} --table {name}`.
 
 **Milestone**: Full index → compact → query lifecycle. Stale cleanup.
-Term-range splitting. Cross-segment AND.
+Term-range splitting. Cross-segment AND. Exact `doc_frequency`
+recomputation after stale filtering.
 
 ### Phase 5: Vacuum
 
@@ -3339,12 +3833,14 @@ Term-range splitting. Cross-segment AND.
 - `ls.vacuum(VacuumRequest)` — read-only, uses `open` (not
   `open_mut`). LIST segments in object storage, diff against SlateDB,
   delete orphans older than grace period.
+- Vacuum only manages LakeSearch segment files. SlateDB's own GC
+  remains internal to SlateDB and is not touched here.
 - UUIDv7 segment IDs prevent collision with successor writers.
-- CLI: `lakesearch vacuum --table {name} [--grace-period 1h]`.
+- CLI: `lakesearch vacuum --catalog-uri {uri} --table {name} [--grace-period 1h]`.
 - Tests: orphan files deleted, live files preserved, grace period
-  respected.
+  respected, SlateDB-managed files never targeted.
 
-**Milestone**: Full lifecycle works — init, add-index, index, compact,
+**Milestone**: Full lifecycle works — add-index, index, compact,
 vacuum, query. All operations tested end-to-end.
 
 ### Phase 6: Benchmarks
@@ -3354,13 +3850,15 @@ vacuum, query. All operations tested end-to-end.
 - `benches/boolean.rs`: intersect/union/difference at various sizes.
 - `benches/tokenizer.rs`: throughput MB/sec.
 - `benches/segment.rs`: build time, cold read.
-- `benches/e2e.rs`: rare term, common term, multi-term AND, index
-  throughput.
+- `benches/e2e.rs`: rare term, common term, multi-term AND, prefix,
+  suffix, split-sibling cross-segment AND, ranked mixed-coverage
+  query, and index throughput.
 - All use in-memory object store.
 
 **Benchmark harness** (Python):
 - Indexed vs brute-force via Arrow Flight.
-- Test matrix: data sizes, selectivities, query types.
+- Test matrix: data sizes, selectivities, query types, fully indexed vs
+  partially indexed tails, and `selectivity_threshold` cutovers.
 - Regression gate: >10% investigated.
 
 **Milestone**: Performance validated. Benchmark suite in CI.
@@ -3373,6 +3871,9 @@ support for production data lake formats beyond DuckLake.
 **Iceberg catalog** (behind `iceberg` feature):
 - `IcebergCatalog` using `iceberg-rust` crate. Reads table metadata
   from REST catalog or object storage.
+- Backend-owned path parsing:
+  - last segment = table name
+  - preceding segments = namespace path
 - Manifest caching: LRU by path (immutable files), cache current
   manifest list (re-read on snapshot advance), incremental updates
   (diff old/new manifest list, read only new manifests).
@@ -3383,13 +3884,15 @@ support for production data lake formats beyond DuckLake.
 **Delta Lake catalog** (behind `delta` feature):
 - `DeltaCatalog` using `deltalake` crate. Reads `_delta_log/` commit
   entries. Checkpoint-based state reconstruction.
+- Backend-owned path parsing follows Delta's table naming rules for the
+  configured catalog / root.
 - Integration tests with `#[ignore]`.
 
 **DataFusion integration**:
 - Implement a DataFusion `TableProvider` that wraps `LakeSearch::query`
   as a scan node. A SQL query like
-  `SELECT * FROM lakesearch('events', 'description', 'error timeout')`
-  pushes the full-text predicate into LakeSearch and returns an Arrow
+  `SELECT * FROM lakesearch_query('prod.events', '{"search":{"column":"description","match":"error timeout"}}')`
+  pushes the canonical query shape into LakeSearch and returns an Arrow
   `RecordBatchStream` that DataFusion consumes natively.
 - Integrate into DataFusion query plans: LakeSearch handles text
   search pruning, DataFusion handles the rest (joins, aggregations,
@@ -3410,6 +3913,30 @@ support for production data lake formats beyond DuckLake.
 Delta catalog as alternative. DataFusion integration for in-process
 text search + SQL. DuckLake remains the local dev default.
 
+### Phase 8: Deferred Query Language Extensions
+
+These are intentionally **not** part of the MVP. They are listed here so
+the roadmap is exhaustive, but the earlier phases are fully
+implementable without them.
+
+**Negation / richer wildcard support**:
+- Add `not` back into the public query grammar and private `QueryExpr`
+  only after the planner/runtime contract is fully designed.
+- Add richer wildcard forms only after the MVP prefix/suffix model is
+  stable:
+  - middle wildcard / contains matching
+  - multi-`*` globs
+  - literal escaping
+  - regex queries
+- Define explicit planner behavior for these features rather than
+  silently degrading to surprising parses.
+- Tests: correctness against brute force, clear validation errors for
+  malformed syntax, and benchmark gates for pathological expansions.
+
+**Milestone**: Extended query language beyond the MVP, implemented only
+after the prefix/suffix-only grammar and positive boolean model have
+been proven in production.
+
 ---
 
 ## 21. Design Decisions Summary
@@ -3417,22 +3944,69 @@ text search + SQL. DuckLake remains the local dev default.
 All design questions raised during the review process have been
 resolved and inlined into their respective sections:
 
+- **Table resolution model**: server/REST/Flight use
+  `catalog_alias + backend path`; the backend owns the remaining path
+  segments (§ 2, architecture; § 10, catalog resolution)
+- **Catalog abstraction**: `Catalog::resolve_table(...)` returns a
+  table-bound `ResolvedTable` trait object; there is no separate
+  backend enum wrapper or registry trait
+  (§ 10, catalog resolution and table metadata)
+- **Resolved-table seam**: `open` / `open_mut` take
+  `Arc<dyn ResolvedTable>` directly; backend-specific catalogs stay
+  behind that trait boundary (§ 2, architecture; § 10, catalog resolution)
+- **CLI contract**: all operations are stateless via `--catalog-uri`
+  + backend-relative `--table`; `query` accepts only `--json` /
+  `--json-file` for the nested query body (§ 2, CLI; § 8, query model)
+- **Request model**: `QueryBody` is the canonical nested query body;
+  REST/Flight wrap it in `SearchRequest { table, .. }`, while the CLI
+  supplies table identity out of band (§ 8, query model; § 9, Flight)
+- **Initialization model**: there is no public `init`; `add-index`
+  creates metadata and all other verbs fail with "run add-index first"
+  until initialization exists (§ 2, CLI; § 12, API specs; § 13, column lifecycle)
+- **Cross-column query surface**: no public `multi_match`; one-column
+  `match` + explicit boolean composition is the only external query
+  model (§ 8, query model)
+- **Canonical query grammar**: public JSON uses `match`, recursive
+  `and` / `or`; the private plan is the same recursive positive-only
+  `QueryExpr` tree. Negation (`not`) is future work, not MVP
+  (§ 8, query model)
+- **Default tokenizer name**: `whitespace_lowercase`
+  (§ 4, tokenization; § 13, column lifecycle)
 - **Key separator**: `\x00` (§ 11, key layout)
+- **SlateDB keying**: keys are table-local because each resolved table
+  has its own SlateDB instance; there is no public `table_id`
+  (§ 2, storage layout; § 10, resolved tables; § 11, key layout)
+- **Index target semantics**: per-column snapshot pointers are
+  monotonic; explicit older targets backfill only lagging columns and
+  never rewind ahead columns; a pure rewind fails (§ 12a, index API)
 - **Stale filtering in merge**: `stale_paths` parameter on the merge
   primitive (§ 12b, compact API)
-- **Corpus stats accuracy**: `token_count` added to doc table entries,
-  24 bytes per entry (§ 3, segment file format)
+- **Corpus stats accuracy**: `token_count` lives in the doc table and
+  `row_hit_count` lives in posting entries, enabling exact
+  `total_tokens` and row-level `doc_frequency` recomputation during
+  stale filtering (§ 3, segment file format; § 12b, compact API)
+- **Mixed indexed + brute-force BM25**: ranked queries score over the
+  full queried corpus by adding `delta_rows`, `delta_tokens`, and
+  `delta_df` from the unindexed tail before final scoring
+  (§ 5, BM25 scoring; § 8, query model; § 12c, query path)
 - **Segment ID generation**: UUIDv7, time-sortable (§ 2, storage layout)
 - **SlateDB per-table**: One instance per table (§ 2, storage layout)
 - **Compact does not advance snapshot pointer**: Only index advances it
   (§ 12b, compact API)
+- **Query stats schema**: `segments_touched`, `candidate_pages`,
+  `rows_scanned`, `rows_matched`, `unindexed_files_scanned`,
+  `elapsed_ms` (§ 8, query model)
 - **Stale index queries**: Always return correct results, report
   `unindexed_files_scanned` in QueryStats (§ 12c, query path)
+- **Cross-segment / cross-column execution**: reduce each clause to row
+  ranges first, combine row ranges according to the `QueryExpr` tree,
+  then fetch Parquet once for the combined `RowSelection`
+  (§ 8, query model; § 12c, query path)
 - **Query-time catalog latency**: Iceberg implementations should cache
   manifests; keeping index up to date eliminates catalog calls on the
   fast path (§ 10, Iceberg manifest caching)
 - **`files_at_snapshot` memory at scale**: Query uses
   `check_files_live` with small input set; compact accepts full
   materialization as a batch cost. Users should run data lake
-  compaction regularly for high-write tables (§ 10, catalog trait;
+  compaction regularly for high-write tables (§ 10, catalog resolution;
   § 12c, query path)

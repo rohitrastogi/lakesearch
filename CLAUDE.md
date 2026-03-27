@@ -3,9 +3,11 @@
 ## Project
 
 LakeSearch: external full-text search indices for Parquet files in data lakes.
-Single `lakesearch` library crate with two thin binary wrappers:
-`lakesearch-server` (query service) and `lakesearch-cli`.
-See `DESIGN_CONSOLIDATED.md` for architecture, APIs, and implementation phases.
+Current repo shape: a multi-crate workspace with `lakesearch-core`,
+`lakesearch-indexer`, `lakesearch-query`, and `lakesearch-cli`.
+Target architecture in `DESIGN.md` consolidates toward a single
+library crate with thin CLI/server wrappers.
+See `DESIGN.md` for architecture, APIs, and implementation phases.
 
 ## Readability
 
@@ -45,10 +47,12 @@ See `DESIGN_CONSOLIDATED.md` for architecture, APIs, and implementation phases.
   Apply this principle broadly: if a parameter has two meaningful states, use
   `bool`, not an enum with two variants.
 
-See `DESIGN_CONSOLIDATED.md` for full architecture. Key code-level rules:
+See `DESIGN.md` for full architecture. Key code-level rules:
 
-- The library has two internal layers: **core** (sync, pure, no I/O) and
-  **operations** (async, I/O, SlateDB, catalog). Both in the same crate.
+- Preserve the same separation the target architecture uses:
+  **core** (sync, pure, no I/O) and **operations** (async, I/O,
+  SlateDB, catalog). Today that boundary spans multiple crates; after
+  consolidation it becomes two layers inside one library crate.
 - Make impossible states impossible to represent. Prefer enums with data over
   structs with related optional fields.
 - Use `serde` with strong types at external boundaries (REST requests, Flight
