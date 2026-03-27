@@ -143,13 +143,13 @@ uses `open_mut` for index/compact and `open` for query/vacuum.
 Thin wrapper around the library:
 
 ```
-lakesearch init         --table events --column message --catalog ducklake:./events.ducklake
+lakesearch init         --table events --column description --catalog ducklake:./events.ducklake
 lakesearch add-index   --table events --column description [--tokenizer default]
 lakesearch drop-index  --table events --column description
 lakesearch index        --table events [--snapshot 5]
 lakesearch compact      --table events
 lakesearch vacuum       --table events [--grace-period 1h]
-lakesearch query        --table events --column message --query "error timeout" [--limit 100]
+lakesearch query        --table events --column description --query "error timeout" [--limit 100]
 ```
 
 `init` connects to the catalog, verifies the table exists, resolves
@@ -504,10 +504,11 @@ everything needed for query planning without knowing section sizes in advance.
 |                                                          |
 +----------------------------------------------------------+
 |                                                          |
-|  Footer (fixed size: 56 bytes)                           |
+|  Footer (fixed size: 64 bytes)                           |
 |  +----------------------------------------------------+  |
 |  | File table section offset: u64                     |  |
 |  | Doc table section offset: u64                      |  |
+|  | Term info table section offset: u64                |  |
 |  | Forward FST section offset: u64                    |  |
 |  | Reverse FST section offset: u64                    |  |
 |  | Posting lists section offset: u64                  |  |
@@ -521,7 +522,7 @@ everything needed for query planning without knowing section sizes in advance.
 
 ### Reading a Segment
 
-1. Read the last 56 bytes (footer) to get section offsets
+1. Read the last 64 bytes (footer) to get section offsets
 2. Load the doc table into memory (small — 24 bytes x num_pages)
 3. Load the forward FST (and optionally the reverse FST) into memory
 4. For a query term, look up the forward FST to get `term_ordinal`.
@@ -889,7 +890,7 @@ let req = QueryRequest::multi_match("connection refused", &["description", "erro
     .limit(50);
 
 // Cross-column predicates: different text per column
-let req = QueryRequest::multi_column(CombineOp::And)
+let req = QueryRequest::multi_column(BoolOp::And)
     .column("description", "error")
     .column("status_code", "500")
     .limit(10);
@@ -931,27 +932,36 @@ text or user-facing types.
 
 ```rust
 // Private — produced by builders, consumed by planner/evaluator.
+
+enum BoolOp { And, Or }   // used for both within-column and cross-column
+
 struct QueryPlan {
     searches: Vec<ColumnPlan>,
-    combine: CombineOp,         // And | Or (irrelevant for single column)
+    combine: BoolOp,                 // cross-column And | Or (irrelevant for single column)
     select: Vec<String>,
     limit: Option<usize>,
     score: bool,
+    selectivity_threshold: f64,      // default 0.0 (always use index)
 }
 
 struct ColumnPlan {
     column: String,
-    terms: Vec<QueryTerm>,      // from parse_query()
-    operator: BoolOp,           // how to combine terms within this column
+    terms: Vec<QueryTerm>,           // from parse_query()
+    operator: BoolOp,                // within-column And | Or
 }
 
-// From lakesearch-core/src/tokenizer.rs
+// From tokenizer module (currently lakesearch-core/src/tokenizer.rs;
+// moves during crate consolidation in Phase 0)
 enum QueryTerm {
     Exact(String),              // FST exact lookup
     Prefix(String),             // FST prefix iteration → union posting lists
     Suffix(String),             // reverse FST prefix iteration → union
 }
 ```
+
+NOT is not expressible through the builder API. For queries requiring
+NOT clauses, use the cross-column JSON syntax in REST/Flight. NOT
+support in builders may be added later if demand warrants it.
 
 `QueryTerm` is the atomic unit the evaluator dispatches on:
 - `Exact` → single FST lookup → one posting list
@@ -1327,6 +1337,7 @@ the REST `SearchRequest` in `api_types.rs`. Normative field names:
 | `select` | string[] | no | all columns |
 | `limit` | integer | no | unlimited |
 | `score` | boolean | no | false |
+| `selectivity_threshold` | float | no | 0.0 |
 
 Example:
 ```
@@ -1805,37 +1816,6 @@ From LakeSearch's perspective:
 
 This is exactly the append-and-compact pattern we designed for.
 
-### DuckDB-RS Usage
-
-The `duckdb` Rust crate with `bundled` feature compiles DuckDB from
-source. Extensions are loaded at runtime:
-
-```rust
-use duckdb::{params, Connection};
-
-let conn = Connection::open_in_memory()?;
-conn.execute_batch("INSTALL ducklake; LOAD ducklake;")?;
-conn.execute_batch(
-    "ATTACH 'ducklake:./catalog.ducklake' AS lake (DATA_PATH './data/');"
-)?;
-
-// Query metadata
-let mut stmt = conn.prepare(
-    "SELECT path, file_size_bytes, record_count
-     FROM __ducklake_metadata_lake.ducklake_data_file
-     WHERE table_id = ? AND begin_snapshot > ? AND begin_snapshot <= ?"
-)?;
-let files: Vec<DataFile> = stmt.query_map(params![table_id, from, to], |row| {
-    Ok(DataFile {
-        path: row.get(0)?,
-        size_bytes: row.get(1)?,
-        row_count: row.get(2)?,
-    })
-})?.collect::<Result<_, _>>()?;
-```
-
-All we do is submit SQL queries. No special Rust API needed for DuckLake.
-
 ---
 
 ## 11. SlateDB Metadata Store
@@ -2054,7 +2034,6 @@ all columns in lockstep. When a new column is added, it starts with
 
 ```rust
 pub struct IndexRequest {
-    pub table_id: String,
     /// Snapshot to index up to. If None, uses current snapshot.
     pub target_snapshot: Option<SnapshotId>,
     /// Split segments exceeding this size. Default 256MB.
@@ -2180,7 +2159,6 @@ of segments that need stale-file filtering at query time.
 
 ```rust
 pub struct CompactRequest {
-    pub table_id: String,
     /// Split segments exceeding this size. Default 256MB.
     pub target_segment_size: Option<u64>,
 }
@@ -2460,7 +2438,6 @@ accumulate from failed index/compact operations or replaced segments.
 
 ```rust
 pub struct VacuumRequest {
-    pub table_id: String,
     /// Only delete files older than this duration. Default: 1 hour.
     pub grace_period: Option<Duration>,
 }
@@ -2766,7 +2743,7 @@ Two binaries, one library. The library is the product.
 | `arrow-flight` | Arrow Flight gRPC server for streaming query results |
 | `object_store` | Abstraction over S3/GCS/Azure/local filesystem |
 | `slatedb` | Embedded LSM key-value store on object storage for metadata |
-| `duckdb` | DuckLake catalog implementation (behind `catalog` feature) |
+| `duckdb` | DuckLake catalog implementation (behind `ducklake` feature) |
 | `axum` | HTTP server for REST search API |
 | `tonic` | gRPC framework for Arrow Flight server |
 | `serde` / `serde_json` | Metadata serialization |
@@ -2872,7 +2849,7 @@ bench("multi_term_and", indexed_multi, bruteforce_multi)
 # -- Benchmark 4: Prefix search --
 def indexed_prefix():
     reader = client.do_get(flight.Ticket(
-        b'{"table":"events","search":{"column":"description","query":{"prefix":"conn"}}}'
+        b'{"table":"events","search":{"column":"description","match":"conn*"}}'
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
@@ -3001,17 +2978,17 @@ User inserts 100K rows across 100 Parquet files. DuckLake snapshot = 1.
 index(table_id="events", target_snapshot=Some(1))
 
 1. target = snapshot 1
-2. Config: one column "message"
+2. Config: one column "description"
 3. message: no snapshot pointer -> last_indexed = None
 4. catalog.files_at_snapshot(1) -> 100 files
-5. Build segments for "message" column
+5. Build segments for "description" column
    -> 10 segments of ~5MB each
-6. Write to s3://lake/events/lakesearch/segments/message/*.seg
+6. Write to s3://lake/events/lakesearch/segments/description/*.seg
 7. SlateDB txn:
-   - PUT seg|events|message|{max_term_1}|{seg_1} -> ...
+   - PUT seg|events|description|{max_term_1}|{seg_1} -> ...
    - ... (10 entries)
-   - PUT meta|events|corpus|message -> { total_rows: 100000, ... }
-   - PUT meta|events|snapshot|message -> { last_indexed: 1 }
+   - PUT meta|events|corpus|description -> { total_rows: 100000, ... }
+   - PUT meta|events|snapshot|description -> { last_indexed: 1 }
    - COMMIT + flush
 ```
 
@@ -3027,9 +3004,9 @@ index(table_id="events")    // no snapshot -> uses current = 2
 3. catalog.files_added_between(1, 2) -> 5 new files
 4. Build 1 small segment (~500KB)
 5. SlateDB txn:
-   - PUT seg|events|message|{max_term}|{seg_11} -> ...
+   - PUT seg|events|description|{max_term}|{seg_11} -> ...
    - UPDATE corpus stats
-   - PUT meta|events|snapshot|message -> { last_indexed: 2 }
+   - PUT meta|events|snapshot|description -> { last_indexed: 2 }
    - COMMIT + flush
 ```
 
@@ -3085,7 +3062,7 @@ index(table_id="events")
 6. SlateDB txn:
    - PUT seg|events|description|{max_term}|{seg} -> ... (new segments)
    - PUT meta|events|corpus|description -> { total_rows: ..., ... }
-   - PUT meta|events|snapshot|message -> { last_indexed: 3 }  // unchanged
+   - PUT meta|events|snapshot|description -> { last_indexed: 3 }  // unchanged
    - PUT meta|events|snapshot|description -> { last_indexed: 3 }
    - COMMIT + flush
 
@@ -3338,10 +3315,12 @@ This is the most complex phase.
 - When merge output exceeds `target_segment_size`, split by term
   range. Track output size during sorted iteration, finalize and
   start new segment at threshold.
-- All siblings share the same doc table (no doc_id renumbering).
+- Each sibling is a fully independent segment with its own doc table
+  and dense doc_ids. No shared doc table. Cross-sibling AND uses
+  page-location intersection (§ 7).
 - Store `min_term`/`max_term` per sibling in SlateDB segment entry.
 - Tests: merge within target → one output. Merge exceeding target →
-  split outputs with disjoint term ranges. Doc_id consistency.
+  split outputs with disjoint term ranges.
 
 **Page-location intersection for cross-segment AND**:
 - When AND query terms span different segments, resolve doc_ids to
