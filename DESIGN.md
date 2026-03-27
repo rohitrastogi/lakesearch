@@ -762,6 +762,16 @@ Splitting happens during both indexing (when a new segment exceeds
 the target). Each split produces N sibling segments with disjoint term
 ranges covering the same set of Parquet files.
 
+### Split Policy
+
+`target_segment_size` defaults to 256MB (total segment file bytes).
+Configurable on `CompactRequest` and `IndexRequest`. During the merge
+or index build, track output size. When crossing the threshold,
+finalize the current segment (its own doc table, FST, dense doc_ids),
+start a new one. Each sibling is a fully independent segment — no
+shared doc table, no doc_id compatibility constraints. Cross-sibling
+AND uses page-location intersection (see below).
+
 ### The Cross-Segment AND Problem
 
 Each segment has its own doc_id space — doc_id 7 in seg_A is unrelated
@@ -927,7 +937,6 @@ struct ColumnPlan {
     column: String,
     terms: Vec<QueryTerm>,      // from parse_query()
     operator: BoolOp,           // how to combine terms within this column
-    weight: f64,                // for cross-column score combination
 }
 
 // From lakesearch-core/src/tokenizer.rs
@@ -944,11 +953,17 @@ enum QueryTerm {
   (bounded by `MAX_WILDCARD_EXPANSION`)
 - `Suffix` → reverse FST prefix iterator → union of posting lists
 
+If a wildcard expands to more than `MAX_WILDCARD_EXPANSION` (1024)
+terms, return an error: "prefix '{prefix}*' expands to N terms,
+exceeding limit of 1024." No silent truncation, no brute-force
+fallback. The user narrows their query.
+
 `ColumnPlan.operator` determines how term-level posting lists are
 combined (AND intersection / OR union). `QueryPlan.combine` determines
 how column-level results are joined (AND: row must match all columns,
-OR: row matches any column). Scoring is always weighted sum across
-matching columns.
+OR: row matches any column). Both AND and OR sum per-column BM25
+scores. OR rows matching more columns rank higher. Ties broken by
+`(file_path, row_index)` for deterministic ordering.
 
 ### Query Language
 
@@ -1363,6 +1378,15 @@ If the client wants incremental results with scores (e.g., for a live UI),
 it can request `score: true` without `limit`. The server streams scored rows
 as they are produced, in arbitrary order. The client is responsible for
 sorting/truncating.
+
+#### Query Cancellation
+
+When the client drops the Flight stream or REST connection, bounded
+channel drops propagate backward through the pipeline — I/O producers
+stop reading Parquet pages, in-flight rayon tasks complete but results
+are dropped on send to a closed channel. No explicit cancellation
+token needed. Query timeouts are deferred to the production polish
+phase.
 
 Queries that must materialize on the DuckDB side (regardless of LakeSearch
 streaming):
@@ -1885,6 +1909,41 @@ After committing index/compact metadata, call `db.flush().await` to
 ensure durability before returning success. Without flush, a crash could
 lose the update (segment files would be orphaned, cleaned by vacuum).
 
+### Publish Contract
+
+Segment files are written to object storage BEFORE the SlateDB
+transaction commits. If the transaction fails, segment files become
+orphans (cleaned by vacuum). If segment upload fails, the transaction
+never starts. There is no window where metadata references a
+non-existent segment file.
+
+A `DbReader` sees a consistent SlateDB snapshot — either fully before
+or fully after a transaction. All segment entries from one
+index/compact commit appear atomically. A reader that started before
+a commit continues seeing the old segment set for its entire query.
+
+After compact commits, old segment keys are deleted from SlateDB but
+old segment files remain on object storage until vacuum runs. Readers
+that loaded old entries before the commit can still read the old files.
+
+**Invariant: segment files always outlive their metadata entries.**
+
+### Segment Lifecycle
+
+```
+Written:          File on object storage, no SlateDB entry yet.
+                  (In-flight index/compact, pre-commit.)
+Live:             File on storage AND SlateDB entry references it.
+                  (Queries use this segment.)
+Replaced:         SlateDB entry deleted (by compact), file still exists.
+                  (Old readers may still be mid-query on it.)
+Vacuum-eligible:  Replaced AND file age > grace_period.
+Deleted:          File removed by vacuum.
+```
+
+Grace period (default 1h) must exceed the maximum expected query
+execution time.
+
 ### Writer Fencing
 
 SlateDB enforces single-writer via epoch-based fencing. If two processes
@@ -1965,6 +2024,8 @@ pub struct IndexRequest {
     pub table_id: String,
     /// Snapshot to index up to. If None, uses current snapshot.
     pub target_snapshot: Option<SnapshotId>,
+    /// Split segments exceeding this size. Default 256MB.
+    pub target_segment_size: Option<u64>,
 }
 
 pub struct IndexResult {
@@ -2087,6 +2148,8 @@ of segments that need stale-file filtering at query time.
 ```rust
 pub struct CompactRequest {
     pub table_id: String,
+    /// Split segments exceeding this size. Default 256MB.
+    pub target_segment_size: Option<u64>,
 }
 
 pub struct CompactResult {
@@ -2486,10 +2549,21 @@ Mitigate by ensuring vacuum's grace period is much longer than max query executi
 
 ### Cache Implementation
 
-Use an LRU cache with a configurable memory budget (e.g. 256MB default). Priority:
-1. FSTs (highest hit rate)
-2. Doc tables (needed for every query, enable cross-column intersection)
-3. Posting list blocks (largest, lowest priority)
+Use `moka` LRU cache with a configurable memory budget (default 256MB).
+Priority: FSTs (highest hit rate), doc tables (needed for every query),
+posting list blocks (largest, lowest priority).
+
+### Cache Correctness
+
+Cache correctness depends ONLY on the SlateDB snapshot taken at query
+start, never on cache freshness:
+- Segment files are immutable, addressed by unique paths (UUIDv7).
+  Cache key = path. No ETag/version needed.
+- Parquet metadata is immutable per file. Same logic.
+- SlateDB `DbReader` snapshot determines which segments are consulted.
+  Cache only affects whether bytes come from memory or object storage.
+- Invalidation is purely LRU eviction by memory pressure. No TTL
+  needed for immutable content keyed by unique paths.
 
 ---
 
