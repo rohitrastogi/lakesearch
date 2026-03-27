@@ -122,6 +122,19 @@ same but opens SlateDB in writer mode (`Db`), which fences out any
 other writer on the same table. Calling `index()` or `compact()` on
 a read-only handle returns a clear error.
 
+Internally, `LakeSearch` holds an enum over the two handle types:
+
+```rust
+enum MetadataHandle {
+    Reader(slatedb::DbReader),
+    Writer(slatedb::Db),
+}
+```
+
+`index()` and `compact()` match on `Writer` and return an error for
+`Reader`. `query()` and `vacuum()` work with either — `Db` supports
+reads too.
+
 The query server uses `open` (read-only, multiple instances). The CLI
 uses `open_mut` for index/compact and `open` for query/vacuum.
 
@@ -152,7 +165,21 @@ is a no-op.
 
 ### Server (Optional)
 
-The query service is the only server component. A long-running server caches:
+The query service is the only server component. Its config is a list
+of table paths — everything else (columns, catalog URI, segment
+metadata) is already in each table's SlateDB:
+
+```yaml
+tables:
+  - s3://bucket/warehouse/events/
+  - s3://bucket/warehouse/logs/
+```
+
+On startup, the server opens `LakeSearch::open()` (read-only) for each
+table path and serves queries against them. No column config, no
+catalog URIs in the server config — those are in SlateDB.
+
+A long-running server caches:
 - SlateDB reads (segment index entries) — avoids repeated object store reads.
 - Loaded segment files — the main I/O cost. LRU cache by segment path.
 - Data lake catalog connections — avoid re-attaching DuckLake on every call.
