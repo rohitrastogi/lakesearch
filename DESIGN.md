@@ -673,7 +673,7 @@ contains `doc_frequency` for each term. Global corpus stats (`N`,
 **Aggregation**:
 ```
 global_N = corpus_stats.total_rows           (from SlateDB)
-global_avg_dl = corpus_stats.total_tokens / global_N  (from SlateDB)
+global_avg_dl = if global_N > 0 { corpus_stats.total_tokens / global_N } else { 0.0 }
 For each query term t:
   global_df[t] = sum(segment.term_info(t).doc_frequency
                      for segment in loaded_segments
@@ -681,6 +681,12 @@ For each query term t:
 ```
 
 This is just an addition across values already in memory. No extra I/O.
+
+**Zero edge case**: If `global_N == 0` (all segments for a column were
+stale-deleted by compact, or column was just added and never indexed),
+`avg_dl` is 0 and BM25 scores are 0. The query returns no indexed
+results — only brute-force results if unindexed files exist. No
+divide-by-zero.
 
 **Correctness**: Summing df(t) across segments is safe because no
 Parquet file appears in two live segments simultaneously. Each index
@@ -1302,6 +1308,33 @@ to our query pipeline:
   streams RecordBatches as they are produced — each Parquet page that is
   fetched and verified yields a batch immediately, without waiting for the
   full result set.
+
+#### Flight Ticket Schema
+
+The ticket is the search request as UTF-8 JSON bytes. Same fields as
+the REST `SearchRequest` in `api_types.rs`. Normative field names:
+
+| Field | Type | Required | Default |
+|-------|------|----------|---------|
+| `table` | string | yes | — |
+| `search` | object | yes | — |
+| `search.column` | string | yes (match) | — |
+| `search.match` | string | yes (match) | — |
+| `search.operator` | string | no | `"or"` |
+| `search.and` / `search.or` | object[] | yes (cross-column) | — |
+| `search.multi_match` | string | yes (multi-match) | — |
+| `search.columns` | string[] | yes (multi-match) | — |
+| `select` | string[] | no | all columns |
+| `limit` | integer | no | unlimited |
+| `score` | boolean | no | false |
+
+Example:
+```
+b'{"table":"events","search":{"column":"description","match":"error timeout","operator":"and"},"select":["timestamp","service"],"limit":10,"score":true}'
+```
+
+Agents implementing Flight client/server MUST use these exact field
+names. The REST handler and Flight handler parse the same JSON shape.
 
 #### DuckDB Integration via RecordBatchReader
 
@@ -2922,7 +2955,34 @@ object store.
 
 ---
 
-## 18. Worked Example
+## 18. Canonical Test Table
+
+All tests, examples, and worked scenarios use this table schema. Agents
+writing tests MUST use this schema so integration tests compose.
+
+**Table name**: `events`
+
+**Parquet schema**:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `timestamp` | `Timestamp(Microsecond, UTC)` | Event time |
+| `service` | `Utf8` | Service name (e.g., "api", "worker", "db") |
+| `description` | `Utf8` | Free-text log message (primary indexed column) |
+| `error_message` | `Utf8` | Error details (secondary indexed column) |
+| `status_code` | `Int32` | HTTP status code |
+| `response_time_ms` | `Float64` | Request latency |
+
+**Indexed columns**: `description` (always), `error_message` (for
+multi-column tests).
+
+**Test data generator** (`write_test_parquet`): cycles through provided
+description strings, generates synthetic values for other columns.
+Page indices (`offset_index`) are always written.
+
+---
+
+## 19. Worked Example
 
 ### Setup
 
@@ -3042,7 +3102,7 @@ If a user queries `description` before the backfill index runs:
 
 ---
 
-## 19. Implementation Phases
+## 20. Implementation Phases
 
 Each phase builds on the previous and produces testable, working
 functionality. Build on `main` (clean base), cherry-pick the segment
@@ -3373,7 +3433,7 @@ text search + SQL. DuckLake remains the local dev default.
 
 ---
 
-## 20. Design Decisions Summary
+## 21. Design Decisions Summary
 
 All design questions raised during the review process have been
 resolved and inlined into their respective sections:
