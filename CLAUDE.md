@@ -2,9 +2,10 @@
 
 ## Project
 
-LakeSearch: external full-text search indices for Parquet files in object storage.
-Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
-`lakesearch-compactor`, `lakesearch-query`. See `DESIGN.md` for architecture.
+LakeSearch: external full-text search indices for Parquet files in data lakes.
+Single `lakesearch` library crate with two thin binary wrappers:
+`lakesearch-server` (query service) and `lakesearch-cli`.
+See `DESIGN_CONSOLIDATED.md` for architecture, APIs, and implementation phases.
 
 ## Readability
 
@@ -23,30 +24,46 @@ Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
 - Use `tracing` for logging, not `println!` or `eprintln!` in application code.
   Use structured fields: `tracing::info!(segment_id = %id, term_count, "indexed segment")`.
 
-## Design
+## Design Preferences
 
-- `lakesearch-core` is sync and pure by default. The optional `io` feature
-  gate adds shared async I/O utilities (storage, CAS, parquet helpers) that
-  both `lakesearch-indexer` and `lakesearch-query` depend on. Without `io`,
-  core has no I/O, no `anyhow`, and no async code.
-- No service crate depends on another service crate. They only share core.
-- Before exposing a public API from core, review: are internal details leaked?
-  Would a caller find the API obvious without reading the implementation?
+- **Don't expose implementation trees to users.** If there's a clean builder
+  or struct API, use it. Internal ASTs, enum hierarchies, and plumbing types
+  should be private. Users call `match_text()`, not
+  `SearchExpr::Single(ColumnSearch { query: QueryNode::Match { ... } })`.
+- **One path, not two.** Avoid "simple mode" and "advanced mode" code paths
+  for the same operation. One canonical representation, one code path that
+  handles all cases. Degenerate cases (single-column query, single-segment
+  merge) should fall out naturally, not be special-cased.
+- **All-or-nothing operations.** Index, compact, and other mutating operations
+  are atomic. If one file in a batch fails, the whole batch fails. No partial
+  commits, no per-item error recovery. Retry the batch.
+- **Decisions, not options.** Pick one approach (UUIDv7, bincode, moka) and
+  use it everywhere. Don't add configuration knobs for things that have a
+  clear best answer. If a choice genuinely needs to vary, make it a trait
+  or feature flag — not a runtime parameter.
+- **Score is a boolean.** Don't add multi-mode enums when true/false suffices.
+  Apply this principle broadly: if a parameter has two meaningful states, use
+  `bool`, not an enum with two variants.
+
+See `DESIGN_CONSOLIDATED.md` for full architecture. Key code-level rules:
+
+- The library has two internal layers: **core** (sync, pure, no I/O) and
+  **operations** (async, I/O, SlateDB, catalog). Both in the same crate.
 - Make impossible states impossible to represent. Prefer enums with data over
-  structs with related optional fields. If a value can be in one of N states,
-  use an enum with N variants, not a struct with N optional fields.
-- Use `serde` with strong types at external boundaries (JSON metadata, REST
-  requests, Flight tickets). Validate and parse into domain types early.
+  structs with related optional fields.
+- Use `serde` with strong types at external boundaries (REST requests, Flight
+  tickets). Validate and parse into domain types early.
   Internally, pass typed structs, not raw JSON or `serde_json::Value`.
-- Use `thiserror` for error types in core (structured, matchable errors).
-  Use `anyhow` in service crate binaries and in core's `io` modules for
-  top-level error handling. Core's default (non-`io`) modules must not
-  depend on anyhow.
+- Use `thiserror` for error types in the core layer (structured, matchable).
+  Use `anyhow` in the operations layer and binaries for top-level error
+  handling. Core layer modules must not depend on anyhow.
 - Prefer pure functions where practical. Keep mutation localized to builders
   (`SegmentBuilder`, `PostingListBuilder`) and clearly stateful structs.
 - Use `#[must_use]` on functions whose return value should not be ignored.
 - Avoid `clone()` unless necessary. Prefer borrowing. When cloning is needed
   for async boundaries or thread transfer, document why.
+- SlateDB values are bincode-encoded. Keys use `\x00` separators.
+- Segment IDs are UUIDv7. Cache with `moka`.
 
 ## Error Handling
 
@@ -58,7 +75,8 @@ Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
 - Propagate errors with `?`. Add context at boundaries using `.context()`
   (anyhow) or by mapping to a domain error type.
 - Catch errors at external boundaries: object storage calls, Parquet reads,
-  network I/O. Let internal invariant violations fail loudly.
+  SlateDB operations, catalog calls. Let internal invariant violations fail
+  loudly.
 
 ## Async and Concurrency
 
@@ -69,22 +87,35 @@ Rust workspace with four crates: `lakesearch-core`, `lakesearch-indexer`,
 - For concurrent I/O (e.g., loading multiple segments), use `FuturesUnordered`
   or `tokio::task::JoinSet`. Bound concurrency where appropriate.
 - Prefer structured concurrency: tasks should have clear ownership and
-  cancellation semantics. Long-lived background work (compaction loop, cache
-  refresh) should have explicit start/stop lifecycle.
+  cancellation semantics.
+- For workloads that mix I/O and CPU (reading from object storage, then
+  processing), separate the two into distinct stages connected by bounded
+  channels. I/O tasks run on tokio, CPU work dispatches to rayon. Bound
+  both I/O concurrency (semaphore) and in-flight CPU work (no more than
+  available threads). See `lakesearch-query/src/query/pipeline.rs` for the
+  reference implementation of this pattern.
+- CPU work dispatched to rayon should be pure functions:
+  `(input, context) → output`. No shared mutable state. This makes them
+  safe to run in parallel with no synchronization.
+- Use bounded channels between stages. Backpressure propagates naturally.
+  On error, send it downstream and let channel drops handle cancellation.
 
 ## Testing
 
-- Test behavior through public interfaces. Core's public API should be
-  thoroughly tested; private helpers are tested indirectly.
+- Test behavior through public interfaces. The `LakeSearch` struct's methods
+  should be the primary test surface for operations.
 - Write tests for code with meaningful branching, algorithmic complexity,
   or subtle invariants (posting list codec, boolean ops, BM25 math,
-  segment round-trip, CAS retry logic).
+  segment round-trip, SlateDB metadata round-trip, catalog diff logic).
 - Each test should have one primary reason to fail.
+- Use `MockCatalog` (in-memory file list with snapshot tracking) for unit
+  tests. No DuckDB dependency in unit tests.
+- Use `object_store::memory::InMemory` for storage tests — no real S3 calls.
+- DuckLake integration tests use `#[ignore]` (require extension download).
 - Integration tests: write Parquet files, index them, query, verify results.
   These are slow and should be marked with `#[ignore]` or run in a separate
   test target.
-- Use `tempfile` for filesystem tests. Use `object_store::memory::InMemory`
-  for storage tests — no real S3 calls in unit tests.
+- Use `tempfile` for filesystem tests.
 
 ### Property-Based Tests (proptest)
 
@@ -113,9 +144,8 @@ Checked-in fixtures for deterministic correctness checks:
 
 ### Test Parquet Generator
 
-A shared test utility (`lakesearch-core/src/test_utils.rs`, behind
-`#[cfg(test)]` or a `test-utils` feature) that creates Parquet files with
-known content patterns:
+A shared test utility (behind `test-utils` feature) that creates Parquet files
+with known content patterns:
 
 ```rust
 /// Create a Parquet file with deterministic content for testing.
@@ -129,46 +159,11 @@ pub fn write_test_parquet(
 ) -> Result<()>;
 ```
 
-This ensures end-to-end tests are deterministic and self-contained — no
-external test data files to manage.
-
 ## Benchmarks (criterion)
 
 Every performance-sensitive component has `criterion` benchmarks. Benchmarks
 are written alongside the code, not after. Run with `cargo bench` before
 committing any change to a benchmarked component.
-
-### Per-Component Benchmarks
-
-**Posting codec** (`lakesearch-core/benches/posting.rs`):
-- `posting/encode/dense_10k` — encode 10K dense sequential doc_ids
-- `posting/encode/sparse_10k` — encode 10K sparse random doc_ids
-- `posting/decode/dense_10k` — decode 10K dense doc_ids
-- `posting/decode/sparse_10k` — decode 10K sparse doc_ids
-- Log `bits_per_docid` as a custom metric (target: <2 bits dense, <8 sparse)
-
-**Boolean ops** (`lakesearch-core/benches/boolean.rs`):
-- `boolean/intersect/{size_a}_{size_b}` — 1K∩1K, 1K∩100K, 100K∩100K
-- `boolean/union/{size_a}_{size_b}` — same size matrix
-- `boolean/difference/{size_a}_{size_b}` — same size matrix
-
-**Tokenizer** (`lakesearch-core/benches/tokenizer.rs`):
-- `tokenizer/throughput` — MB/sec of English text tokenized
-
-**Segment** (`lakesearch-core/benches/segment.rs`):
-- `segment/build/{terms}_{docs}` — build time for N terms, M doc_ids
-- `segment/read_term` — cold read: parse footer → load FST → lookup one term → decode posting list
-- Log `segment_size_ratio` (segment bytes / indexed text bytes) as custom metric
-
-**End-to-end** (`lakesearch-query/benches/e2e.rs`):
-- `e2e/query/rare_term` — query a term appearing in <0.1% of rows
-- `e2e/query/common_term` — query a term appearing in >10% of rows
-- `e2e/query/multi_term_and` — 3-term AND query
-- `e2e/index/throughput` — rows/sec indexing throughput
-- Log `pruning_ratio` (candidate pages / total pages) and `false_positive_rate`
-  (rows scanned / rows matched) as custom metrics
-
-### Performance Regression Gate
 
 If a benchmark regresses by more than 10% compared to the previous run,
 investigate before committing. `criterion` reports statistical significance
