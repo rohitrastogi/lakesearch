@@ -181,6 +181,17 @@ The query server uses lazy `Catalog::resolve_table(...)` + `open`
 reference. The CLI uses `open_mut_from_uri` for mutating operations and
 `open_from_uri` for read-only operations.
 
+`open(table)` uses `slatedb::DbReader::open(...)` without an explicit
+checkpoint id. In SlateDB, that means the reader creates and manages its
+own checkpoint against the latest persistent manifest, then periodically
+polls for manifest / WAL changes at `manifest_poll_interval` and
+re-establishes the checkpoint when needed. Each query runs against one
+consistent checkpoint from that reader for the duration of the query,
+but a long-lived cached read-only handle may lag a recent `index` or
+`compact` commit until the next poll. A one-shot CLI invocation opens a
+fresh `DbReader`, so it starts from the latest persistent manifest at
+open time.
+
 ### CLI
 
 Thin wrapper around the library:
@@ -237,7 +248,6 @@ hot tables to benefit from caching. The server stays on the read path:
 operations remain CLI-only by default.
 
 A long-running server caches:
-- SlateDB reads (segment index entries) — avoids repeated object store reads.
 - Loaded segment files — the main I/O cost. LRU cache by segment path.
 - Data lake catalog connections — avoid re-attaching DuckLake on every call.
 
@@ -700,6 +710,13 @@ MVP tokenizer: `whitespace_lowercase`
 6. Track term presence per row, then aggregate it into:
    - row-level `doc_frequency` for the term info table
    - per-page `row_hit_count` for each posting entry
+
+Query-time cheap filtering uses the same canonicalization steps, but
+does **not** rewrite Parquet data on disk. Instead, LakeSearch builds
+temporary Arrow string arrays (or a temporary shadow `RecordBatch`) with
+lowercase + NFC applied to the searched columns, runs vectorized
+substring `contains` checks on those shadow arrays, combines the masks,
+and then filters the original batch before tokenization.
 
 Future tokenizers (not MVP): stemming, n-grams, language-specific.
 
@@ -1190,19 +1207,37 @@ terms, return an error: "prefix '{prefix}*' expands to N terms,
 exceeding limit of 1024." No silent truncation, no brute-force
 fallback. The user narrows their query.
 
+Prefix routing uses a half-open lexicographic interval over normalized
+term bytes. For prefix `p`, the planner routes to any segment whose
+stored term range `[min_term, max_term]` overlaps `[p,
+prefix_upper_bound(p))`. `prefix_upper_bound(p)` is the smallest byte
+string strictly greater than every byte string beginning with `p`; if no
+such upper bound exists, the interval is `[p, +inf)`. Exact routing is a
+point lookup on one term, not an interval.
+
 Suffix queries are asymmetric in one important way in the MVP:
 reverse-FST lookup works naturally **inside** a segment, but segment
-entries are keyed only by forward `min_term` / `max_term`. So exact and
-prefix queries can prune candidate segments by term range, while suffix
-queries load all segments for the referenced column and rely on reverse-FST
-expansion plus normal page/Parquet pruning after that. Reverse-range
-segment pruning is future work.
+entries are keyed only by forward `min_term` / `max_term`. So exact
+queries can prune candidate segments by point lookup and prefix queries
+can prune by prefix-interval overlap, while suffix queries load all
+segments for the referenced column and rely on reverse-FST expansion
+plus normal page/Parquet pruning after that. Reverse-range segment
+pruning is future work.
 
 `ColumnPlan.operator` determines how term-level posting lists are
 combined within a single `match` clause. `QueryExpr::And` means all
 children must match. `QueryExpr::Or` means any child may match. BM25
-scores from matching `ColumnPlan` leaves are summed. Ties are broken by
-`(file_path, row_index)` for deterministic ordering.
+scores from matching `ColumnPlan` leaves are summed.
+
+LakeSearch's canonical row identity is:
+- `(file_path, row_group, row_index_within_row_group)`
+
+`row_index_within_row_group` is the 0-based row ordinal within the
+Parquet row group, not within a page, batch, or full file. It is
+derived from Parquet `PageLocation.first_row_index` plus the row's
+offset within that page. This key is used for deduplication, merging
+indexed + brute-force results, and deterministic tie-breaking for equal
+BM25 scores.
 
 ### Query Language
 
@@ -1318,6 +1353,9 @@ effectiveness:
 The MVP `QueryStats` schema is fixed to these fields:
 - `segments_touched`
 - `candidate_pages`
+- `total_rows_in_snapshot`
+- `indexed_rows_scanned`
+- `unindexed_rows_scanned`
 - `rows_scanned`
 - `rows_matched`
 - `unindexed_files_scanned`
@@ -1329,6 +1367,9 @@ The MVP `QueryStats` schema is fixed to these fields:
   "stats": {
     "segments_touched": 3,
     "candidate_pages": 12,
+    "total_rows_in_snapshot": 12000000,
+    "indexed_rows_scanned": 240,
+    "unindexed_rows_scanned": 120,
     "rows_scanned": 360,
     "rows_matched": 4,
     "unindexed_files_scanned": 0,
@@ -1336,6 +1377,13 @@ The MVP `QueryStats` schema is fixed to these fields:
   }
 }
 ```
+
+`total_rows_in_snapshot` is the total row count in the queried lake
+snapshot. `rows_scanned` is the actual row-level verification work
+performed by the query and is defined as
+`indexed_rows_scanned + unindexed_rows_scanned`. The split fields make
+it visible how much work came from indexed candidate pages versus the
+brute-force unindexed tail.
 
 ### Term Resolution
 
@@ -1349,8 +1397,11 @@ that the evaluator dispatches on:
   posting lists inside each loaded segment (bounded)
 
 Segment-level pruning behavior differs by term kind:
-- **Exact / Prefix**: use SlateDB `min_term` / `max_term` to find only
-  candidate segments for that term
+- **Exact**: use SlateDB `min_term` / `max_term` to find only
+  candidate segments whose range contains that exact term
+- **Prefix**: route by overlap with the half-open interval
+  `[prefix, prefix_upper_bound(prefix))`; this may match segments whose
+  entire term range lies strictly above the raw prefix string itself
 - **Suffix**: no segment-level pruning in the MVP; load all segments
   for the column, then use the reverse FST inside each segment
 
@@ -1361,10 +1412,10 @@ sorted-array union on `u32` doc_id values.
 **Important:** all page-level boolean operations are **approximate**. They
 identify candidate pages that *may* contain matching rows, but a page-level
 AND does not guarantee every row in the page satisfies the full predicate. The
-row-level verification step (see execution pipeline) uses an ILIKE pre-filter
-(SIMD substring check) to cheaply discard most non-matching rows, then
-tokenizes only survivors to evaluate the complete boolean query and eliminate
-false positives.
+row-level verification step (see execution pipeline) uses a canonical
+shadow-column `contains` pre-filter to cheaply discard most
+non-matching rows, then tokenizes only survivors to evaluate the
+complete boolean query and eliminate false positives.
 
 #### Negation (Future Work)
 
@@ -1477,31 +1528,38 @@ matching columns for each row.
 8. **Page Fetch**: read candidate rows once per work item using
    `ParquetRecordBatchReaderBuilder` with `RowSelection` +
    `ProjectionMask` (include all searched columns)
-9. **Row-Level Verification** (ILIKE pre-filter + tokenization):
+9. **Row-Level Verification** (canonical shadow-column pre-filter +
+   tokenization):
    Page-level posting lists are approximate — a candidate page with 8192
    rows may contain only a few actual matches. To avoid tokenizing every
    row (which dominates CPU for large pages or long text fields), apply
    a two-stage filter:
 
-   a. **ILIKE pre-filter**: For each query term, run Arrow's SIMD
-      `ilike` kernel on the raw string column — case-insensitive
-      substring check, no tokenization. AND/OR the resulting BitArrays
-      across terms. This cheaply discards the vast majority of
-      non-matching rows (SIMD scan, no Unicode normalization, no
-      allocation per token).
-   b. **Tokenize survivors only**: For rows passing the ILIKE filter,
+   a. **Canonical shadow-column pre-filter**: Build a temporary Arrow
+      string array (or temporary `RecordBatch`) for each searched column
+      in the current batch with lowercase + NFC applied. For each query
+      term body, run vectorized substring `contains` checks on that
+      shadow column, AND/OR the resulting boolean masks across terms,
+      and filter the original batch with the combined mask. This cheaply
+      discards the vast majority of non-matching rows while preserving
+      the tokenizer's canonicalization semantics.
+   b. **Tokenize survivors only**: For rows passing the shadow-column filter,
       tokenize and evaluate the compiled `QueryPlan`. Discard rows that
-      don't match. ILIKE is a superset filter (substring, not
-      token-boundary), so a few false positives
+      don't match. The `contains` pre-filter is still a superset filter
+      (substring, not token-boundary), so a few false positives
       reach this stage, but the count is small.
+      Implementations should benchmark this against direct
+      tokenize-every-row verification and keep the pre-filter only where
+      it wins on the target workload.
 
-   This is the same ILIKE pre-filter used in the brute-force path,
-   applied to the indexed path's verification step. For a page where 3
-   out of 8192 rows match, tokenization runs on ~5-10 rows (ILIKE
-   survivors) instead of 8192.
+   This is the same canonical shadow-column pre-filter used in the
+   brute-force path, applied to the indexed path's verification step.
+   For a page where 3 out of 8192 rows match, tokenization runs on
+   ~5-10 rows (shadow-column survivors) instead of 8192.
 10. **Unindexed Tail + BM25 Finalization**:
     - **Filter mode** (`score: false` or omitted): brute-force the
-      unindexed tail with the ILIKE pre-filter + tokenize-survivors
+      unindexed tail with the shadow-column pre-filter +
+      tokenize-survivors
       path, then emit verified rows immediately. No TF computation, no
       IDF lookup, no BM25 math. If `limit` is specified, stop after N
       verified rows (no ranking — first-N, not top-N). Fully streamable.
@@ -1541,10 +1599,11 @@ column, and only columns that do not yet cover a given file contribute
 
 1. **Pass 1 — stream only the searched columns**: Read full row groups
    sequentially (large I/O, not page-random).
-   - **Filter queries** (`score: false`): use the ILIKE pre-filter
-     (SIMD substring check) to cheaply discard non-candidate rows, then
-     tokenize survivors and evaluate the compiled `QueryPlan`. Record
-     matching row indices.
+   - **Filter queries** (`score: false`): use the canonical
+     shadow-column pre-filter (temporary lowercase + NFC Arrow arrays
+     plus vectorized substring `contains`) to cheaply discard
+     non-candidate rows, then tokenize survivors and evaluate the
+     compiled `QueryPlan`. Record matching row indices.
    - **Ranked queries** (`score: true`): tokenize every row in the
      searched columns once. This pass simultaneously:
      - evaluates the compiled `QueryPlan`
@@ -1810,11 +1869,19 @@ only needs to provide the backend-relative `object_path`.
 ### Catalog and Resolved Table Interfaces
 
 ```rust
-/// A snapshot identifier in the data lake.
-/// For DuckLake this is a BIGINT snapshot_id. Stored as a string for
-/// format-agnostic representation.
+/// A snapshot / version identifier in the data lake.
+///
+/// LakeSearch requires all supported backends to expose a non-negative,
+/// totally ordered 64-bit integer identifier for snapshot progress.
+/// This makes the monotonic backfill rules mechanically implementable:
+/// `SnapshotId` values are compared numerically, never lexicographically.
+///
+/// Examples:
+/// - DuckLake: BIGINT `snapshot_id`
+/// - Iceberg: `snapshot-id` (long)
+/// - Delta Lake: table version / commit version
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct SnapshotId(pub String);
+pub struct SnapshotId(pub i64);
 
 /// A data file tracked by the data lake.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2145,6 +2212,8 @@ GLOBAL STATE
     Contains:
       indexed_columns: Vec<ColumnConfig>
         Each: { name: String, tokenizer: String, status: active|dropped }
+        MVP invariant: at most one `ColumnConfig` per column name.
+        Multiple indexes / tokenizers per column are out of scope.
 
   meta|snapshot|{column}              -> ColumnSnapshotState
     Contains:
@@ -2179,10 +2248,16 @@ SEGMENT INDEX
     range may contain the query term.
 ```
 
-**Why this works for queries**: To find segments for term T, scan from
-`seg|{col}|{T}` forward. The first key with `max_term >= T`
-is the first candidate. Keep scanning until `min_term > T`. This is
-O(matching segments), not O(all segments).
+**Why this works for queries**:
+- **Exact term `T`**: scan from `seg|{col}|{T}` forward. The first key
+  with `max_term >= T` is the first candidate. Keep scanning until
+  `min_term > T`.
+- **Prefix `P*`**: scan from `seg|{col}|{P}` forward. Keep segments whose
+  `[min_term, max_term]` overlaps `[P, prefix_upper_bound(P))`, and stop
+  once `min_term >= prefix_upper_bound(P)` (or never, if the upper bound
+  is unbounded).
+
+This is O(matching segments), not O(all segments).
 
 **Why this works for atomic updates**: A single SlateDB transaction can
 put/delete keys across all prefixes (meta, seg, corpus). No multi-table
@@ -2219,10 +2294,10 @@ orphans (cleaned by vacuum). If segment upload fails, the transaction
 never starts. There is no window where metadata references a
 non-existent segment file.
 
-A `DbReader` sees a consistent SlateDB snapshot — either fully before
-or fully after a transaction. All segment entries from one
-index/compact commit appear atomically. A reader that started before
-a commit continues seeing the old segment set for its entire query.
+Each query uses one consistent SlateDB read snapshot — either fully
+before or fully after a transaction. All segment entries from one
+index/compact commit appear atomically. A query that started before a
+commit continues seeing the old segment set for its entire execution.
 
 After compact commits, old segment keys are deleted from SlateDB but
 old segment files remain on object storage until vacuum runs. Readers
@@ -2265,6 +2340,21 @@ let iter = reader.scan_prefix(prefix).await?;
 
 Multiple concurrent query and vacuum processes supported.
 
+LakeSearch opens `DbReader` without an explicit checkpoint id. Per
+SlateDB's checkpoint model, such a reader establishes a checkpoint on
+the latest persistent manifest, uses that checkpoint consistently for
+reads, and polls again at `manifest_poll_interval` to decide whether to
+re-establish it. If an explicit checkpoint id were supplied, the reader
+would stay pinned to that checkpoint and would not poll for new state.
+Therefore:
+- each query sees one consistent SlateDB checkpoint for its full
+  planning / execution lifetime
+- a cached read-only handle eventually observes new `index` / `compact`
+  commits after the reader's next poll, not necessarily immediately at
+  query start
+- MVP query planning re-reads active segment entries from SlateDB each
+  query rather than caching mutable segment-entry results across queries
+
 ### Concurrency Model
 
 **Writer concurrency**: SlateDB enforces single-writer per database
@@ -2298,10 +2388,11 @@ semantics out of the box.
 
 **Reader concurrency**: Query and vacuum only read SlateDB (via
 `DbReader`). They can run concurrently with each other and with a
-writer. Readers see a consistent point-in-time snapshot — either
-before or after a metadata commit, never partial state. Vacuum's
-grace period (default 1 hour) prevents it from deleting segment files
-that a concurrent index/compact has written but not yet committed.
+writer. Each query sees a consistent point-in-time metadata snapshot —
+either before or after a metadata commit, never partial state.
+Vacuum's grace period (default 1 hour) prevents it from deleting
+segment files that a concurrent index/compact has written but not yet
+committed.
 
 ---
 
@@ -2321,6 +2412,10 @@ that a concurrent index/compact has written but not yet committed.
 - `index`, `query`, `compact`, `vacuum`, and `drop-index` require that
   metadata to already exist. If it does not, they return a clear
   "run add-index first" error.
+- MVP supports only one index definition per column. `add-index` on an
+  already-active column returns an error. To change tokenizer, run
+  `drop-index`, then `add-index`, then `index`. Multiple indexes per
+  column and planner-side index combination are future work.
 
 **Snapshot handling**: Index accepts an optional `target_snapshot` for
 incremental backfill. Per-column snapshot pointers are monotonic: an
@@ -2656,37 +2751,56 @@ QUERY(table, query):
 
 3. Determine unindexed files per referenced column:
      If last_indexed == snap:
-       unindexed_files = []            // fast path
+       unindexed_files = []
      Else if last_indexed is None:
        unindexed_files = table.files_at_snapshot(snap)  // everything
      Else:
        unindexed_files = table.files_added_between(last_indexed, snap)
 
 4. Stale filtering is deferred to after segment discovery (step 7).
-     When last_indexed == snap, skip entirely (fast path).
-     Otherwise, collect parquet file paths from candidate segments
-     after step 6, then call table.check_files_live(paths) to get
-     the live subset. This avoids materializing the full file list —
-     only the files from candidate segments are checked.
+     Always collect parquet file paths from candidate segments after
+     step 6, then call table.check_files_live(paths) to get the live
+     subset. This avoids materializing the full file list — only the
+     files from candidate segments are checked.
 
 --- Step 2: Indexed path (candidate generation; no Parquet reads) ---
 
 5. PARSE the request into `QueryPlan`.
 
 6. For each query term / column pair in the `QueryPlan`:
-     If term is Exact or Prefix:
+     If term is Exact:
        SCAN SlateDB for candidate segments:
          Start: seg|{column}|{term}
          End:   seg|{column}|~
          Keep segments where min_term <= term <= max_term.
+     If term is Prefix:
+       SCAN SlateDB for candidate segments:
+         Start: seg|{column}|{prefix}
+         End:   seg|{column}|~
+         Keep segments whose [min_term, max_term] overlaps
+           [prefix, prefix_upper_bound(prefix)).
+         Stop once min_term >= prefix_upper_bound(prefix)
+           (or never, if upper bound is unbounded).
      If term is Suffix:
        use all segments for that column
        (MVP: no reverse-range segment pruning metadata)
 
+     Within one query, coalesce repeated same-column segment-discovery
+     work in a query-local scratch map. If multiple clauses need nearby
+     or identical discovery ranges for the same column, the planner may
+     issue one broader SlateDB scan and partition / filter the returned
+     segment entries in memory for those clauses. If two branches still
+     request the same discovery result, compute it once and reuse it for
+     the rest of the query.
+
 7. LOAD the candidate segments (from cache or object storage).
-     If stale filtering is needed:
-       call table.check_files_live(candidate_segment_paths) once
-       to get live_paths.
+     call table.check_files_live(candidate_segment_paths) once
+     to get live_paths.
+
+     Within one query, also single-flight already-open immutable segment
+     artifacts (FST, doc table, posting blocks) by segment path so
+     repeated clause evaluation does not re-open or re-decode the same
+     segment twice.
 
 8. For each `ColumnPlan` leaf:
      a. Resolve each referenced term in each matching segment:
@@ -2705,7 +2819,8 @@ QUERY(table, query):
 
 9. Combine the per-leaf row ranges according to the enclosing
      `QueryExpr` tree. Cross-column AND/OR and same-column AND/OR
-     across split siblings both happen here on row identity /
+     across split siblings both happen here on canonical row identity
+     `(file_path, row_group, row_index_within_row_group)` /
      overlapping row ranges. No Parquet data has been read yet.
 
 10. Group the resulting row ranges by `(file, row_group)` and build
@@ -2713,9 +2828,11 @@ QUERY(table, query):
 
 11. For each indexed work item:
       READ candidate rows once with `RowSelection + ProjectionMask`.
-      ILIKE pre-filter: SIMD substring check per query term to cheaply
-        discard non-matching rows.
-      Tokenize only ILIKE survivors, evaluate the compiled `QueryPlan`.
+      Build temporary lowercase + NFC shadow Arrow arrays for the
+        searched columns, run vectorized substring `contains` per query
+        term, combine masks, and filter the original batch.
+      Tokenize only shadow-column survivors, evaluate the compiled
+        `QueryPlan`.
       If `score: true` and every referenced column is fully indexed:
         score immediately with indexed global df + corpus stats.
       Else if `score: true`:
@@ -2728,8 +2845,9 @@ QUERY(table, query):
       columns (two-pass projection):
       Pass 1 — stream only the searched columns:
         If `score: false`:
-          ILIKE pre-filter, tokenize survivors, evaluate `QueryPlan`,
-          record matching row indices.
+          build temporary lowercase + NFC shadow Arrow arrays, apply
+          vectorized substring `contains`, tokenize survivors, evaluate
+          `QueryPlan`, record matching row indices.
         Else (`score: true`):
           tokenize every row once, evaluate `QueryPlan`, record
           matching row indices + per-row TF / `dl`, and accumulate
@@ -2772,15 +2890,17 @@ Step 8d filters these at query time. Running compact promptly reduces
 this overhead by rewriting the segments themselves.
 
 **Performance tiers**:
-- Best: fully indexed, no staleness -> no brute-force, no stale filtering.
+- Best: fully indexed, no staleness -> no brute-force; only targeted
+  candidate-path liveness checks.
 - Typical: small unindexed tail -> most results from index, small scan.
 - Worst: nothing indexed -> full brute-force. Same as no index at all.
 
-**Optimization for the query path stale check**: Rather than calling
-`files_at_snapshot` on every query (which reads manifest metadata), we
-can skip stale filtering entirely when `last_indexed == snap`. When
-they differ, the query needs to pay this cost. This is one reason to
-call index frequently — it keeps queries fast.
+**Optimization for the query path stale check**: Query never
+materializes the full live file set. It always performs a targeted
+`check_files_live(candidate_paths)` on only the paths referenced by the
+candidate segments. Keeping the index up to date still helps by reducing
+the unindexed tail, but it does not eliminate this targeted liveness
+check.
 
 ---
 
@@ -2855,6 +2975,13 @@ SlateDB metadata for the resolved table and writes the initial
 create a snapshot pointer for the column — the absence of a pointer means
 `last_indexed = None`.
 
+MVP supports only one index definition per column. If the column is
+already active in `TableConfig`, `add-index` returns an error. If the
+column exists in `TableConfig` with status = `dropped`, `add-index`
+reactivates that same column entry with the supplied tokenizer and leaves
+the snapshot pointer absent so the next `index` call performs a full
+backfill. Supporting multiple active indexes per column is future work.
+
 The next `index` call sees the new column with no snapshot pointer,
 fetches all files via `files_at_snapshot(target)`, and indexes them.
 After the call, the new column is in sync with the others. This is
@@ -2898,7 +3025,6 @@ reads. Cached items and their staleness strategy:
 
 | Item | Size | TTL / Invalidation Strategy |
 |------|------|-----------------------------|
-| SlateDB segment entries (from metadata reads) | Small | Read via `DbReader` snapshot — always consistent. Refresh periodically or on query if stale. |
 | FSTs (from segment files) | Medium (typically KB-low MB per segment) | Immutable. Cache keyed by segment path. Evict via LRU. Highest-value cache items. |
 | Doc tables (from segment files) | Small-medium (24 bytes x pages per segment) | Immutable. Cache keyed by segment path. Needed for every query that hits this segment. |
 | Parquet footer + offset_index | Small | Immutable per file. Cache keyed by file path. Needed only for cross-column queries if doc table doesn't already have `first_row_index` (it does). |
@@ -2909,12 +3035,15 @@ reads. Cached items and their staleness strategy:
 Segment files are **immutable files**. Once written, they never change. This means
 cache invalidation is trivial:
 
-- SlateDB metadata reads provide a consistent view of which segments are active.
-  When a new segment entry appears (after index or compact commits), load the new
-  segment data. Old cached segments remain valid as long as SlateDB still references
-  them.
+- Each query reads the active segment entries fresh from SlateDB via the
+  current `DbReader` checkpoint. LakeSearch does **not** cache these
+  mutable metadata reads across queries.
+- When a new segment entry appears (after index or compact commits),
+  later queries may start loading that segment's immutable data into the
+  object cache.
 - When a SlateDB read shows a segment is no longer referenced, it can be evicted
-  from cache. The underlying file will be cleaned up by vacuum.
+  from the immutable object caches by ordinary LRU pressure. The
+  underlying file will be cleaned up by vacuum.
 
 The only race condition: a cached segment file could be vacuumed while still in cache.
 Mitigate by ensuring vacuum's grace period is much longer than max query execution time.
@@ -2925,15 +3054,38 @@ Use `moka` LRU cache with a configurable memory budget (default 256MB).
 Priority: FSTs (highest hit rate), doc tables (needed for every query),
 posting list blocks (largest, lowest priority).
 
+### Per-Query Scan Coalescing And Reuse
+
+Each query owns a short-lived in-memory scratch context. This is not a
+shared cache and needs no invalidation beyond dropping it at query end.
+
+- SlateDB segment-discovery work may be coalesced within the query,
+  usually per column. When several clauses need nearby or overlapping
+  search ranges, the planner may issue one broader scan and reuse the
+  returned segment entries across those clauses.
+- If two parallel branches still need the same discovery result, use
+  single-flight reuse keyed by the discovery request (for example
+  `(column, term-kind, search-range)`), so only one branch performs the
+  scan and the others await it.
+- Immutable segment artifacts already loaded during the query may be
+  reused by segment path in addition to any shared LRU cache.
+- `check_files_live(candidate_paths)` results may be reused within the
+  query when multiple clauses converge on the same candidate-path set.
+
+This avoids repeated planning work inside one request without creating a
+cross-query correctness problem.
+
 ### Cache Correctness
 
-Cache correctness depends ONLY on the SlateDB snapshot taken at query
-start, never on cache freshness:
+Cache correctness depends ONLY on the consistent SlateDB checkpoint used
+by the query, never on cache freshness:
 - Segment files are immutable, addressed by unique paths (UUIDv7).
   Cache key = path. No ETag/version needed.
 - Parquet metadata is immutable per file. Same logic.
-- SlateDB `DbReader` snapshot determines which segments are consulted.
-  Cache only affects whether bytes come from memory or object storage.
+- The cached handle's current `DbReader` checkpoint determines which
+  segments are consulted for that query. LakeSearch re-reads that
+  segment-entry metadata from SlateDB each query; caches only affect
+  whether immutable bytes come from memory or object storage.
 - Invalidation is purely LRU eviction by memory pressure. No TTL
   needed for immutable content keyed by unique paths.
 
@@ -2962,12 +3114,27 @@ Core never opens a file or makes a network call. Everything works on
 ```rust
 // -- Segment writing (indexer and compactor produce these) --
 
+pub struct PostingEntry {
+    pub doc_id: DocId,
+    pub row_hit_count: u32,
+}
+
+pub struct DocTableEntry {
+    pub file_ordinal: u32,
+    pub row_group: u16,
+    pub page_index: u16,
+    pub first_row_index: u64,
+    pub row_count: u32,
+    pub token_count: u32,
+}
+
 pub struct SegmentBuilder { .. }
 impl SegmentBuilder {
     pub fn new() -> Self;
     pub fn add_file(&mut self, path: &str, row_group_count: u16) -> FileOrdinal;
     pub fn add_page(&mut self, file: FileOrdinal, row_group: u16,
-                     page: u16, first_row_index: u64, row_count: u32) -> DocId;
+                     page: u16, first_row_index: u64,
+                     row_count: u32, token_count: u32) -> DocId;
     pub fn add_posting(&mut self, term: &str, doc_id: DocId, row_hit_count: u32);
     pub fn set_doc_frequency(&mut self, term: &str, df: u32);
     pub fn set_corpus_stats(&mut self, total_rows: u64, total_tokens: u64);
@@ -2983,14 +3150,14 @@ impl<'a> SegmentReader<'a> {
     pub fn fst(&self) -> &fst::Map<&[u8]>;
     pub fn reverse_fst(&self) -> &fst::Map<&[u8]>;
     pub fn term_info(&self, term_ordinal: u64) -> Result<TermInfo>;
-    pub fn read_posting_list(&self, info: &TermInfo) -> Result<Vec<DocId>>;
+    pub fn read_posting_list(&self, info: &TermInfo) -> Result<Vec<PostingEntry>>;
     pub fn corpus_stats(&self) -> CorpusStats;
 }
 
 // -- Posting list codec --
 
-pub fn encode_posting_list(doc_ids: &[DocId]) -> Vec<u8>;
-pub fn decode_posting_list(data: &[u8]) -> Vec<DocId>;
+pub fn encode_posting_list(entries: &[PostingEntry]) -> Vec<u8>;
+pub fn decode_posting_list(data: &[u8]) -> Vec<PostingEntry>;
 
 // -- Boolean operations on sorted doc_id arrays --
 
@@ -3014,6 +3181,12 @@ pub struct CorpusStats { .. }           // total_rows, total_tokens
 pub struct SegmentEntry { .. }          // segment_path, min_term, max_term, size_bytes, doc_count, parquet_files, ...
 ```
 
+These public core APIs intentionally mirror the on-disk segment format:
+posting lists expose `row_hit_count`, and doc-table entries expose
+`token_count`. Compact and query both need this richer metadata for
+exact `doc_frequency` recomputation, corpus-stat recomputation, and
+mixed indexed / brute-force BM25.
+
 The core layer has **no traits**. No `StorageBackend`, no `SegmentStore`.
 The operations layer calls `object_store` directly and hands bytes to
 core. This avoids leaking async boundaries and lifetime complexity into
@@ -3033,10 +3206,10 @@ for the reference implementation.
    files, read only candidate pages via RowSelection. For unindexed
    files, stream full row groups sequentially.
 2. **CPU dispatcher** (single tokio task): Pulls work items from the
-   queue, dispatches to rayon for ILIKE pre-filter + tokenization +
-   verification + scoring. Bounds in-flight CPU work to available
-   threads. Uses `tokio::select!` with biased priority to drain
-   completed work before pulling new items.
+   queue, dispatches to rayon for shadow-column normalization +
+   `contains` pre-filter + tokenization + verification + scoring.
+   Bounds in-flight CPU work to available threads. Uses `tokio::select!`
+   with biased priority to drain completed work before pulling new items.
 3. **Coalescer** (single tokio task): Accumulates small output batches
    into target-sized chunks before sending downstream.
 
@@ -3162,9 +3335,10 @@ def indexed_rare():
     ))
     return conn.sql("SELECT count(*) FROM reader").fetchone()
 
-# IMPORTANT: brute-force baselines use word-boundary regex, not substring
-# ILIKE. Our index does token-based matching, so ILIKE '%conn%' would match
-# "disconnect" (substring hit) while the index would not. The regex baseline
+# IMPORTANT: brute-force baselines use word-boundary regex, not the
+# shadow-column substring `contains` pre-filter. Our index does token-based
+# matching, so substring '%conn%' would match "disconnect" while the index
+# would not. The regex baseline
 # with \b is a practical DuckDB-native approximation — not semantically
 # identical to our tokenizer (which does Unicode NFC normalization and has
 # its own boundary rules), but close enough for performance comparison.
@@ -3252,7 +3426,8 @@ bench("search_plus_agg", indexed_agg, bruteforce_agg)
 | Metric | How | Why |
 |--------|-----|-----|
 | Wall-clock time | `time.perf_counter()` around each query | Primary metric — is indexed faster? |
-| Rows scanned | LakeSearch stats response (`rows_scanned`) vs DuckDB `EXPLAIN ANALYZE` | Validates that the index actually pruned data |
+| Total rows in snapshot | LakeSearch stats response (`total_rows_in_snapshot`) | Denominator for pruning ratio and coverage reporting |
+| Rows scanned | LakeSearch stats response (`rows_scanned`, `indexed_rows_scanned`, `unindexed_rows_scanned`) vs DuckDB `EXPLAIN ANALYZE` | Validates that the index actually pruned data and shows where scan cost came from |
 | Segments touched | LakeSearch stats (`segments_touched`) | Shows how much indexed metadata/query work the planner had to consult |
 | Unindexed files scanned | LakeSearch stats (`unindexed_files_scanned`) | Makes degraded-path / backfill cost visible |
 | Bytes read from storage | Object store metrics or `strace` | Confirms I/O reduction, not just CPU |
@@ -3515,7 +3690,8 @@ Merge completed work from feature branches and restructure crates.
   filtering), `tracing::error!` for failures. Add as each code path
   is written, not retrofitted.
 - Define response stat structs upfront: `QueryStats`
-  (`segments_touched`, `candidate_pages`, `rows_scanned`,
+  (`segments_touched`, `candidate_pages`, `total_rows_in_snapshot`,
+  `indexed_rows_scanned`, `unindexed_rows_scanned`, `rows_scanned`,
   `rows_matched`, `unindexed_files_scanned`, `elapsed_ms`),
   `CompactResult` (merged, stale
   cleaned, created), `IndexResult` (segments created, files indexed
@@ -3579,7 +3755,9 @@ Foundation libraries inside the `lakesearch` crate.
   - If metadata does not exist yet: create SlateDB at
     `{table.table_location()}/lakesearch/slatedb/` and write
     `meta|config`.
-  - Reads config, appends column (status=active), writes back.
+  - Reads config. If the column is already active, return an error.
+  - If the column is dropped, reactivate that same column entry and
+    update its tokenizer. Otherwise append a new column (status=active).
   - No snapshot pointer created (backfill happens on next `index`).
 - `ls.drop_index(column)` (requires `open_mut`):
   - Single transaction: update config (status=dropped), delete all
@@ -3588,9 +3766,12 @@ Foundation libraries inside the `lakesearch` crate.
   call through `LakeSearch` with `--catalog-uri` + backend-relative
   `--table`.
 - Tests: add-index on a new table → verify config created, add-index
-  on an existing table → verify column appended, drop-index → verify
-  segments/stats/pointer deleted, uninitialized `drop-index` returns
-  the "run add-index first" error.
+  on an existing table with a new column → verify column appended,
+  add-index on an already-active column → verify error, drop-index →
+  verify segments/stats/pointer deleted, drop-index then add-index on
+  the same column with a new tokenizer → verify reactivation +
+  backfill-needed state, uninitialized `drop-index` returns the "run
+  add-index first" error.
 
 **Milestone**: `add_index()` initializes metadata, `drop_index()`
 removes a column cleanly, and both work against DuckLake + SlateDB.
@@ -3601,14 +3782,26 @@ All metadata operations tested with mock catalog.
 Fix the query layer before building new features. Items within this
 phase are independent — can be done in any order or in parallel.
 
-**ILIKE pre-filter on indexed verification path**:
-- Add ILIKE pre-filter to `verify_batch` (indexed candidates): run
-  Arrow's `ilike_utf8` kernel per query term, AND/OR the boolean
-  masks, filter the RecordBatch before tokenization.
+**Canonical shadow-column pre-filter on verification path**:
+- Add a pre-filter to `verify_batch` (indexed candidates): build
+  temporary lowercase + NFC Arrow arrays or a shadow `RecordBatch` for
+  the searched columns, run vectorized substring `contains` per query
+  term, AND/OR the boolean masks, then filter the original batch before
+  tokenization.
 - Expected: tokenization on ~10 rows instead of 8192 per candidate
   page. Orders-of-magnitude CPU reduction.
-- Tests: same results with and without ILIKE. Benchmark tokenization
-  call count.
+- Tests: same results with and without the pre-filter. Benchmark
+  shadow-column filtering versus direct tokenize-every-row and keep the
+  optimization only where it wins.
+
+**QueryStats population + accounting**:
+- Populate `total_rows_in_snapshot` from the queried lake snapshot and
+  track `indexed_rows_scanned` / `unindexed_rows_scanned` as actual
+  row-level verification work on the indexed and brute-force paths.
+- Set `rows_scanned = indexed_rows_scanned + unindexed_rows_scanned`.
+- Tests: fully indexed query, mixed indexed/unindexed query, and
+  brute-force-only query all report the expected split counters and
+  preserve the sum invariant.
 
 **Global df(t) aggregation for BM25**:
 - After loading candidate segments, sum `doc_frequency` across all
@@ -3648,18 +3841,16 @@ phase are independent — can be done in any order or in parallel.
   AND, and cross-column OR all return the same rows as brute force.
 
 **Stale filtering on the query path**:
-- When a column's snapshot pointer lags the current lake snapshot,
-  collect Parquet file paths from candidate segments and call
-  `ResolvedTable::check_files_live(...)` once.
+- Collect Parquet file paths from candidate segments and call
+  `ResolvedTable::check_files_live(...)` once per query scope.
 - Filter stale page hits before row-range reduction / Parquet reads.
-- Keep the fast path when `last_indexed == current_snapshot` so there
-  is no liveness call in steady state.
 - Tests: query with stale segments before compact returns the same rows
   as after compact; stale candidates never leak into results.
 
 **Two-pass brute-force projection**:
-- Pass 1: stream only the searched columns. ILIKE + tokenize. Collect
-  matching row indices.
+- Pass 1: stream only the searched columns. For filter queries, build
+  lowercase + NFC shadow Arrow arrays, apply vectorized substring
+  `contains`, then tokenize survivors and collect matching row indices.
 - Ranked mixed-coverage queries (`score: true` with unindexed files)
   use a heavier pass 1: tokenize every row once so BM25 can accumulate
   exact `delta_rows`, `delta_tokens`, and `delta_df`.
@@ -3687,14 +3878,24 @@ phase are independent — can be done in any order or in parallel.
 
 **Segment caching update**:
 - `ObjectCache` caches segment file bytes by path (immutable).
+- Query planning reads active segment entries fresh from SlateDB each
+  time; do not cache mutable SlateDB scan results across queries.
+- Within one query, coalesce same-column SlateDB scans and single-flight
+  reuse repeated discovery / immutable-artifact work in a query-local
+  scratch context.
 - Remove manifest/manifest-list caching.
-- Snapshot `DbReader` at query start for consistent segment metadata.
+- Cached read-only handles reuse a `DbReader` that tracks the latest
+  persistent manifest by polling at `manifest_poll_interval`; each query
+  uses that reader's current checkpoint consistently.
 - Parquet metadata caching unchanged.
+- Instrumentation / tests: verify same-column clauses reuse one
+  coalesced discovery path within a query, and parallel branches
+  single-flight repeated segment opens instead of duplicating them.
 
 **Milestone**: Query path reads from SlateDB + catalog. Indexed
 candidate generation reduces to row ranges before any Parquet read.
 BM25 uses full-corpus stats (including ranked mixed-coverage tails).
-ILIKE pre-filter on indexed path. Two-pass brute-force. Server
+Canonical shadow-column pre-filter on indexed path. Two-pass brute-force. Server
 resolves tables lazily from the catalog meta file and stays strictly
 read-only. All existing query tests pass with new backend.
 
@@ -3963,6 +4164,10 @@ resolved and inlined into their respective sections:
 - **Initialization model**: there is no public `init`; `add-index`
   creates metadata and all other verbs fail with "run add-index first"
   until initialization exists (§ 2, CLI; § 12, API specs; § 13, column lifecycle)
+- **One active index per column in MVP**: `add-index` on an already
+  active column is an error; changing tokenizer is `drop-index` +
+  `add-index` + `index`; multiple indexes per column are future work
+  (§ 10, key layout; § 12, API specs; § 13, column lifecycle)
 - **Cross-column query surface**: no public `multi_match`; one-column
   `match` + explicit boolean composition is the only external query
   model (§ 8, query model)
@@ -3972,6 +4177,9 @@ resolved and inlined into their respective sections:
   (§ 8, query model)
 - **Default tokenizer name**: `whitespace_lowercase`
   (§ 4, tokenization; § 13, column lifecycle)
+- **Snapshot identifier type**: `SnapshotId(pub i64)`; all supported
+  backends must expose a non-negative, totally ordered 64-bit integer
+  snapshot / version identifier (§ 10, catalog resolution)
 - **Key separator**: `\x00` (§ 11, key layout)
 - **SlateDB keying**: keys are table-local because each resolved table
   has its own SlateDB instance; there is no public `table_id`
@@ -3994,17 +4202,38 @@ resolved and inlined into their respective sections:
 - **Compact does not advance snapshot pointer**: Only index advances it
   (§ 12b, compact API)
 - **Query stats schema**: `segments_touched`, `candidate_pages`,
-  `rows_scanned`, `rows_matched`, `unindexed_files_scanned`,
-  `elapsed_ms` (§ 8, query model)
+  `total_rows_in_snapshot`, `indexed_rows_scanned`,
+  `unindexed_rows_scanned`, `rows_scanned`, `rows_matched`,
+  `unindexed_files_scanned`, `elapsed_ms` (§ 8, query model)
+- **Cheap row filter semantics**: build temporary lowercase + NFC
+  shadow Arrow arrays / batches and run vectorized substring
+  `contains` there before tokenization; do not use raw-string `ILIKE`
+  because it is not aligned with tokenizer normalization
+  (§ 4, tokenization; § 8, query model; Phase 2 roadmap)
 - **Stale index queries**: Always return correct results, report
   `unindexed_files_scanned` in QueryStats (§ 12c, query path)
+- **Query-time stale filtering**: always use targeted
+  `check_files_live(candidate_paths)` over the candidate segments'
+  Parquet paths; do not skip liveness checks solely because the column
+  snapshot pointer equals the current lake snapshot (§ 12c, query path)
 - **Cross-segment / cross-column execution**: reduce each clause to row
   ranges first, combine row ranges according to the `QueryExpr` tree,
   then fetch Parquet once for the combined `RowSelection`
   (§ 8, query model; § 12c, query path)
+- **Canonical row identity**: `(file_path, row_group,
+  row_index_within_row_group)` is the stable row key for dedupe,
+  merge, and tie-breaking; the row index is 0-based within the Parquet
+  row group and comes from `PageLocation.first_row_index + offset`
+  (§ 8, query model)
+- **Prefix segment pruning**: prefix queries route by interval overlap
+  with `[prefix, prefix_upper_bound(prefix))`, not by treating the raw
+  prefix string as an exact term (§ 8, query model; § 11, key layout;
+  § 12c, query path)
 - **Query-time catalog latency**: Iceberg implementations should cache
-  manifests; keeping index up to date eliminates catalog calls on the
-  fast path (§ 10, Iceberg manifest caching)
+  manifests; keeping index up to date reduces unindexed-tail catalog
+  work, but queries still perform targeted
+  `check_files_live(candidate_paths)` lookups (§ 10, Iceberg manifest
+  caching; § 12c, query path)
 - **`files_at_snapshot` memory at scale**: Query uses
   `check_files_live` with small input set; compact accepts full
   materialization as a batch cost. Users should run data lake
