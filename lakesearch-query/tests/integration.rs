@@ -42,9 +42,11 @@ async fn run_query(
         lakesearch_query::ScoreMode::None
     };
     let cache = Arc::new(ObjectCache::new(Arc::clone(store)));
+    let current = read_current(store.as_ref(), base).await?;
+    let metadata = read_metadata(store.as_ref(), &current.value).await?;
     query::run_query_collected(
         cache,
-        base.clone(),
+        &metadata,
         column.to_owned(),
         query_text,
         operator,
@@ -1380,9 +1382,11 @@ async fn streaming_query_returns_all_results() {
     .unwrap();
 
     let cache = Arc::new(ObjectCache::new(Arc::clone(&store)));
+    let current = read_current(store.as_ref(), &base).await.unwrap();
+    let metadata = read_metadata(store.as_ref(), &current.value).await.unwrap();
     let stream = query::run_query(
         cache,
-        base,
+        &metadata,
         "description".to_owned(),
         "hello",
         Operator::Or,

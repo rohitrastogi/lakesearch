@@ -25,13 +25,13 @@ This creates `demo/data/events.parquet` with ~10K rows of synthetic log events.
 ```bash
 # Create table
 cargo run -p lakesearch-cli -- create-table \
-    --location "file://$(pwd)/demo/data/lakesearch/" \
+    --location "file://$(pwd)/demo/data/" \
     --table-name events \
     --column description
 
 # Index the parquet file (path is relative to the file:// store root)
 cargo run -p lakesearch-cli -- index \
-    --location "file://$(pwd)/demo/data/lakesearch/" \
+    --location "file://$(pwd)/demo/data/" \
     --file "$(pwd)/demo/data/events.parquet" \
     --column description
 ```

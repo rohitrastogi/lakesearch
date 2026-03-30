@@ -159,6 +159,7 @@ mod tests {
                 name: "description".to_owned(),
                 tokenizer: crate::tokenizer::DEFAULT_TOKENIZER.to_owned(),
                 status: ColumnStatus::Active,
+                backfill_manifest_lists: None,
             }],
             snapshot: Snapshot {
                 timestamp_ms: 1000,

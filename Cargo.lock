@@ -584,6 +584,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
+name = "cascadq-client"
+version = "0.1.0"
+source = "git+ssh://git@github.com/rohitrastogi/cascadq.git#5f48c2e71e00450b0a9ebc580c3fb2ed74a03551"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "cc"
 version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1517,6 +1531,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "lakesearch-admin"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum 0.8.8",
+ "cascadq-client",
+ "chrono",
+ "clap",
+ "futures",
+ "lakesearch-core",
+ "object_store",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "lakesearch-cli"
 version = "0.1.0"
 dependencies = [
@@ -1543,6 +1581,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arrow",
+ "async-trait",
  "bytes",
  "chrono",
  "crc32fast",

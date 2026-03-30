@@ -15,8 +15,8 @@ use arrow_flight::{
 };
 use futures::stream::{StreamExt, TryStreamExt};
 use futures::Stream;
-use lakesearch_core::metadata::ColumnStatus;
-use object_store::path::Path;
+use lakesearch_core::metadata::{ColumnStatus, Metadata};
+use lakesearch_core::storage::{read_current, read_metadata};
 use serde::Deserialize;
 use tonic::{Request, Response, Status, Streaming};
 use tracing::info;
@@ -44,8 +44,7 @@ struct FlightSearchRequest {
     limit: Option<usize>,
 }
 
-/// Arrow Flight service backed by LakeSearch.
-#[derive(Clone)]
+/// Wraps `AppState` and implements `FlightService`.
 pub struct LakeSearchFlightService {
     state: AppState,
 }
@@ -55,18 +54,33 @@ impl LakeSearchFlightService {
         Self { state }
     }
 
-    /// Validates table exists and column is indexed. Returns the object cache
-    /// and base path on success.
+    /// Looks up a table from the catalog, reads fresh metadata, validates
+    /// the column, and returns the object cache + metadata.
     async fn validate_request(
         &self,
         req: &FlightSearchRequest,
-    ) -> Result<(Arc<ObjectCache>, Path), Status> {
-        let (object_cache, base, meta) = self
+    ) -> Result<(Arc<ObjectCache>, Metadata), Status> {
+        let table = self
             .state
-            .cache
-            .get_table_state(&req.table)
+            .catalog
+            .get_table(&req.table)
             .await
+            .map_err(|e| Status::internal(e.to_string()))?
             .ok_or_else(|| Status::not_found(format!("table '{}' not found", req.table)))?;
+
+        let index_base = table.index_base();
+        let object_cache = self
+            .state
+            .table_cache
+            .get_or_create(&req.table, Arc::clone(&table.store))
+            .await;
+
+        let current = read_current(table.store.as_ref(), &index_base)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
+        let meta = read_metadata(table.store.as_ref(), &current.value)
+            .await
+            .map_err(|e| Status::internal(e.to_string()))?;
 
         meta.indexed_columns
             .iter()
@@ -75,7 +89,7 @@ impl LakeSearchFlightService {
                 Status::invalid_argument(format!("column '{}' not found or dropped", req.column))
             })?;
 
-        Ok((object_cache, base))
+        Ok((object_cache, meta))
     }
 }
 
@@ -121,12 +135,12 @@ impl FlightService for LakeSearchFlightService {
     ) -> Result<Response<FlightInfo>, Status> {
         let descriptor = request.into_inner();
         let req = parse_search_request(&descriptor.cmd)?;
-        let (object_cache, base) = self.validate_request(&req).await?;
+        let (object_cache, meta) = self.validate_request(&req).await?;
 
         let with_score = req.score != ScoreMode::None;
         let schema = crate::query::resolve_schema_from_table(
             &object_cache,
-            &base,
+            &meta,
             &req.column,
             &req.select,
             with_score,
@@ -159,6 +173,7 @@ impl FlightService for LakeSearchFlightService {
         Err(Status::unimplemented("poll_flight_info not supported"))
     }
 
+    #[allow(clippy::result_large_err)]
     async fn do_get(
         &self,
         request: Request<Ticket>,
@@ -168,7 +183,7 @@ impl FlightService for LakeSearchFlightService {
 
         info!(table = %req.table, column = %req.column, query = %req.match_text, "flight do_get");
 
-        let (object_cache, base) = self.validate_request(&req).await?;
+        let (object_cache, meta) = self.validate_request(&req).await?;
 
         let operator: crate::Operator = req.operator.into();
         let score_mode: crate::ScoreMode = req.score.into();
@@ -179,7 +194,7 @@ impl FlightService for LakeSearchFlightService {
             timeout,
             crate::query::run_query(
                 object_cache,
-                base,
+                &meta,
                 req.column,
                 &req.match_text,
                 operator,
@@ -192,35 +207,19 @@ impl FlightService for LakeSearchFlightService {
             ),
         )
         .await
-        .map_err(|_| Status::deadline_exceeded("query setup timed out"))?
+        .map_err(|_| Status::deadline_exceeded("query timeout"))?
         .map_err(|e| Status::internal(e.to_string()))?;
 
         let schema = crate::RecordBatchStream::schema(&*batch_stream);
-
         let mapped_stream =
             batch_stream.map_err(|e| arrow_flight::error::FlightError::ExternalError(e.into()));
 
-        let flight_data_stream = FlightDataEncoderBuilder::new()
+        let flight_stream = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(mapped_stream)
-            .map_err(|e| Status::internal(e.to_string()));
+            .map(|r| r.map_err(|e| Status::internal(e.to_string())));
 
-        // Enforce a wall-clock deadline across the entire stream, not just
-        // per-batch. Once `timeout` elapses from stream creation, every
-        // subsequent poll yields DEADLINE_EXCEEDED.
-        let deadline = tokio::time::Instant::now() + timeout;
-        #[allow(clippy::result_large_err)] // Status is required by the Flight trait
-        let timed_stream = flight_data_stream.map(move |item| {
-            if tokio::time::Instant::now() >= deadline {
-                Err(Status::deadline_exceeded("query timed out"))
-            } else {
-                item
-            }
-        });
-
-        Ok(Response::new(
-            Box::pin(timed_stream) as Self::DoGetStream
-        ))
+        Ok(Response::new(Box::pin(flight_stream)))
     }
 
     async fn do_put(

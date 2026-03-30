@@ -28,6 +28,10 @@ pub struct IndexedColumn {
     pub name: String,
     pub tokenizer: String,
     pub status: ColumnStatus,
+    /// Frozen manifest list refs for an in-progress backfill.
+    /// Present only when `status == Backfilling`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub backfill_manifest_lists: Option<Vec<String>>,
 }
 
 /// Snapshot of a table's index state at a point in time.
@@ -180,6 +184,7 @@ mod tests {
                 name: "description".to_owned(),
                 tokenizer: crate::tokenizer::DEFAULT_TOKENIZER.to_owned(),
                 status: ColumnStatus::Active,
+                backfill_manifest_lists: None,
             }],
             snapshot: Snapshot {
                 timestamp_ms: 1711100000000,

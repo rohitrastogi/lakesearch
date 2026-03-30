@@ -69,6 +69,7 @@ pub async fn create_test_table(store: &dyn ObjectStore, base: &Path, columns: &[
             name: (*name).to_owned(),
             tokenizer: DEFAULT_TOKENIZER.to_owned(),
             status: ColumnStatus::Active,
+            backfill_manifest_lists: None,
         })
         .collect();
 

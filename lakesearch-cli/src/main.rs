@@ -113,8 +113,9 @@ async fn main() -> Result<()> {
             column,
         } => {
             let (store, base) = lakesearch_core::storage::parse_location(&location)?;
+            let index_base = base.child("lakesearch");
 
-            if lakesearch_core::storage::current_exists(store.as_ref(), &base).await? {
+            if lakesearch_core::storage::current_exists(store.as_ref(), &index_base).await? {
                 bail!("table already exists at {location}");
             }
 
@@ -125,6 +126,7 @@ async fn main() -> Result<()> {
                     name: name.clone(),
                     tokenizer: DEFAULT_TOKENIZER.to_owned(),
                     status: ColumnStatus::Active,
+                    backfill_manifest_lists: None,
                 })
                 .collect();
 
@@ -141,7 +143,8 @@ async fn main() -> Result<()> {
             };
 
             let meta_path =
-                lakesearch_core::storage::write_metadata(store.as_ref(), &base, &metadata).await?;
+                lakesearch_core::storage::write_metadata(store.as_ref(), &index_base, &metadata)
+                    .await?;
 
             let pointer = lakesearch_core::metadata::CurrentPointer {
                 metadata_path: meta_path,
@@ -149,7 +152,7 @@ async fn main() -> Result<()> {
             };
             lakesearch_core::storage::write_json(
                 store.as_ref(),
-                &base.child("metadata").child("current.json"),
+                &index_base.child("metadata").child("current.json"),
                 &pointer,
             )
             .await?;
@@ -162,8 +165,9 @@ async fn main() -> Result<()> {
             column,
         } => {
             let (store, base) = lakesearch_core::storage::parse_location(&location)?;
+            let index_base = base.child("lakesearch");
             let runtime = LakeRuntime::default();
-            lakesearch_indexer::run_index(&store, &base, &file, &column, &runtime).await?;
+            lakesearch_indexer::run_index(&store, &index_base, &file, &column, &runtime).await?;
             println!("Indexing complete.");
         }
         Command::Query {
@@ -176,12 +180,18 @@ async fn main() -> Result<()> {
             select,
         } => {
             let (store, base) = lakesearch_core::storage::parse_location(&location)?;
-            let cache =
-                std::sync::Arc::new(lakesearch_query::object_cache::ObjectCache::new(store));
+            let index_base = base.child("lakesearch");
+            let cache = std::sync::Arc::new(lakesearch_query::object_cache::ObjectCache::new(
+                store.clone(),
+            ));
+            let current =
+                lakesearch_core::storage::read_current(store.as_ref(), &index_base).await?;
+            let metadata =
+                lakesearch_core::storage::read_metadata(store.as_ref(), &current.value).await?;
             let runtime = std::sync::Arc::new(LakeRuntime::default());
             let result = lakesearch_query::query::run_query_collected(
                 cache,
-                base,
+                &metadata,
                 column,
                 &match_text,
                 operator.into(),

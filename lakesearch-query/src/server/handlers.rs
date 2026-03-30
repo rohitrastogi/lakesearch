@@ -5,6 +5,7 @@ use axum::extract::{Path, State};
 use axum::Json;
 
 use lakesearch_core::metadata::{ColumnStatus, IndexedColumn};
+use lakesearch_core::storage::{read_current, read_metadata};
 
 use super::api_types::*;
 use super::error::ApiError;
@@ -42,30 +43,56 @@ pub async fn health() -> Json<HealthResponse> {
     })
 }
 
-pub async fn list_tables(State(state): State<AppState>) -> Json<ListTablesResponse> {
-    let names = state.cache.table_names().await;
-    let mut tables = Vec::with_capacity(names.len());
-    for name in names {
-        if let Some(meta) = state.cache.get_metadata(&name).await {
-            tables.push(TableInfo {
-                name,
-                location: meta.location.clone(),
+pub async fn list_tables(
+    State(state): State<AppState>,
+) -> Result<Json<ListTablesResponse>, ApiError> {
+    let tables = state
+        .catalog
+        .list_tables()
+        .await
+        .map_err(ApiError::Internal)?;
+
+    // Load metadata for all tables in parallel
+    let futs: Vec<_> = tables
+        .into_iter()
+        .map(|table| async move {
+            let index_base = table.index_base();
+            let current = read_current(table.store.as_ref(), &index_base).await.ok()?;
+            let meta = read_metadata(table.store.as_ref(), &current.value)
+                .await
+                .ok()?;
+            Some(TableInfo {
+                name: table.name,
+                location: table.location,
                 indexed_columns: active_column_names(&meta.indexed_columns),
-            });
-        }
-    }
-    Json(ListTablesResponse { tables })
+            })
+        })
+        .collect();
+
+    let results = futures::future::join_all(futs).await;
+    let infos = results.into_iter().flatten().collect();
+
+    Ok(Json(ListTablesResponse { tables: infos }))
 }
 
 pub async fn get_table(
     State(state): State<AppState>,
     Path(table_name): Path<String>,
 ) -> Result<Json<TableInfo>, ApiError> {
-    let meta = state
-        .cache
-        .get_metadata(&table_name)
+    let table = state
+        .catalog
+        .get_table(&table_name)
         .await
+        .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
+
+    let index_base = table.index_base();
+    let current = read_current(table.store.as_ref(), &index_base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let meta = read_metadata(table.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
 
     Ok(Json(TableInfo {
         name: table_name,
@@ -81,11 +108,26 @@ pub async fn search(
 ) -> Result<Json<SearchResponse>, ApiError> {
     let start = std::time::Instant::now();
 
-    let (object_cache, base, meta) = state
-        .cache
-        .get_table_state(&table_name)
+    let table = state
+        .catalog
+        .get_table(&table_name)
         .await
+        .map_err(ApiError::Internal)?
         .ok_or_else(|| ApiError::NotFound(format!("table '{table_name}' not found")))?;
+
+    let index_base = table.index_base();
+    let object_cache = state
+        .table_cache
+        .get_or_create(&table_name, Arc::clone(&table.store))
+        .await;
+
+    // Read fresh metadata every query
+    let current = read_current(table.store.as_ref(), &index_base)
+        .await
+        .map_err(ApiError::Internal)?;
+    let meta = read_metadata(table.store.as_ref(), &current.value)
+        .await
+        .map_err(ApiError::Internal)?;
 
     meta.indexed_columns
         .iter()
@@ -102,7 +144,7 @@ pub async fn search(
         state.config.query_timeout(),
         crate::query::run_query_collected(
             object_cache,
-            base,
+            &meta,
             req.search.column.clone(),
             &req.search.match_text,
             operator,
