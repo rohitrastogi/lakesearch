@@ -5,7 +5,7 @@
 //! (Option<RecordBatch>, QueryStats)`. I/O and coalescing are handled by
 //! the pipeline module.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -97,7 +97,7 @@ pub(crate) fn resolve_projection(
 
 /// Context for row verification.
 pub(crate) struct VerifyContext<'a> {
-    pub query_terms: &'a [String],
+    pub query_terms: &'a [lakesearch_core::tokenizer::QueryTerm],
     pub term_infos: &'a [(String, u32)],
     pub operator: Operator,
     pub with_score: bool,
@@ -130,12 +130,16 @@ pub(crate) fn brute_force_verify_batch(
 ) -> (Option<RecordBatch>, QueryStats) {
     let col = batch.column(ctx.indexed_batch_col);
 
-    // Arrow pre-filter: case-insensitive substring check via ILIKE
+    // Arrow pre-filter: case-insensitive substring ILIKE check.
+    // All patterns use "%term%" because ILIKE operates on raw text (not
+    // tokenized). This is a coarse filter — matches_predicate does the
+    // real prefix/suffix check on tokenized output.
     let term_masks: Vec<BooleanArray> = ctx
         .query_terms
         .iter()
-        .filter_map(|term| {
-            let pattern = format!("%{term}%");
+        .filter_map(|qt| {
+            let t = qt.term();
+            let pattern = format!("%{t}%");
             let scalar = Scalar::new(StringArray::from(vec![pattern.as_str()]));
             arrow::compute::kernels::comparison::ilike(col, &scalar).ok()
         })
@@ -215,23 +219,18 @@ fn verify_rows(
 // ---------------------------------------------------------------------------
 
 /// Checks whether the tokenized row matches the boolean query predicate.
-fn matches_predicate(tokens: &[String], query_terms: &[String], operator: Operator) -> bool {
-    let single_term = query_terms.len() == 1;
-    let few_terms = query_terms.len() <= 4;
+fn matches_predicate(
+    tokens: &[String],
+    query_terms: &[lakesearch_core::tokenizer::QueryTerm],
+    operator: Operator,
+) -> bool {
+    let term_matches = |qt: &lakesearch_core::tokenizer::QueryTerm| -> bool {
+        tokens.iter().any(|t| qt.matches_token(t))
+    };
 
-    if single_term {
-        tokens.iter().any(|t| t == &query_terms[0])
-    } else if few_terms {
-        match operator {
-            Operator::And => query_terms.iter().all(|q| tokens.iter().any(|t| t == q)),
-            Operator::Or => query_terms.iter().any(|q| tokens.iter().any(|t| t == q)),
-        }
-    } else {
-        let token_set: HashSet<&str> = tokens.iter().map(|s| s.as_str()).collect();
-        match operator {
-            Operator::And => query_terms.iter().all(|t| token_set.contains(t.as_str())),
-            Operator::Or => query_terms.iter().any(|t| token_set.contains(t.as_str())),
-        }
+    match operator {
+        Operator::And => query_terms.iter().all(term_matches),
+        Operator::Or => query_terms.iter().any(term_matches),
     }
 }
 

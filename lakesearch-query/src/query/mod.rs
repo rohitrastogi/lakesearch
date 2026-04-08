@@ -27,7 +27,7 @@ use tracing::info;
 use lakesearch_core::bm25;
 use lakesearch_core::runtime::LakeRuntime;
 use lakesearch_core::segment::SegmentReader;
-use lakesearch_core::tokenizer::tokenize;
+use lakesearch_core::tokenizer::{parse_query, QueryTerm};
 use object_store::path::Path;
 use parquet::file::metadata::ParquetMetaData;
 
@@ -140,7 +140,7 @@ async fn setup_query(
     cache: &Arc<ObjectCache>,
     base: &Path,
     column: &str,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     operator: Operator,
     select_columns: &[String],
     with_score: bool,
@@ -195,7 +195,7 @@ fn launch_pipeline(
     unindexed_files: Vec<String>,
     cache: Arc<ObjectCache>,
     column: String,
-    query_terms: Vec<String>,
+    query_terms: Vec<QueryTerm>,
     operator: Operator,
     score_mode: crate::ScoreMode,
     with_score: bool,
@@ -210,15 +210,38 @@ fn launch_pipeline(
 ) {
     let candidate_pages: usize = work_items.iter().map(|w| w.entries.len()).sum();
     let agg_avg_dl = bm25::avg_dl(agg.total_tokens, agg.total_rows);
-    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(
-        query_terms
-            .iter()
-            .map(|t| {
-                let df = agg.term_df.get(t).copied().unwrap_or(1) as u32;
-                (t.clone(), df)
-            })
-            .collect(),
-    );
+    // For exact terms, look up df directly. For wildcards, include all
+    // expanded terms from agg stats so brute-force BM25 scoring works.
+    let mut agg_term_vec: Vec<(String, u32)> = Vec::new();
+    for qt in &query_terms {
+        match qt {
+            QueryTerm::Exact(t) => {
+                let df = agg.term_df.get(t.as_str()).copied().unwrap_or(1) as u32;
+                agg_term_vec.push((t.clone(), df));
+            }
+            QueryTerm::Prefix(p) => {
+                for (term, &df) in &agg.term_df {
+                    if term.starts_with(p.as_str()) {
+                        agg_term_vec.push((term.clone(), df as u32));
+                    }
+                }
+            }
+            QueryTerm::Suffix(s) => {
+                for (term, &df) in &agg.term_df {
+                    if term.ends_with(s.as_str()) {
+                        agg_term_vec.push((term.clone(), df as u32));
+                    }
+                }
+            }
+        }
+    }
+    if agg_term_vec.is_empty() {
+        // Fallback: ensure at least something for scoring
+        for qt in &query_terms {
+            agg_term_vec.push((qt.term().to_owned(), 1));
+        }
+    }
+    let agg_term_infos: Arc<Vec<(String, u32)>> = Arc::new(agg_term_vec);
 
     let shared_ctx = Arc::new(SharedQueryContext {
         query_terms: Arc::new(query_terms),
@@ -292,7 +315,7 @@ pub async fn run_query(
     runtime: Arc<LakeRuntime>,
 ) -> Result<SendableRecordBatchStream> {
     let with_score = score_mode != crate::ScoreMode::None;
-    let query_terms = tokenize(query_text);
+    let query_terms = parse_query(query_text);
     if query_terms.is_empty() {
         let schema = build_empty_schema(&select_columns, &column, with_score);
         let (tx, rx) = tokio::sync::mpsc::channel(1);
@@ -389,7 +412,7 @@ pub async fn run_query_collected(
     runtime: Arc<LakeRuntime>,
 ) -> Result<CollectedQueryResult> {
     let with_score = score_mode != crate::ScoreMode::None;
-    let query_terms = tokenize(query_text);
+    let query_terms = parse_query(query_text);
     if query_terms.is_empty() {
         return Ok(CollectedQueryResult {
             batches: vec![],

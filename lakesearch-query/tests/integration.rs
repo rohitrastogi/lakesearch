@@ -1408,3 +1408,184 @@ async fn streaming_query_returns_all_results() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Wildcard query tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prefix_query_matches_expanded_terms() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    // Descriptions: "connection refused", "connection timeout", "success ok", "connector error"
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/prefix.parquet",
+        40,
+        10,
+        &[
+            "connection refused",
+            "connection timeout",
+            "success ok",
+            "connector error",
+        ],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // "conn*" should match "connection" and "connector"
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "conn*",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // 3/4 descriptions contain a word starting with "conn"
+    let rows = total_rows(&result.batches);
+    assert_eq!(rows, 30, "3/4 descriptions × 10 rows each = 30");
+
+    let texts = extract_texts(&result.batches);
+    for t in &texts {
+        assert!(
+            t.contains("connection") || t.contains("connector"),
+            "prefix 'conn*' should match connection/connector: {t}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn suffix_query_matches_expanded_terms() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/suffix.parquet",
+        40,
+        10,
+        &[
+            "connection refused",
+            "connection timeout",
+            "success ok",
+            "permission denied",
+        ],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // "*ion" should match "connection" and "permission"
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "*ion",
+        Operator::Or,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let texts = extract_texts(&result.batches);
+    for t in &texts {
+        assert!(
+            t.contains("connection") || t.contains("permission"),
+            "suffix '*ion' should match connection/permission: {t}"
+        );
+    }
+    // 3/4 descriptions have a word ending in "ion" (connection x2, permission x1)
+    assert_eq!(total_rows(&result.batches), 30);
+}
+
+#[tokio::test]
+async fn mixed_wildcard_and_exact_with_and() {
+    let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    let base = Path::from("table");
+    let runtime = LakeRuntime::new(2);
+
+    create_test_table(store.as_ref(), &base, &["description"]).await;
+
+    let file_path = upload_test_parquet(
+        store.as_ref(),
+        "data/mixed.parquet",
+        40,
+        10,
+        &[
+            "connection refused",
+            "connection timeout",
+            "success ok",
+            "connector timeout",
+        ],
+    )
+    .await;
+
+    run_index(
+        &store,
+        &base,
+        std::slice::from_ref(&file_path),
+        "description",
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    // "conn* timeout" with AND: must have a conn-prefix word AND "timeout"
+    let result = run_query(
+        &store,
+        &base,
+        "description",
+        "conn* timeout",
+        Operator::And,
+        false,
+        None,
+        &[],
+        &runtime,
+    )
+    .await
+    .unwrap();
+
+    let texts = extract_texts(&result.batches);
+    for t in &texts {
+        assert!(
+            (t.contains("connection") || t.contains("connector")) && t.contains("timeout"),
+            "should match conn* AND timeout: {t}"
+        );
+    }
+    // "connection timeout" and "connector timeout" = 2/4 descriptions
+    assert_eq!(total_rows(&result.batches), 20);
+}

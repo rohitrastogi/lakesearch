@@ -3,11 +3,12 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 
 use lakesearch_core::bm25;
 use lakesearch_core::boolean;
 use lakesearch_core::segment::SegmentReader;
+use lakesearch_core::tokenizer::{QueryTerm, MAX_WILDCARD_EXPANSION};
 use lakesearch_core::types::DocId;
 
 use crate::Operator;
@@ -24,24 +25,53 @@ pub(crate) struct SegmentEvaluation {
 
 /// Looks up posting lists for each query term and combines them with boolean
 /// ops. Returns candidates and term infos from a single set of FST lookups.
+///
+/// For wildcard terms (prefix/suffix), expands the wildcard to all matching
+/// terms in the segment's FST, unions their posting lists, and treats the
+/// result as a single "term" for boolean combination.
 pub(crate) fn evaluate_segment(
     reader: &SegmentReader,
-    query_terms: &[String],
+    query_terms: &[QueryTerm],
     operator: Operator,
 ) -> Result<SegmentEvaluation> {
     let mut entries: Vec<(u32, Vec<DocId>)> = Vec::new();
     let mut term_infos: Vec<(String, u32)> = Vec::new();
 
-    for term in query_terms {
-        match reader.term_ordinal(term) {
-            Some(ord) => {
-                let info = reader.term_info(ord)?;
-                let postings = reader.posting_list(ord)?;
-                term_infos.push((term.clone(), info.doc_frequency));
-                entries.push((info.doc_frequency, postings));
-            }
-            None => {
-                if operator == Operator::And {
+    for qt in query_terms {
+        match qt {
+            QueryTerm::Exact(term) => match reader.term_ordinal(term) {
+                Some(ord) => {
+                    let info = reader.term_info(ord)?;
+                    let postings = reader.posting_list(ord)?;
+                    term_infos.push((term.clone(), info.doc_frequency));
+                    entries.push((info.doc_frequency, postings));
+                }
+                None => {
+                    if operator == Operator::And {
+                        return Ok(SegmentEvaluation {
+                            candidates: vec![],
+                            term_infos: vec![],
+                        });
+                    }
+                }
+            },
+            QueryTerm::Prefix(pat) | QueryTerm::Suffix(pat) => {
+                let expanded = if matches!(qt, QueryTerm::Prefix(_)) {
+                    reader.prefix_terms(pat)
+                } else {
+                    reader.suffix_terms(pat)
+                };
+                if expanded.len() > MAX_WILDCARD_EXPANSION {
+                    bail!(
+                        "wildcard '{pat}' expanded to {} terms (max {MAX_WILDCARD_EXPANSION})",
+                        expanded.len()
+                    );
+                }
+                let postings = expand_wildcard(reader, &expanded, &mut term_infos)?;
+                if let Some(p) = postings {
+                    let df = p.len() as u32;
+                    entries.push((df, p));
+                } else if operator == Operator::And {
                     return Ok(SegmentEvaluation {
                         candidates: vec![],
                         term_infos: vec![],
@@ -73,6 +103,30 @@ pub(crate) fn evaluate_segment(
         candidates: combined,
         term_infos,
     })
+}
+
+/// Expands wildcard matches: unions posting lists from all matching terms.
+/// Collects term_infos for BM25 scoring. Returns None if no terms matched.
+fn expand_wildcard(
+    reader: &SegmentReader,
+    matches: &[(String, u64)],
+    term_infos: &mut Vec<(String, u32)>,
+) -> Result<Option<Vec<DocId>>> {
+    if matches.is_empty() {
+        return Ok(None);
+    }
+
+    let mut combined: Option<Vec<DocId>> = None;
+    for (term, ordinal) in matches {
+        let info = reader.term_info(*ordinal)?;
+        let postings = reader.posting_list(*ordinal)?;
+        term_infos.push((term.clone(), info.doc_frequency));
+        combined = Some(match combined {
+            Some(prev) => boolean::union(&prev, &postings),
+            None => postings,
+        });
+    }
+    Ok(combined)
 }
 
 /// Groups evaluated candidates into `IndexedWorkItem`s, one per (file, row_group).

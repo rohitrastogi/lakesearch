@@ -7,6 +7,8 @@ use arrow::record_batch::RecordBatch;
 use lakesearch_core::types::DocTableEntry;
 use serde::{Deserialize, Serialize};
 
+use lakesearch_core::tokenizer::QueryTerm;
+
 use crate::Operator;
 
 /// Output column name for the matched text.
@@ -89,7 +91,7 @@ pub(crate) struct BruteForceScoring {
 
 /// Query-wide context shared across all batches via `Arc`.
 pub(crate) struct SharedQueryContext {
-    pub query_terms: Arc<Vec<String>>,
+    pub query_terms: Arc<Vec<QueryTerm>>,
     pub operator: Operator,
     pub with_score: bool,
     pub schema: SchemaRef,

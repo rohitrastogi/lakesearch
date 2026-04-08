@@ -99,6 +99,91 @@ fn push_unicode_token(raw: &str, tokens: &mut Vec<String>) {
     }
 }
 
+/// A parsed query term with optional wildcard markers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueryTerm {
+    /// Exact term match.
+    Exact(String),
+    /// Prefix match: `conn*` → `Prefix("conn")`.
+    Prefix(String),
+    /// Suffix match: `*tion` → `Suffix("tion")`.
+    Suffix(String),
+}
+
+/// Maximum number of terms a wildcard may expand to.
+pub const MAX_WILDCARD_EXPANSION: usize = 1024;
+
+/// Parses a query string into `QueryTerm`s.
+///
+/// Splits on whitespace, detects `*` wildcards at token boundaries,
+/// and lowercases + NFC-normalizes the non-wildcard portion.
+///
+/// - `conn*` → `Prefix("conn")`
+/// - `*tion` → `Suffix("tion")`
+/// - `timeout` → `Exact("timeout")`
+/// - `*` alone is ignored (matches everything, not useful)
+#[must_use]
+pub fn parse_query(text: &str) -> Vec<QueryTerm> {
+    let mut terms = Vec::new();
+    for raw in text.split_whitespace() {
+        let is_prefix = raw.ends_with('*');
+        let is_suffix = raw.starts_with('*');
+        let stripped = raw.trim_matches('*');
+        if stripped.is_empty() {
+            continue;
+        }
+        // Tokenize the stripped portion (lowercases + normalizes).
+        // Punctuation in the input may produce multiple tokens
+        // (e.g. "error:timeout" → ["error", "timeout"]).
+        let tokens = tokenize(stripped);
+        if tokens.is_empty() {
+            continue;
+        }
+
+        if !is_prefix && !is_suffix {
+            // No wildcard: emit all tokens as exact matches
+            terms.extend(tokens.into_iter().map(QueryTerm::Exact));
+        } else {
+            // Wildcard applies to the first token only. Any extra tokens
+            // from punctuation splitting become exact matches.
+            let mut iter = tokens.into_iter();
+            let first = iter.next().expect("tokens is non-empty");
+            let wildcard = match (is_prefix, is_suffix) {
+                (true, true) => QueryTerm::Prefix(first),
+                (true, false) => QueryTerm::Prefix(first),
+                (false, true) => QueryTerm::Suffix(first),
+                _ => unreachable!(),
+            };
+            terms.push(wildcard);
+            terms.extend(iter.map(QueryTerm::Exact));
+        }
+    }
+    terms
+}
+
+impl QueryTerm {
+    /// Returns the inner term string regardless of variant.
+    pub fn term(&self) -> &str {
+        match self {
+            Self::Exact(t) | Self::Prefix(t) | Self::Suffix(t) => t,
+        }
+    }
+
+    /// Returns true if this is a wildcard (prefix or suffix) term.
+    pub fn is_wildcard(&self) -> bool {
+        !matches!(self, Self::Exact(_))
+    }
+
+    /// Returns true if a tokenized token matches this query term.
+    pub fn matches_token(&self, token: &str) -> bool {
+        match self {
+            Self::Exact(q) => token == q,
+            Self::Prefix(p) => token.starts_with(p.as_str()),
+            Self::Suffix(s) => token.ends_with(s.as_str()),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +260,100 @@ mod tests {
             assert!(!t.is_empty());
             assert_eq!(*t, t.to_lowercase());
         }
+    }
+
+    #[test]
+    fn parse_query_exact() {
+        assert_eq!(
+            parse_query("connection timeout"),
+            vec![
+                QueryTerm::Exact("connection".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_prefix() {
+        assert_eq!(
+            parse_query("conn*"),
+            vec![QueryTerm::Prefix("conn".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_query_suffix() {
+        assert_eq!(
+            parse_query("*tion"),
+            vec![QueryTerm::Suffix("tion".to_owned())]
+        );
+    }
+
+    #[test]
+    fn parse_query_mixed() {
+        assert_eq!(
+            parse_query("conn* timeout *error"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+                QueryTerm::Suffix("error".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_lowercases() {
+        assert_eq!(
+            parse_query("CONN* *TION"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Suffix("tion".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_bare_star_ignored() {
+        assert_eq!(parse_query("*"), Vec::<QueryTerm>::new());
+        assert_eq!(
+            parse_query("hello * world"),
+            vec![
+                QueryTerm::Exact("hello".to_owned()),
+                QueryTerm::Exact("world".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_punctuated_emits_all_tokens() {
+        // "error:timeout" should produce two exact terms, not just "error"
+        assert_eq!(
+            parse_query("error:timeout"),
+            vec![
+                QueryTerm::Exact("error".to_owned()),
+                QueryTerm::Exact("timeout".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_query_wildcard_with_punctuation() {
+        // "conn*:refused" — the * is mid-token, not at the end of the
+        // whitespace-delimited word, so no wildcard is detected.
+        assert_eq!(
+            parse_query("conn*:refused"),
+            vec![
+                QueryTerm::Exact("conn".to_owned()),
+                QueryTerm::Exact("refused".to_owned()),
+            ]
+        );
+        // But "conn* refused" has * at the end of the first word.
+        assert_eq!(
+            parse_query("conn* refused"),
+            vec![
+                QueryTerm::Prefix("conn".to_owned()),
+                QueryTerm::Exact("refused".to_owned()),
+            ]
+        );
     }
 }
